@@ -1,3 +1,13 @@
+# Image Parser
+
+## Windows install
+
+Double-click `install.bat` (or run `install.bat /nopause` from a terminal). It will:
+
+1. Install Node.js LTS and `immich-go` via `winget` if they are missing (Node 20.19+ / 22.12+ required).
+2. Run `npm install` and `npm run build`.
+3. Create an **Image Parser** shortcut on your desktop.
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
