@@ -7,9 +7,11 @@ import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { exiftool } from 'exiftool-vendored'
 import sharp from 'sharp'
+import { createSerialQueue } from './imageFileQueue.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const appIconPath = path.join(__dirname, 'assets', process.platform === 'win32' ? 'imageparser.ico' : 'imageparser.png')
 const allowedExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff'])
 const defaultSortBy = 'createdAt'
 const immichSettingsFileName = 'immich-settings.json'
@@ -17,6 +19,7 @@ const maxImmichOutputLength = 32_000
 const metadataRotationExtensions = new Set(['.jpg', '.jpeg', '.tif', '.tiff'])
 const pixelRotationExtensions = new Set(['.png', '.webp'])
 const imageRevisionByPath = new Map()
+const runImageFileOperation = createSerialQueue()
 const defaultImmichSettings = Object.freeze({
   serverUrl: '',
   userApiKey: '',
@@ -150,16 +153,16 @@ const saveImmichSettings = async (settings) => {
 const buildImmichUploadArguments = (settings, directoryPath) => {
   const tags = normalizeImmichTags(settings.tags)
   const uploadArguments = [
-    '--concurrent-tasks',
-    String(settings.concurrentTasks),
-    '--no-ui',
-    'upload',
+      'upload',
     'from-folder',
+    `--concurrent-tasks=${String(settings.concurrentTasks)}`,
+    '--no-ui',
     `--server=${settings.serverUrl}`,
     '--recursive=false',
     `--api-key=${settings.userApiKey}`,
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
     `--into-album=${settings.albumName}`,
+      '--ban-file=**_b.**'
   ]
 
   if (settings.adminApiKey) {
@@ -212,7 +215,6 @@ const runImmichUpload = async (settings, directoryPath, reportProgress = () => {
     return await new Promise((resolve, reject) => {
       let stdout = ''
       let stderr = ''
-      let liveOutput = ''
       const uploadProcess = spawn('immich-go', uploadArguments, {
         cwd: normalizedDirectoryPath,
         shell: false,
@@ -223,18 +225,16 @@ const runImmichUpload = async (settings, directoryPath, reportProgress = () => {
 
       uploadProcess.stdout.on('data', (chunk) => {
         stdout = appendBoundedOutput(stdout, chunk)
-        liveOutput = appendBoundedOutput(liveOutput, chunk)
         reportProgress({
           phase: 'uploading',
-          output: redactImmichSecrets(liveOutput, normalizedSettings),
+          output: redactImmichSecrets(chunk.toString(), normalizedSettings),
         })
       })
       uploadProcess.stderr.on('data', (chunk) => {
         stderr = appendBoundedOutput(stderr, chunk)
-        liveOutput = appendBoundedOutput(liveOutput, chunk)
         reportProgress({
           phase: 'uploading',
-          output: redactImmichSecrets(liveOutput, normalizedSettings),
+          output: redactImmichSecrets(chunk.toString(), normalizedSettings),
         })
       })
       uploadProcess.on('error', (error) => {
@@ -844,6 +844,7 @@ const createMainWindow = () => {
     minHeight: 760,
     title: 'Image Parser',
     backgroundColor: '#0f172a',
+    icon: appIconPath,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -909,7 +910,7 @@ ipcMain.handle('read-directory', async (_event, directoryPath, sortBy = defaultS
   }
 })
 
-ipcMain.handle('save-metadata', async (_event, metadata) => {
+ipcMain.handle('save-metadata', (_event, metadata) => runImageFileOperation(async () => {
   if (!metadata?.frontPath) {
     throw new Error('No image selected for metadata update.')
   }
@@ -931,7 +932,7 @@ ipcMain.handle('save-metadata', async (_event, metadata) => {
     updatedFiles: imagePaths.length,
     sidecarFile: (await resolveExistingSidecarPath(metadata.frontPath)) ?? buildSidecarPath(metadata.frontPath),
   }
-})
+}))
 
 ipcMain.handle('read-sidecar-metadata', async (_event, filePath) => {
   if (!filePath) {
@@ -946,13 +947,11 @@ ipcMain.handle('read-sidecar-metadata', async (_event, filePath) => {
   return readSidecarMetadata(filePath)
 })
 
-ipcMain.handle('get-preview-data-url', async (_event, filePath, rotation) => {
-  return getPreviewDataUrl(filePath, rotation)
-})
+ipcMain.handle('get-preview-data-url', (_event, filePath, rotation) =>
+  runImageFileOperation(() => getPreviewDataUrl(filePath, rotation)))
 
-ipcMain.handle('apply-image-rotations', async (_event, request) => {
-  return applyImageRotations(request)
-})
+ipcMain.handle('apply-image-rotations', (_event, request) =>
+  runImageFileOperation(() => applyImageRotations(request)))
 
 ipcMain.handle('load-immich-settings', async () => {
   return loadImmichSettings()

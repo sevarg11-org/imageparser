@@ -8,6 +8,12 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from 'react'
 import './App.css'
+import {
+  completeDateSegment,
+  parseDateSegments,
+  toIsoDate,
+  type DateSegments,
+} from './dateEntry'
 
 type ImagePair = {
   id: string
@@ -283,6 +289,7 @@ const toFileUrl = (filePath: string) => {
 }
 
 const defaultDate = new Date().toISOString().slice(0, 10)
+const METADATA_ENTRY_SESSION_KEY = 'imageparser.metadata-entry-expanded'
 const defaultImmichSettings: ImmichSettings = {
   serverUrl: '',
   userApiKey: '',
@@ -293,39 +300,23 @@ const defaultImmichSettings: ImmichSettings = {
   concurrentTasks: 2,
 }
 
-const normalizeDateYear = (value: string) => {
-  const dateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!dateParts) {
-    return value
-  }
-
-  const [, year, month, day] = dateParts
-  if (!year.startsWith('00')) {
-    return value
-  }
-
-  const twoDigitYear = Number(year.slice(-2))
-  const fullYear = twoDigitYear >= 50 ? 1900 + twoDigitYear : 2000 + twoDigitYear
-  return `${fullYear}-${month}-${day}`
-}
-
-const setDateYearTo2000 = (value: string) => {
-  const dateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  const fallbackDateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(defaultDate)
-  const month = dateParts?.[2] ?? fallbackDateParts?.[2] ?? '01'
-  const day = dateParts?.[3] ?? fallbackDateParts?.[3] ?? '01'
-  return `2000-${month}-${day}`
-}
-
 function App() {
   const [directoryPath, setDirectoryPath] = useState('')
   const [pairs, setPairs] = useState<ImagePair[]>([])
   const [selectedIndex, setSelectedIndex] = useState(0)
+  const [imageNumberInput, setImageNumberInput] = useState('1')
   const [sortBy, setSortBy] = useState<SortOption>('createdAt')
   const [metadata, setMetadata] = useState<MetadataForm>({
     date: defaultDate,
     description: '',
     tags: [],
+  })
+  const [dateSegments, setDateSegments] = useState(() => parseDateSegments(defaultDate))
+  const [isMetadataEntryExpanded, setIsMetadataEntryExpanded] = useState(() => {
+    if (typeof window === 'undefined') {
+      return false
+    }
+    return window.sessionStorage.getItem(METADATA_ENTRY_SESSION_KEY) === 'true'
   })
   const [tagInput, setTagInput] = useState('')
   const [recentTags, setRecentTags] = useState<string[]>([])
@@ -342,14 +333,15 @@ function App() {
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0)
   const hasUserChangedRef = useRef(false)
   const dateInputRef = useRef<HTMLInputElement | null>(null)
-  const descriptionInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const dayInputRef = useRef<HTMLInputElement | null>(null)
+  const yearInputRef = useRef<HTMLInputElement | null>(null)
+  const dateSegmentsRef = useRef(dateSegments)
+  const descriptionInputRef = useRef<HTMLInputElement | null>(null)
   const tagInputRef = useRef<HTMLInputElement | null>(null)
   const immichOutputRef = useRef<HTMLPreElement | null>(null)
   const isImmichOutputFollowingRef = useRef(true)
   const saveTimeoutRef = useRef<number | null>(null)
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null)
-  const dateDigitBufferRef = useRef('')
-  const dateDigitTimeoutRef = useRef<number | null>(null)
 
   const selectedPair = useMemo(
     () => (pairs[selectedIndex] ? pairs[selectedIndex] : null),
@@ -384,6 +376,13 @@ function App() {
       isMounted = false
     }
   }, [])
+
+  useEffect(() => {
+    window.sessionStorage.setItem(
+      METADATA_ENTRY_SESSION_KEY,
+      String(isMetadataEntryExpanded),
+    )
+  }, [isMetadataEntryExpanded])
 
   useEffect(() => {
     const electronApi = window.electronAPI
@@ -452,7 +451,7 @@ function App() {
     hasUserChangedRef.current = false
   }, [rotations])
 
-  const persistCurrentPair = useCallback(() => {
+  const persistCurrentPair = useCallback((formValues: MetadataForm = metadata) => {
     if (pendingPersistenceRef.current) {
       return pendingPersistenceRef.current
     }
@@ -460,6 +459,11 @@ function App() {
     const operation = (async () => {
       if (!selectedPair) {
         return true
+      }
+
+      if (!toIsoDate(dateSegmentsRef.current)) {
+        setStatus('Enter a valid month, day, and year before saving.')
+        return false
       }
 
       const electronApi = window.electronAPI
@@ -473,7 +477,7 @@ function App() {
       clearPendingSave()
 
       try {
-        await savePairMetadata(selectedPair, metadata)
+        await savePairMetadata(selectedPair, formValues)
 
         if (rotationSnapshot.front === 0 && rotationSnapshot.back === 0) {
           return true
@@ -529,17 +533,18 @@ function App() {
     return operation
   }, [clearPendingSave, metadata, rotations, savePairMetadata, selectedPair])
 
-  const navigateToIndex = useCallback(async (nextIndex: number) => {
+  const navigateToIndex = useCallback(async (nextIndex: number, formValues?: MetadataForm) => {
     const boundedIndex = Math.min(Math.max(nextIndex, 0), pairs.length - 1)
     if (boundedIndex === selectedIndex || isUploading || !isHydrated) {
       return
     }
 
-    if (!(await persistCurrentPair())) {
+    if (!(await persistCurrentPair(formValues))) {
       return
     }
 
     setIsHydrated(false)
+    setImageNumberInput(String(boundedIndex + 1))
     setSelectedIndex(boundedIndex)
   }, [isHydrated, isUploading, pairs.length, persistCurrentPair, selectedIndex])
 
@@ -571,6 +576,9 @@ function App() {
           description: frontXmpValues.description ?? '',
           tags: frontXmpValues.tags ?? [],
         })
+        const loadedSegments = parseDateSegments(loadedDate)
+        dateSegmentsRef.current = loadedSegments
+        setDateSegments(loadedSegments)
         setRecentTags((current) => [
           ...(frontXmpValues.tags ?? []),
           ...current.filter(
@@ -581,9 +589,6 @@ function App() {
           ),
         ])
         setTagInput('')
-        if (dateInputRef.current) {
-          dateInputRef.current.value = loadedDate
-        }
         setRotations({
           front: normalizeRotation(frontXmpValues.rotation ?? 0),
           back: normalizeRotation(backXmpValues?.rotation ?? 0),
@@ -601,10 +606,10 @@ function App() {
           description: '',
           tags: [],
         })
+        const defaultSegments = parseDateSegments(defaultDate)
+        dateSegmentsRef.current = defaultSegments
+        setDateSegments(defaultSegments)
         setTagInput('')
-        if (dateInputRef.current) {
-          dateInputRef.current.value = defaultDate
-        }
         setRotations({ front: 0, back: 0 })
         setIsHydrated(true)
         setStatus(`No sidecar metadata found for ${selectedPair.imageLabel}.`)
@@ -631,6 +636,9 @@ function App() {
     }
 
     clearPendingSave()
+    if (!toIsoDate(dateSegmentsRef.current)) {
+      return
+    }
     saveTimeoutRef.current = window.setTimeout(async () => {
       try {
         await savePairMetadata(selectedPair, metadata)
@@ -653,6 +661,7 @@ function App() {
 
     const frameId = window.requestAnimationFrame(() => {
       dateInputRef.current?.focus()
+      dateInputRef.current?.select()
     })
 
     return () => {
@@ -678,7 +687,9 @@ function App() {
       const tagName = target?.tagName ?? ''
       const key = event.key.toLowerCase()
       const isRotationHotkeyBlocked =
-        target === descriptionInputRef.current || target === tagInputRef.current
+        target === descriptionInputRef.current ||
+        target === tagInputRef.current ||
+        Boolean(target?.closest('.immich-content input'))
 
       if (isPersistingRotation || isUploading || !isHydrated) {
         return
@@ -780,94 +791,109 @@ function App() {
     )
   }
 
-  const updateDateField = (value: string) => {
-    if (dateInputRef.current) {
-      dateInputRef.current.value = value
-    }
-    updateFormField('date', value)
-  }
-
-  const clearDateDigitBuffer = () => {
-    if (dateDigitTimeoutRef.current !== null) {
-      window.clearTimeout(dateDigitTimeoutRef.current)
-      dateDigitTimeoutRef.current = null
-    }
-    dateDigitBufferRef.current = ''
-  }
-
-  const applyYear2000Shortcut = () => {
-    clearDateDigitBuffer()
-    updateDateField(setDateYearTo2000(metadata.date))
-  }
-
-  const handleDateBlur = (value: string) => {
-    if (dateDigitBufferRef.current === '00') {
-      applyYear2000Shortcut()
-      return
-    }
-
-    clearDateDigitBuffer()
-    const normalizedDate = normalizeDateYear(value)
-    if (normalizedDate !== value) {
-      updateDateField(normalizedDate)
-    } else if (!value && metadata.date) {
-      updateDateField('')
+  const updateDateSegments = (next: DateSegments) => {
+    dateSegmentsRef.current = next
+    setDateSegments(next)
+    const nextDate = toIsoDate(next)
+    if (nextDate && nextDate !== metadata.date) {
+      updateFormField('date', nextDate)
     }
   }
 
-  const handleDateKeyDown = async (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (/^\d$/.test(event.key)) {
-      if (dateDigitTimeoutRef.current !== null) {
-        window.clearTimeout(dateDigitTimeoutRef.current)
+  const handleDateSegmentChange = (field: keyof DateSegments, value: string) => {
+    const digits = value.replace(/\D/g, '').slice(0, field === 'year' ? 4 : 2)
+    const next = { ...dateSegmentsRef.current, [field]: digits }
+    clearPendingSave()
+    updateDateSegments(next)
+
+    if (digits.length === 2 && Number(digits) >= 1) {
+      if (field === 'month' && Number(digits) <= 12) {
+        dayInputRef.current?.focus()
+        dayInputRef.current?.select()
+      } else if (field === 'day' && Number(digits) <= 31) {
+        yearInputRef.current?.focus()
+        yearInputRef.current?.select()
       }
-
-      dateDigitBufferRef.current += event.key
-      dateDigitTimeoutRef.current = window.setTimeout(() => {
-        if (dateDigitBufferRef.current === '00') {
-          applyYear2000Shortcut()
-        } else {
-          clearDateDigitBuffer()
-        }
-      }, 300)
-    } else if (event.key !== 'Enter') {
-      clearDateDigitBuffer()
     }
+  }
 
+  const handleImageNumberKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key !== 'Enter') {
       return
     }
 
     event.preventDefault()
-    clearPendingSave()
-    const shouldApplyYear2000 = dateDigitBufferRef.current === '00'
-    clearDateDigitBuffer()
-    const normalizedDate = shouldApplyYear2000
-      ? setDateYearTo2000(metadata.date)
-      : normalizeDateYear(event.currentTarget.value)
-    const formValues = normalizedDate === metadata.date ? metadata : { ...metadata, date: normalizedDate }
-
-    if (normalizedDate !== metadata.date) {
-      updateDateField(normalizedDate)
+    const imageNumber = Number(imageNumberInput)
+    if (!Number.isInteger(imageNumber) || imageNumber < 1 || imageNumber > pairs.length) {
+      setStatus(`Enter an image number from 1 to ${pairs.length}.`)
+      return
     }
 
-    if (selectedPair && hasUserChangedRef.current) {
-      try {
-        await savePairMetadata(selectedPair, formValues)
-      } catch (error) {
-        setStatus(error instanceof Error ? error.message : 'Unable to save the metadata.')
-        return
+    void navigateToIndex(imageNumber - 1)
+  }
+
+  const handleDateSegmentBlur = (field: keyof DateSegments) => {
+    const current = dateSegmentsRef.current
+    const next = { ...current, [field]: completeDateSegment(current[field], field) }
+    updateDateSegments(next)
+    if (!toIsoDate(next)) {
+      setStatus('Enter a valid month, day, and year before saving.')
+    }
+  }
+
+  const handleDescriptionKeyDown = async (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== 'Enter') {
+      return
+    }
+
+    event.preventDefault()
+    if (selectedIndex + 1 >= pairs.length) {
+      if (selectedPair && hasUserChangedRef.current) {
+        try {
+          await persistCurrentPair()
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Unable to save the metadata.')
+        }
       }
+      return
     }
 
     await navigateToIndex(selectedIndex + 1)
   }
 
-  const handleDateChange = (value: string) => {
-    if (!value) {
+  const handleDateKeyDown = async (
+    event: ReactKeyboardEvent<HTMLInputElement>,
+    field: keyof DateSegments,
+  ) => {
+    if (event.key !== 'Enter') {
       return
     }
 
-    updateDateField(normalizeDateYear(value))
+    event.preventDefault()
+    const current = dateSegmentsRef.current
+    const next = { ...current, [field]: completeDateSegment(current[field], field) }
+    const nextDate = toIsoDate(next)
+    if (!nextDate) {
+      setStatus('Enter a valid month, day, and year before saving.')
+      return
+    }
+
+    clearPendingSave()
+    updateDateSegments(next)
+    const formValues = nextDate === metadata.date ? metadata : { ...metadata, date: nextDate }
+
+    if (selectedIndex + 1 >= pairs.length) {
+      if (selectedPair && hasUserChangedRef.current) {
+        try {
+          await savePairMetadata(selectedPair, formValues)
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : 'Unable to save the metadata.')
+        }
+      }
+      return
+    }
+
+    await navigateToIndex(selectedIndex + 1, formValues)
   }
 
   const handleChooseDirectory = async () => {
@@ -896,6 +922,7 @@ function App() {
       setIsHydrated(false)
       setPairs(result.files)
       setRecentTags(result.recentTags)
+      setImageNumberInput('1')
       setSelectedIndex(0)
 
       if (!result.files.length) {
@@ -929,6 +956,7 @@ function App() {
       setIsHydrated(false)
       setPairs(result.files)
       setRecentTags(result.recentTags)
+      setImageNumberInput('1')
       setSelectedIndex(0)
       setStatus(`Loaded ${result.files.length} photo group${result.files.length === 1 ? '' : 's'}.`)
     } catch (error) {
@@ -1023,101 +1051,151 @@ function App() {
           <aside className="metadata-panel">
             <h2>Metadata</h2>
             <div className="metadata-grid">
-              <label className="metadata-date">
-                Date
-                <input
-                  key={selectedPair.id}
-                  ref={dateInputRef}
-                  type="date"
-                  defaultValue={metadata.date}
-                  onChange={(event) => handleDateChange(event.target.value)}
-                  onBlur={(event) => handleDateBlur(event.target.value)}
-                  onKeyDown={handleDateKeyDown}
-                  disabled={isPersistingRotation || isUploading}
-                />
-              </label>
+              <fieldset className="metadata-date">
+                <legend>Date</legend>
+                <div className="date-segments">
+                  <input
+                    ref={dateInputRef}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={2}
+                    aria-label="Month"
+                    value={dateSegments.month}
+                    onFocus={(event) => event.currentTarget.select()}
+                    onChange={(event) => handleDateSegmentChange('month', event.target.value)}
+                    onBlur={() => handleDateSegmentBlur('month')}
+                    onKeyDown={(event) => void handleDateKeyDown(event, 'month')}
+                    disabled={isPersistingRotation || isUploading}
+                  />
+                  <span aria-hidden="true">/</span>
+                  <input
+                    ref={dayInputRef}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={2}
+                    aria-label="Day"
+                    value={dateSegments.day}
+                    onFocus={(event) => event.currentTarget.select()}
+                    onChange={(event) => handleDateSegmentChange('day', event.target.value)}
+                    onBlur={() => handleDateSegmentBlur('day')}
+                    onKeyDown={(event) => void handleDateKeyDown(event, 'day')}
+                    disabled={isPersistingRotation || isUploading}
+                  />
+                  <span aria-hidden="true">/</span>
+                  <input
+                    ref={yearInputRef}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={4}
+                    aria-label="Year"
+                    value={dateSegments.year}
+                    onFocus={(event) => event.currentTarget.select()}
+                    onChange={(event) => handleDateSegmentChange('year', event.target.value)}
+                    onBlur={() => handleDateSegmentBlur('year')}
+                    onKeyDown={(event) => void handleDateKeyDown(event, 'year')}
+                    disabled={isPersistingRotation || isUploading}
+                  />
+                </div>
+              </fieldset>
 
               <label className="metadata-description">
                 Description
-                <textarea
+                <input
                   ref={descriptionInputRef}
+                  type="text"
                   value={metadata.description}
                   onChange={(event) => updateFormField('description', event.target.value)}
                   placeholder="Image description"
-                  rows={2}
+                  onKeyDown={(event) => void handleDescriptionKeyDown(event)}
                   disabled={isPersistingRotation || isUploading}
                 />
               </label>
 
-              <div className="metadata-tags">
-                <label htmlFor="new-tag">Tags</label>
-                <div className="tag-entry">
-                  <input
-                    id="new-tag"
-                    ref={tagInputRef}
-                    type="text"
-                    value={tagInput}
-                    onChange={(event) => setTagInput(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ',') {
-                        event.preventDefault()
-                        addTag()
-                      }
-                    }}
-                    placeholder="Type a new tag"
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={addTag}
-                    disabled={!tagInput.trim() || isPersistingRotation || isUploading}
-                  >
-                    Add
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {metadata.tags.length ? (
-              <div className="selected-tags" aria-label="Selected tags">
-                {metadata.tags.map((tag) => (
-                  <button
-                    key={tag.toLocaleLowerCase()}
-                    type="button"
-                    onClick={() => toggleTag(tag)}
-                    disabled={isPersistingRotation || isUploading}
-                    aria-label={`Remove ${tag}`}
-                  >
-                    {tag} <span aria-hidden="true">&times;</span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-
-            <fieldset className="recent-tags">
-              <legend>Recent tags</legend>
-              {recentTags.length ? (
-                <div className="recent-tag-options">
-                  {recentTags.map((tag) => (
-                    <label key={tag.toLocaleLowerCase()}>
+              <details
+                className="metadata-details"
+                open={isMetadataEntryExpanded}
+                onToggle={(event) => setIsMetadataEntryExpanded(event.currentTarget.open)}
+              >
+                <summary className="metadata-details-summary">
+                  <span>Tags</span>
+                  <span className="metadata-details-action">
+                    {isMetadataEntryExpanded ? 'Collapse' : 'Expand'}
+                  </span>
+                </summary>
+                <div className="metadata-details-content">
+                  <div className="metadata-tags">
+                    <label htmlFor="new-tag">Tags</label>
+                    <div className="tag-entry">
                       <input
-                        type="checkbox"
-                        checked={metadata.tags.some(
-                          (selectedTag) =>
-                            selectedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
-                        )}
-                        onChange={() => toggleTag(tag)}
+                        id="new-tag"
+                        ref={tagInputRef}
+                        type="text"
+                        value={tagInput}
+                        onChange={(event) => setTagInput(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ',') {
+                            event.preventDefault()
+                            addTag()
+                          }
+                        }}
+                        placeholder="Type a new tag"
                         disabled={isPersistingRotation || isUploading}
                       />
-                      <span>{tag}</span>
-                    </label>
-                  ))}
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={addTag}
+                        disabled={!tagInput.trim() || isPersistingRotation || isUploading}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+
+                  {metadata.tags.length ? (
+                    <div className="selected-tags" aria-label="Selected tags">
+                      {metadata.tags.map((tag) => (
+                        <button
+                          key={tag.toLocaleLowerCase()}
+                          type="button"
+                          onClick={() => toggleTag(tag)}
+                          disabled={isPersistingRotation || isUploading}
+                          aria-label={`Remove ${tag}`}
+                        >
+                          {tag} <span aria-hidden="true">&times;</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <fieldset className="recent-tags">
+                    <legend>Recent tags</legend>
+                    {recentTags.length ? (
+                      <div className="recent-tag-options">
+                        {recentTags.map((tag) => (
+                          <label key={tag.toLocaleLowerCase()}>
+                            <input
+                              type="checkbox"
+                              checked={metadata.tags.some(
+                                (selectedTag) =>
+                                  selectedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
+                              )}
+                              onChange={() => toggleTag(tag)}
+                              disabled={isPersistingRotation || isUploading}
+                            />
+                            <span>{tag}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="field-help">
+                        Tags from recently modified XMP files appear here.
+                      </span>
+                    )}
+                  </fieldset>
                 </div>
-              ) : (
-                <span className="field-help">Tags from recently modified XMP files appear here.</span>
-              )}
-            </fieldset>
+              </details>
+            </div>
           </aside>
 
           <section className="viewer-panel">
@@ -1143,9 +1221,20 @@ function App() {
               >
                 Previous
               </button>
-              <span>
-                {selectedIndex + 1} / {pairs.length}
-              </span>
+              <label className="image-counter">
+                <span className="visually-hidden">Go to image</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={pairs.length}
+                  value={imageNumberInput}
+                  onChange={(event) => setImageNumberInput(event.target.value)}
+                  onKeyDown={handleImageNumberKeyDown}
+                  disabled={isImageControlLocked}
+                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${pairs.length}`}
+                />
+                <span aria-hidden="true">/ {pairs.length}</span>
+              </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex + 1)}
