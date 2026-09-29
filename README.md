@@ -26,8 +26,23 @@ dates and orientation straight into the files on the share. The desktop (Electro
    | `IMAGEPARSER_USERNAME`    | `admin`                          | Optional HTTP Basic auth user                       |
    | `IMAGEPARSER_PASSWORD`    | *(strong password)*              | Enables auth when set (recommended)                 |
 
-3. Make sure the `PUID`/`PGID` user can write to both datasets. Otherwise saving metadata will fail with a
-   permission error.
+3. The container automatically assigns the config directory to `PUID`/`PGID` before dropping root privileges.
+   Make sure that user can also write to the photo dataset; otherwise `.xmp` and EXIF updates will fail.
+
+If upgrading from an earlier image that reports `EACCES` for `/config/secret.key`, pull and recreate the container:
+
+```sh
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+For the old image only, the immediate workaround is to give the configured user ownership of the config dataset:
+
+```sh
+chown -R 568:568 /mnt/tank/apps/imageparser
+```
+
+Replace both the ID values and path with your configured `PUID`, `PGID`, and `IMAGEPARSER_CONFIG_DIR`.
 
 The web UI can only reach files under `/data`, and paths outside it are rejected. There is no HTTPS in the
 container. Keep it on your LAN, or put it behind a reverse proxy with TLS if you expose it more widely.

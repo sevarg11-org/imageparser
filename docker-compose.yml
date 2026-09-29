@@ -6,14 +6,15 @@ services:
     image: ghcr.io/sevarg11-org/imageparser:latest
     pull_policy: always
     init: true
-    # Run as the owner of the photo dataset so .xmp sidecars and EXIF edits keep the right ownership.
-    # TrueNAS SCALE's built-in "apps" user is 568:568. Check yours with `ls -ln /mnt/<pool>/<dataset>`.
-    user: ${PUID:-568}:${PGID:-568}
     ports:
       # IMAGEPARSER_PORT / *_DIR / PUID / PGID are compose substitution variables: set them in the
       # stack's .env file (Dockge: the ".env" editor), NOT under `environment:`.
       - ${IMAGEPARSER_PORT:-8080}:8080
     environment:
+      # Startup fixes ownership of /config, then drops to this user before running the app.
+      # TrueNAS SCALE's built-in "apps" user is 568:568. Match the photo dataset owner when different.
+      PUID: ${PUID:-568}
+      PGID: ${PGID:-568}
       # Optional HTTP Basic auth. Strongly recommended, because the UI can read the saved Immich API keys.
       IMAGEPARSER_USERNAME: ${IMAGEPARSER_USERNAME:-}
       IMAGEPARSER_PASSWORD: ${IMAGEPARSER_PASSWORD:-}
