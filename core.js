@@ -7,7 +7,15 @@ import sharp from 'sharp'
 import { createSerialQueue } from './imageFileQueue.js'
 
 const allowedExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff'])
-const defaultSortBy = 'createdAt'
+const defaultSortBy = 'createdAt-asc'
+const sortFields = new Set(['createdAt', 'dateTaken', 'fileName'])
+const sortDirections = new Set(['asc', 'desc'])
+const sidecarDatePatterns = [
+  /<xmp:SubSecCreateDate[^>]*>([\s\S]*?)<\/xmp:SubSecCreateDate>/i,
+  /<xmp:CreateDate[^>]*>([\s\S]*?)<\/xmp:CreateDate>/i,
+  /<exif:DateTimeOriginal[^>]*>([\s\S]*?)<\/exif:DateTimeOriginal>/i,
+  /<photoshop:DateCreated[^>]*>([\s\S]*?)<\/photoshop:DateCreated>/i,
+]
 const immichSettingsFileName = 'immich-settings.json'
 const maxImmichOutputLength = 32_000
 const metadataRotationExtensions = new Set(['.jpg', '.jpeg', '.tif', '.tiff'])
@@ -358,21 +366,84 @@ const getSideFromFileName = (fileName) => {
   return side === 'front' || side === 'a' ? 'a' : 'b'
 }
 
-const sortPairs = (pairs, sortBy) => {
-  if (sortBy === 'fileName') {
-    return pairs.sort((left, right) => left.imageLabel.localeCompare(right.imageLabel))
+const normalizeSortBy = (sortBy) => {
+  const [field, direction = 'asc'] = String(sortBy ?? '').split('-')
+  if (!sortFields.has(field) || !sortDirections.has(direction)) {
+    return { field: 'createdAt', direction: 'asc' }
   }
 
+  return { field, direction }
+}
+
+const compareFileNames = (left, right) =>
+  left.imageLabel.localeCompare(right.imageLabel, undefined, { numeric: true, sensitivity: 'base' })
+
+const sortPairs = (pairs, sortBy) => {
+  const { field, direction } = normalizeSortBy(sortBy)
+  const directionFactor = direction === 'desc' ? -1 : 1
+
   return pairs.sort((left, right) => {
-    if (left.createdAt !== right.createdAt) {
-      return left.createdAt - right.createdAt
+    if (field === 'fileName') {
+      return compareFileNames(left, right) * directionFactor
     }
 
-    return left.imageLabel.localeCompare(right.imageLabel)
+    const leftValue = left[field]
+    const rightValue = right[field]
+    const isLeftMissing = leftValue === null || leftValue === undefined
+    const isRightMissing = rightValue === null || rightValue === undefined
+
+    // Photos without a value (e.g. no saved date taken) always sort after dated photos.
+    if (isLeftMissing !== isRightMissing) {
+      return isLeftMissing ? 1 : -1
+    }
+
+    if (!isLeftMissing && leftValue !== rightValue) {
+      return (leftValue - rightValue) * directionFactor
+    }
+
+    return compareFileNames(left, right) * directionFactor
   })
 }
 
+const readSidecarRawDate = async (filePath) => {
+  const sidecarPath = await resolveExistingSidecarPath(filePath)
+  if (!sidecarPath) {
+    return ''
+  }
+
+  try {
+    const rawXml = String(await fs.readFile(sidecarPath, 'utf8'))
+    for (const pattern of sidecarDatePatterns) {
+      const match = rawXml.match(pattern)
+      if (match?.[1]?.trim()) {
+        return match[1].trim()
+      }
+    }
+  } catch {
+    // Unreadable sidecars are treated as having no date taken.
+  }
+
+  return ''
+}
+
+const readDateTakenTimestamp = async (frontPath, backPath) => {
+  for (const filePath of [frontPath, backPath]) {
+    if (!filePath) {
+      continue
+    }
+
+    const normalizedDate = normalizeXmpDate(await readSidecarRawDate(filePath))
+    const timestamp = normalizedDate ? Date.parse(normalizedDate) : Number.NaN
+    if (!Number.isNaN(timestamp)) {
+      return timestamp
+    }
+  }
+
+  return null
+}
+
 const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
+  const shouldReadDateTaken = normalizeSortBy(sortBy).field === 'dateTaken'
   const grouped = new Map()
 
   for (const filePath of filePaths) {
@@ -399,6 +470,9 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
         frontPath: frontCandidate.filePath,
         backPath: backCandidate ? backCandidate.filePath : null,
         createdAt: frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
+        dateTaken: shouldReadDateTaken
+          ? await readDateTakenTimestamp(frontCandidate.filePath, backCandidate?.filePath)
+          : null,
       }
     }),
   )
@@ -493,12 +567,7 @@ const readSidecarMetadata = async (filePath) => {
       return ''
     }
 
-    const date = getTagValue(
-      /<xmp:SubSecCreateDate[^>]*>([\s\S]*?)<\/xmp:SubSecCreateDate>/i,
-      /<xmp:CreateDate[^>]*>([\s\S]*?)<\/xmp:CreateDate>/i,
-      /<exif:DateTimeOriginal[^>]*>([\s\S]*?)<\/exif:DateTimeOriginal>/i,
-      /<photoshop:DateCreated[^>]*>([\s\S]*?)<\/photoshop:DateCreated>/i,
-    )
+    const date = getTagValue(...sidecarDatePatterns)
 
     const description = getTagValue(
       /<rdf:li[^>]*xml:lang="x-default"[^>]*>([\s\S]*?)<\/rdf:li>/i,
@@ -797,6 +866,7 @@ export {
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,
+  normalizeSortBy,
   readDirectory,
   readSidecarMetadataForFile as readSidecarMetadata,
   renderPreviewPng,

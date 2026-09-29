@@ -17,14 +17,14 @@ dates and orientation straight into the files on the share. The desktop (Electro
 1. In TrueNAS SCALE, create a stack (Apps → Discover → Install via YAML, or Dockge) from `docker-compose.yml`.
 2. Set these values in the stack's `.env` file:
 
-   | Variable                  | Example                          | Purpose                                             |
-   |---------------------------|----------------------------------|-----------------------------------------------------|
-   | `IMAGEPARSER_PHOTOS_DIR`  | `/mnt/tank/photos/scans`         | Dataset exposed to the web UI (mounted at `/data`)  |
-   | `IMAGEPARSER_CONFIG_DIR`  | `/mnt/tank/apps/imageparser`     | Saved Immich settings + encryption key              |
-   | `PUID` / `PGID`           | `568` / `568`                    | Owner of the photo dataset (`ls -ln` to check)      |
-   | `IMAGEPARSER_PORT`        | `8080`                           | Host port for the web UI                            |
-   | `IMAGEPARSER_USERNAME`    | `admin`                          | Optional HTTP Basic auth user                       |
-   | `IMAGEPARSER_PASSWORD`    | *(strong password)*              | Enables auth when set (recommended)                 |
+   | Variable                 | Example                      | Purpose                                            |
+   | ------------------------ | ---------------------------- | -------------------------------------------------- |
+   | `IMAGEPARSER_PHOTOS_DIR` | `/mnt/tank/photos/scans`     | Dataset exposed to the web UI (mounted at `/data`) |
+   | `IMAGEPARSER_CONFIG_DIR` | `/mnt/tank/apps/imageparser` | Saved Immich settings + encryption key             |
+   | `PUID` / `PGID`          | `568` / `568`                | Owner of the photo dataset (`ls -ln` to check)     |
+   | `IMAGEPARSER_PORT`       | `8080`                       | Host port for the web UI                           |
+   | `IMAGEPARSER_USERNAME`   | `admin`                      | Optional HTTP Basic auth user                      |
+   | `IMAGEPARSER_PASSWORD`   | _(strong password)_          | Enables auth when set (recommended)                |
 
 3. The container automatically assigns the config directory to `PUID`/`PGID` before dropping root privileges.
    Make sure that user can also write to the photo dataset; otherwise `.xmp` and EXIF updates will fail.
@@ -50,6 +50,16 @@ container. Keep it on your LAN, or put it behind a reverse proxy with TLS if you
 To run the web server locally without Docker: `npm run build`, then
 `IMAGEPARSER_ROOT=/path/to/photos IMAGEPARSER_CONFIG_DIR=./config npm run serve`.
 
+## Automated checks
+
+Unit tests use Node.js's built-in test runner, so no separate test framework dependency is needed. Add tests as
+`*.test.mjs` files and run them locally with `npm test`.
+
+The GitHub Actions CI workflow runs the tests, ESLint, and the production build whenever a pull request is opened,
+updated, or reopened. To block merges when any check fails, require the **Test, lint, and build** status check in the
+repository's branch protection rule or ruleset. CI installs dependencies with `npm install`; the project intentionally
+does not track `package-lock.json`.
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
@@ -69,9 +79,9 @@ If you are developing a production application, we recommend updating the config
 
 ```js
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(["dist"]),
   {
-    files: ['**/*.{ts,tsx}'],
+    files: ["**/*.{ts,tsx}"],
     extends: [
       // Other configs...
 
@@ -86,42 +96,40 @@ export default defineConfig([
     ],
     languageOptions: {
       parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        project: ["./tsconfig.node.json", "./tsconfig.app.json"],
         tsconfigRootDir: import.meta.dirname,
       },
       // other options...
     },
   },
-])
-
+]);
 ```
 
 You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
 
 ```js
 // eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+import reactX from "eslint-plugin-react-x";
+import reactDom from "eslint-plugin-react-dom";
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(["dist"]),
   {
-    files: ['**/*.{ts,tsx}'],
+    files: ["**/*.{ts,tsx}"],
     extends: [
       // Other configs...
       // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
+      reactX.configs["recommended-typescript"],
       // Enable lint rules for React DOM
       reactDom.configs.recommended,
     ],
     languageOptions: {
       parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        project: ["./tsconfig.node.json", "./tsconfig.app.json"],
         tsconfigRootDir: import.meta.dirname,
       },
       // other options...
     },
   },
-])
-
+]);
 ```
