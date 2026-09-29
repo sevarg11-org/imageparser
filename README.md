@@ -8,6 +8,33 @@ Double-click `install.bat` (or run `install.bat /nopause` from a terminal). It w
 2. Run `npm install` and `npm run build`.
 3. Create an **Image Parser** shortcut on your desktop.
 
+## Docker / TrueNAS (web version)
+
+The container runs Image Parser as a web app. Open `http://<truenas-ip>:8080` in any browser, click the folder
+button, and browse the mounted photo share. Metadata edits create or update the `.xmp` sidecars and write EXIF
+dates and orientation straight into the files on the share. The desktop (Electron) app is unchanged.
+
+1. In TrueNAS SCALE, create a stack (Apps → Discover → Install via YAML, or Dockge) from `docker-compose.yml`.
+2. Set these values in the stack's `.env` file:
+
+   | Variable                  | Example                          | Purpose                                             |
+   |---------------------------|----------------------------------|-----------------------------------------------------|
+   | `IMAGEPARSER_PHOTOS_DIR`  | `/mnt/tank/photos/scans`         | Dataset exposed to the web UI (mounted at `/data`)  |
+   | `IMAGEPARSER_CONFIG_DIR`  | `/mnt/tank/apps/imageparser`     | Saved Immich settings + encryption key              |
+   | `PUID` / `PGID`           | `568` / `568`                    | Owner of the photo dataset (`ls -ln` to check)      |
+   | `IMAGEPARSER_PORT`        | `8080`                           | Host port for the web UI                            |
+   | `IMAGEPARSER_USERNAME`    | `admin`                          | Optional HTTP Basic auth user                       |
+   | `IMAGEPARSER_PASSWORD`    | *(strong password)*              | Enables auth when set (recommended)                 |
+
+3. Make sure the `PUID`/`PGID` user can write to both datasets. Otherwise saving metadata will fail with a
+   permission error.
+
+The web UI can only reach files under `/data`, and paths outside it are rejected. There is no HTTPS in the
+container. Keep it on your LAN, or put it behind a reverse proxy with TLS if you expose it more widely.
+
+To run the web server locally without Docker: `npm run build`, then
+`IMAGEPARSER_ROOT=/path/to/photos IMAGEPARSER_CONFIG_DIR=./config npm run serve`.
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.

@@ -1,40 +1,42 @@
-FROM node:22-slim
+# syntax=docker/dockerfile:1
 
-# Install system dependencies, a window manager (Openbox), VNC server, and web client
-RUN apt-get update && apt-get install -y \
-    libgtk-3-0 libnss3 libatk-bridge2.0-0 libxss1 libasound2 libatk1.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
-    libgbm1 libpango-1.0-0 libcairo2 \
-    xvfb x11vnc openbox python3-xdg novnc websockify \
-    exiftool \
-    && rm -rf /var/lib/apt/lists/*
+# ---- Build stage: compile the React UI and install production dependencies ----
+FROM node:22-slim AS build
+WORKDIR /app
+# Electron is only needed for the desktop app; skip its ~100 MB binary in the container.
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build && npm prune --omit=dev
+
+# ---- Runtime stage: headless web server ----
+FROM node:22-slim
+# perl is required by exiftool-vendored to write EXIF data into the images.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends perl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data /config \
+    && chown node:node /data /config
 
 COPY --from=pkking/immich-go:latest /immich-go /usr/local/bin/immich-go
 
 WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json server.js core.js imageFileQueue.js ./
 
-# Copy application files
-COPY package*.json ./
-RUN npm install \
-    && npx install-electron
-COPY . .
+ENV NODE_ENV=production \
+    PORT=8080 \
+    IMAGEPARSER_ROOT=/data \
+    IMAGEPARSER_CONFIG_DIR=/config \
+    HOME=/tmp
 
-# Build the React UI into dist/ so Electron loads it instead of the Vite dev server
-RUN npm run build
-
-# Expose port 8080 for the browser interface
+# Override with `user:` in docker-compose to match the owner of your TrueNAS dataset.
+USER node
 EXPOSE 8080
 
-# Create a startup script to launch the virtual screen, window manager, and the web proxy
-RUN echo '#!/bin/bash\n\
-Xvfb :1 -screen 0 1280x720x24 &\n\
-export DISPLAY=:1\n\
-sleep 1\n\
-openbox-session &\n\
-# Run Electron with --no-sandbox since we are operating inside a root container environment\n\
-npm start -- --no-sandbox &\n\
-x11vnc -display :1 -nopw -forever -shared &\n\
-/usr/share/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 8080\n\
-' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
-CMD ["/app/entrypoint.sh"]
+CMD ["node", "server.js"]

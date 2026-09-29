@@ -9,7 +9,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "start": "electron ."
+    "start": "electron .",
+    "serve": "node server.js"
   },
   "dependencies": {
     "concurrently": "^10.0.5",

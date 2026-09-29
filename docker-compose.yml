@@ -6,14 +6,21 @@ services:
     image: ghcr.io/sevarg11-org/imageparser:latest
     pull_policy: always
     init: true
+    # Run as the owner of the photo dataset so .xmp sidecars and EXIF edits keep the right ownership.
+    # TrueNAS SCALE's built-in "apps" user is 568:568. Check yours with `ls -ln /mnt/<pool>/<dataset>`.
+    user: ${PUID:-568}:${PGID:-568}
     ports:
-      # Bind on all host interfaces so the TrueNAS LAN address can reach noVNC.
-      - 0.0.0.0:${IMAGEPARSER_PORT:-8080}:8080
+      # IMAGEPARSER_PORT / *_DIR / PUID / PGID are compose substitution variables: set them in the
+      # stack's .env file (Dockge: the ".env" editor), NOT under `environment:`.
+      - ${IMAGEPARSER_PORT:-8080}:8080
+    environment:
+      # Optional HTTP Basic auth. Strongly recommended, because the UI can read the saved Immich API keys.
+      IMAGEPARSER_USERNAME: ${IMAGEPARSER_USERNAME:-}
+      IMAGEPARSER_PASSWORD: ${IMAGEPARSER_PASSWORD:-}
     volumes:
-      # Set IMAGEPARSER_DATA_DIR to a TrueNAS dataset, for example:
-      # /mnt/tank/photos/imageparser-data:/data
-      - ${IMAGEPARSER_DATA_DIR:-./data}:/data
-      # Persist saved Immich settings in a dataset instead of an ephemeral volume.
-      - ${IMAGEPARSER_CONFIG_DIR:-./config}:/root/.config/imageparser
-    shm_size: 2gb
+      # The photo share the browser can browse and edit, for example /mnt/tank/photos/scans.
+      # Nothing outside this directory is reachable from the web UI.
+      - ${IMAGEPARSER_PHOTOS_DIR:-./data}:/data
+      # Saved Immich settings and the key that encrypts the API keys.
+      - ${IMAGEPARSER_CONFIG_DIR:-./config}:/config
     restart: unless-stopped

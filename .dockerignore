@@ -1,7 +1,12 @@
 .git
+.github
 .idea
 .smoke-test
 node_modules
 dist
+data
+config
 logs
 *.log
+*.iml
+install.bat
