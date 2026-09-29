@@ -26,3 +26,5 @@ dist-ssr
 # Local docker-compose volumes
 /data
 /config
+
+package-lock.json
