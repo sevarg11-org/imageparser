@@ -1,11 +1,11 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Install system dependencies, a window manager (Openbox), VNC server, and web client
 RUN apt-get update && apt-get install -y \
     libgtk-3-0 libnss3 libatk-bridge2.0-0 libxss1 libasound2 libatk1.0-0 \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 \
     libgbm1 libpango-1.0-0 libcairo2 \
-    xvfb x11vnc openbox novnc websockify \
+    xvfb x11vnc openbox python3-xdg novnc websockify \
     exiftool \
     && rm -rf /var/lib/apt/lists/*
 
@@ -15,8 +15,12 @@ WORKDIR /app
 
 # Copy application files
 COPY package*.json ./
-RUN npm install
+RUN npm install \
+    && npx install-electron
 COPY . .
+
+# Build the React UI into dist/ so Electron loads it instead of the Vite dev server
+RUN npm run build
 
 # Expose port 8080 for the browser interface
 EXPOSE 8080
