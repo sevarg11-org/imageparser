@@ -1,0 +1,7 @@
+.git
+.idea
+.smoke-test
+node_modules
+dist
+logs
+*.log
