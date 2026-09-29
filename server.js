@@ -11,6 +11,7 @@ import {
   getImageRevision,
   loadImmichSettings,
   needsRenderedPreview,
+  normalizeSortBy,
   readDirectory,
   readSidecarMetadata,
   renderPreviewPng,
@@ -302,7 +303,8 @@ const createApiRoutes = (secretCodec) => ({
   'POST /api/read-directory': async (request) => {
     const body = await readJsonBody(request)
     const directoryPath = await resolvePathInRoot(body.directoryPath)
-    return readDirectory(directoryPath, body.sortBy === 'fileName' ? 'fileName' : defaultSortBy)
+    const { field, direction } = normalizeSortBy(body.sortBy ?? defaultSortBy)
+    return readDirectory(directoryPath, `${field}-${direction}`)
   },
   'POST /api/read-sidecar-metadata': async (request) => {
     const body = await readJsonBody(request)

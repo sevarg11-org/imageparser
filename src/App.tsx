@@ -23,7 +23,9 @@ type ImagePair = {
   createdAt: number
 }
 
-type SortOption = 'createdAt' | 'fileName'
+type SortField = 'createdAt' | 'dateTaken' | 'fileName'
+type SortDirection = 'asc' | 'desc'
+type SortOption = `${SortField}-${SortDirection}`
 
 type MetadataForm = {
   date: string
@@ -305,7 +307,7 @@ function App() {
   const [pairs, setPairs] = useState<ImagePair[]>([])
   const [selectedIndex, setSelectedIndex] = useState(0)
   const [imageNumberInput, setImageNumberInput] = useState('1')
-  const [sortBy, setSortBy] = useState<SortOption>('createdAt')
+  const [sortBy, setSortBy] = useState<SortOption>('createdAt-asc')
   const [metadata, setMetadata] = useState<MetadataForm>({
     date: defaultDate,
     description: '',
@@ -940,6 +942,7 @@ function App() {
 
   const reloadDirectory = useCallback(async (nextSortBy: SortOption) => {
     if (!window.electronAPI || !directoryPath) {
+      setSortBy(nextSortBy)
       return
     }
 
@@ -1210,8 +1213,12 @@ function App() {
                   }}
                   disabled={isImageControlLocked}
                 >
-                  <option value="createdAt">File created date</option>
-                  <option value="fileName">File name (A-Z)</option>
+                  <option value="createdAt-asc">File created (oldest first)</option>
+                  <option value="createdAt-desc">File created (newest first)</option>
+                  <option value="dateTaken-asc">Date taken (oldest first)</option>
+                  <option value="dateTaken-desc">Date taken (newest first)</option>
+                  <option value="fileName-asc">File name (A-Z)</option>
+                  <option value="fileName-desc">File name (Z-A)</option>
                 </select>
               </label>
               <button
