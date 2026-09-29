@@ -30,8 +30,7 @@ openbox-session &\n\
 # Run Electron with --no-sandbox since we are operating inside a root container environment\n\
 npm start -- --no-sandbox &\n\
 x11vnc -display :1 -nopw -forever -shared &\n\
-/usr/share/novnc/utils/launch.sh --vnc localhost:5900 --listen 8080\n\
+/usr/share/novnc/utils/novnc_proxy --vnc localhost:5900 --listen 8080\n\
 ' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
 CMD ["/app/entrypoint.sh"]
-

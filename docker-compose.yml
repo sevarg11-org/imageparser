@@ -1,0 +1,19 @@
+networks:
+  default:
+    name: imageparser
+services:
+  imageparser:
+    image: ghcr.io/sevarg11-org/imageparser:latest
+    pull_policy: always
+    init: true
+    ports:
+      # Bind on all host interfaces so the TrueNAS LAN address can reach noVNC.
+      - 0.0.0.0:${IMAGEPARSER_PORT:-8080}:8080
+    volumes:
+      # Set IMAGEPARSER_DATA_DIR to a TrueNAS dataset, for example:
+      # /mnt/tank/photos/imageparser-data:/data
+      - ${IMAGEPARSER_DATA_DIR:-./data}:/data
+      # Persist saved Immich settings in a dataset instead of an ephemeral volume.
+      - ${IMAGEPARSER_CONFIG_DIR:-./config}:/root/.config/imageparser
+    shm_size: 2gb
+    restart: unless-stopped
