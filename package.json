@@ -8,6 +8,7 @@
     "dev": "concurrently -k \"vite --host localhost\" \"wait-on http://localhost:5173 && electron .\"",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "node --test",
     "preview": "vite preview",
     "start": "electron .",
     "serve": "node server.js",
