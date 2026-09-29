@@ -8,6 +8,10 @@ jobs:
   push-to-registry:
     name: Build and Push Docker image to GitHub Packages
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
