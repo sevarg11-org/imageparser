@@ -6,6 +6,7 @@ WORKDIR /app
 # Electron is only needed for the desktop app; skip its ~100 MB binary in the container.
 ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
 COPY package*.json ./
+RUN npm install
 RUN npm ci
 COPY . .
 RUN npm run build && npm prune --omit=dev
