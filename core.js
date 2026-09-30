@@ -615,7 +615,7 @@ const readSidecarMetadata = async (filePath) => {
       return "";
     };
 
-    const date = getTagValue(...sidecarDatePatterns) || "";
+    let date = getTagValue(...sidecarDatePatterns) || "";
 
     if (!date) {
       const tags = await exiftool.read(filePath);
