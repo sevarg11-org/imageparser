@@ -1,4 +1,6 @@
 .app-shell {
+  width: 100%;
+  box-sizing: border-box;
   margin: 0 auto;
   padding: 24px;
   color: #e2e8f0;
@@ -79,6 +81,7 @@
   padding: 0.9rem 1rem;
   margin-bottom: 24px;
   color: #cbd5e1;
+  min-width: 300px;
 }
 
 .status-bar strong {
@@ -254,11 +257,8 @@
 
 .image-card img {
   display: block;
-  width: auto;
-  max-width: 100%;
+  width: 100%;
   height: auto;
-  max-height: 420px;
-  margin-inline: auto;
   background: linear-gradient(
     135deg,
     rgba(15, 23, 42, 0.8),
@@ -299,10 +299,10 @@
   box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.45);
   z-index: 5;
   transition:
-    left 0.2s ease-out,
-    top 0.2s ease-out,
-    background-size 0.3s ease-out,
-    background-position 0.3s ease-out;
+    left 100ms ease-out,
+    top 100ms ease-out,
+    background-size 100ms ease-out,
+    background-position 100ms ease-out;
 }
 
 .metadata-panel {
@@ -324,7 +324,6 @@
     );
   gap: 14px;
   align-items: end;
-  transition: grid-template-columns 0.3s ease-out;
 }
 
 .metadata-panel label {
