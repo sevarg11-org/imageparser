@@ -2,7 +2,7 @@ name: publish
 on:
   push:
     branches:
-      - master  # Triggers the workflow on pushes to the main branch
+      - master # Triggers the workflow on pushes to the main branch
 
 jobs:
   push-to-registry:
