@@ -342,6 +342,7 @@ function App() {
   });
   const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
+  const [filterOnlyPairs, setFilterOnlyPairs] = useState(false);
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
   );
@@ -374,9 +375,14 @@ function App() {
   const saveTimeoutRef = useRef<number | null>(null);
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
+  const displayPairs = useMemo(
+    () => (filterOnlyPairs ? pairs.filter((p) => p.backPath !== null) : pairs),
+    [pairs, filterOnlyPairs],
+  );
+
   const selectedPair = useMemo(
-    () => (pairs[selectedIndex] ? pairs[selectedIndex] : null),
-    [pairs, selectedIndex],
+    () => (displayPairs[selectedIndex] ? displayPairs[selectedIndex] : null),
+    [displayPairs, selectedIndex],
   );
 
   useEffect(() => {
@@ -574,7 +580,11 @@ function App() {
 
   const navigateToIndex = useCallback(
     async (nextIndex: number, formValues?: MetadataForm) => {
-      const boundedIndex = Math.min(Math.max(nextIndex, 0), pairs.length - 1);
+      const boundedIndex = Math.min(
+        Math.max(nextIndex, 0),
+        displayPairs.length - 1,
+      );
+
       if (boundedIndex === selectedIndex || isUploading || !isHydrated) {
         return;
       }
@@ -632,8 +642,8 @@ function App() {
           ...current.filter(
             (tag) =>
               !(frontXmpValues.tags ?? []).some(
-                  (loadedTag) =>
-                      loadedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
+                (loadedTag) =>
+                  loadedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
               ),
           ),
         ]);
@@ -1364,6 +1374,14 @@ function App() {
                   <option value="fileName-desc">File name (Z-A)</option>
                 </select>
               </label>
+              <label className="filter-control">
+                <input
+                  type="checkbox"
+                  checked={filterOnlyPairs}
+                  onChange={(event) => setFilterOnlyPairs(event.target.checked)}
+                />
+                <span>Only pairs</span>
+              </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex - 1)}
@@ -1371,6 +1389,7 @@ function App() {
               >
                 Previous
               </button>
+
               <label className="image-counter">
                 <span className="visually-hidden">Go to image</span>
                 <input
