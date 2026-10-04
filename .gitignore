@@ -28,3 +28,4 @@ dist-ssr
 /config
 
 package-lock.json
+/.config/secret.key
