@@ -424,6 +424,10 @@ function App() {
     [displayPairs, selectedIndex],
   );
 
+  /**
+   * Loads Immich settings from storage on app initialization.
+   * Hydrates the immichSettings state and displays any error messages from failed loads.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!electronApi) {
@@ -455,6 +459,9 @@ function App() {
     };
   }, []);
 
+  /**
+   * Persists the expanded/collapsed state of the metadata entry panel to sessionStorage.
+   */
   useEffect(() => {
     window.sessionStorage.setItem(
       METADATA_ENTRY_SESSION_KEY,
@@ -462,6 +469,10 @@ function App() {
     );
   }, [isMetadataEntryExpanded]);
 
+  /**
+   * Sets up an event listener for Immich upload progress updates.
+   * Updates the immichOutput and immichStatus states when progress events occur.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!electronApi) {
@@ -474,6 +485,10 @@ function App() {
     });
   }, []);
 
+  /**
+   * Starts a timer to track upload elapsed time when uploading is in progress.
+   * Updates the uploadElapsedSeconds state every second while isUploading is true.
+   */
   useEffect(() => {
     if (!isUploading) {
       return;
@@ -487,6 +502,9 @@ function App() {
     return () => window.clearInterval(timer);
   }, [isUploading]);
 
+  /**
+   * Auto-scrolls the immichOutput element to the bottom when new output is available.
+   */
   useEffect(() => {
     const outputElement = immichOutputRef.current;
     if (outputElement && isImmichOutputFollowingRef.current) {
@@ -650,6 +668,10 @@ function App() {
     [isHydrated, isUploading, pairs.length, persistCurrentPair, selectedIndex],
   );
 
+  /**
+   * Loads metadata from XMP sidecar files when the selected pair changes.
+   * Hydrates the component with initial state and updates metadata, rotations, and status.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!selectedPair || !electronApi) {
@@ -733,6 +755,10 @@ function App() {
     };
   }, [pairs.length, selectedIndex, selectedPair]);
 
+  /**
+   * Debounces metadata saves and clears pending changes when conditions change.
+   * Triggers a save after user changes stabilize or when navigation occurs.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!selectedPair || !electronApi || !isHydrated) {
@@ -769,6 +795,9 @@ function App() {
     };
   }, [clearPendingSave, selectedPair, metadata, isHydrated, savePairMetadata]);
 
+  /**
+   * Focuses the date input field when the component becomes hydrated and a pair is selected.
+   */
   useEffect(() => {
     if (!selectedPair || !isHydrated) {
       return;
