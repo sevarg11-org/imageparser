@@ -124,9 +124,19 @@ declare global {
   }
 }
 
+/**
+ * Normalizes a rotation value to a multiple of 90 degrees within the range [0, 360).
+ * @param value - The rotation value in degrees.
+ * @returns The normalized rotation value in degrees.
+ */
 const normalizeRotation = (value: number) =>
   (((Math.round(value / 90) % 4) + 4) % 4) * 90;
 
+/**
+ * Formats elapsed time in seconds into a human-readable string (e.g., "1m 30s").
+ * @param elapsedSeconds - The elapsed time in seconds.
+ * @returns A formatted time string.
+ */
 const formatElapsedTime = (elapsedSeconds: number) => {
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
@@ -135,11 +145,30 @@ const formatElapsedTime = (elapsedSeconds: number) => {
     : `${seconds}s`;
 };
 
+/**
+ * Formats an image status message for display in the UI.
+ * @param index - The current image index (0-based).
+ * @param total - The total number of images.
+ * @param label - The image label.
+ * @returns A formatted status string.
+ */
 const formatImageStatus = (index: number, total: number, label: string) =>
   `Image ${index + 1} of ${total}: ${label}.`;
 
+/**
+ * Formats a metadata save confirmation message for display in the UI.
+ * @param label - The image label whose metadata was saved.
+ * @returns A formatted status string.
+ */
 const formatSavedStatus = (label: string) => `Saved changes to ${label}.`;
 
+/**
+ * Resolves the preview source URL for an image, accounting for rotation.
+ * When running in Electron, attempts to use a preview data URL; otherwise falls back to a file URL.
+ * @param filePath - The path to the image file.
+ * @param rotation - The rotation value in degrees.
+ * @returns A resolved source URL for displaying the image preview.
+ */
 const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
   const [src, setSrc] = useState("");
 
@@ -205,6 +234,10 @@ const MagnifiedImage = ({
     backgroundPosition: string;
   } | null>(null);
 
+  /**
+   * Handles mouse movement events to update the magnifier lens position and style.
+   * @param event - The React mouse event object containing mouse position information.
+   */
   const handleMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
     const container = containerRef.current;
     const image = imageRef.current;
@@ -293,6 +326,12 @@ const MagnifiedImage = ({
   );
 };
 
+/**
+ * Converts a file system path to a file:// URL for preview display.
+ * Handles Windows paths, absolute/relative URLs, and properly encodes special characters.
+ * @param filePath - The file system path to convert.
+ * @returns A file:// URL string or an empty string if the path is empty.
+ */
 const toFileUrl = (filePath: string) => {
   if (!filePath) {
     return "";
@@ -385,6 +424,10 @@ function App() {
     [displayPairs, selectedIndex],
   );
 
+  /**
+   * Loads Immich settings from storage on app initialization.
+   * Hydrates the immichSettings state and displays any error messages from failed loads.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!electronApi) {
@@ -416,6 +459,9 @@ function App() {
     };
   }, []);
 
+  /**
+   * Persists the expanded/collapsed state of the metadata entry panel to sessionStorage.
+   */
   useEffect(() => {
     window.sessionStorage.setItem(
       METADATA_ENTRY_SESSION_KEY,
@@ -423,6 +469,10 @@ function App() {
     );
   }, [isMetadataEntryExpanded]);
 
+  /**
+   * Sets up an event listener for Immich upload progress updates.
+   * Updates the immichOutput and immichStatus states when progress events occur.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!electronApi) {
@@ -435,6 +485,10 @@ function App() {
     });
   }, []);
 
+  /**
+   * Starts a timer to track upload elapsed time when uploading is in progress.
+   * Updates the uploadElapsedSeconds state every second while isUploading is true.
+   */
   useEffect(() => {
     if (!isUploading) {
       return;
@@ -448,6 +502,9 @@ function App() {
     return () => window.clearInterval(timer);
   }, [isUploading]);
 
+  /**
+   * Auto-scrolls the immichOutput element to the bottom when new output is available.
+   */
   useEffect(() => {
     const outputElement = immichOutputRef.current;
     if (outputElement && isImmichOutputFollowingRef.current) {
@@ -488,6 +545,12 @@ function App() {
     [rotations],
   );
 
+  /**
+   * Persists metadata changes to the current selected pair and applies image rotations if needed.
+   * This is a debounced operation that saves changes after user input stabilizes.
+   * @param formValues - The metadata form values (description, date, tags) to persist.
+   *                      If not provided, uses the current metadata state.
+   */
   const persistCurrentPair = useCallback(
     (formValues: MetadataForm = metadata) => {
       if (pendingPersistenceRef.current) {
@@ -578,6 +641,12 @@ function App() {
     [clearPendingSave, metadata, rotations, savePairMetadata, selectedPair],
   );
 
+  /**
+   * Navigates to a specific image index after persisting changes from the current pair.
+   * Binds the index to the valid range of displayed pairs and returns early if already at the target.
+   * @param nextIndex - The target zero-based image index to navigate to.
+   * @param formValues - Optional metadata form values to persist before navigating.
+   */
   const navigateToIndex = useCallback(
     async (nextIndex: number, formValues?: MetadataForm) => {
       const boundedIndex = Math.min(
@@ -599,6 +668,10 @@ function App() {
     [isHydrated, isUploading, pairs.length, persistCurrentPair, selectedIndex],
   );
 
+  /**
+   * Loads metadata from XMP sidecar files when the selected pair changes.
+   * Hydrates the component with initial state and updates metadata, rotations, and status.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!selectedPair || !electronApi) {
@@ -682,6 +755,10 @@ function App() {
     };
   }, [pairs.length, selectedIndex, selectedPair]);
 
+  /**
+   * Debounces metadata saves and clears pending changes when conditions change.
+   * Triggers a save after user changes stabilize or when navigation occurs.
+   */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!selectedPair || !electronApi || !isHydrated) {
@@ -718,6 +795,9 @@ function App() {
     };
   }, [clearPendingSave, selectedPair, metadata, isHydrated, savePairMetadata]);
 
+  /**
+   * Focuses the date input field when the component becomes hydrated and a pair is selected.
+   */
   useEffect(() => {
     if (!selectedPair || !isHydrated) {
       return;
@@ -733,6 +813,12 @@ function App() {
     };
   }, [isHydrated, selectedPair]);
 
+  /**
+   * Rotates an image by a given delta value (in 90-degree increments).
+   * Does not apply rotation if already persisting, uploading, or not hydrated.
+   * @param field - Which image to rotate ("front" or "back").
+   * @param delta - The rotation change in degrees (typically ±90).
+   */
   const rotateImage = useCallback(
     (field: RotationField, delta: number) => {
       if (isPersistingRotation || isUploading || !isHydrated) {
@@ -748,7 +834,15 @@ function App() {
     [isHydrated, isPersistingRotation, isUploading],
   );
 
+  /**
+   * Handles keyboard events for navigation and image rotation hotkeys (q, w, e, r, arrow keys).
+   * Rotates images on Q/W/E/R or navigates with arrow keys when inputs are not focused.
+   */
   useEffect(() => {
+    /**
+     * Handles keyboard events for image rotation hotkeys (q/w/e/r) and navigation (arrow keys).
+     * Does nothing when inputs are focused or during busy operations.
+     */
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       const tagName = target?.tagName ?? "";
@@ -817,16 +911,31 @@ function App() {
     selectedPair?.backPath,
   ]);
 
+  /**
+   * Updates a metadata form field value (date or description).
+   * Marks the current pair as having user changes that need to be persisted.
+   * @param field - The field to update ("date" or "description").
+   * @param value - The new value for the field.
+   */
   const updateFormField = (field: "date" | "description", value: string) => {
     hasUserChangedRef.current = true;
     setMetadata((current) => ({ ...current, [field]: value }));
   };
 
+  /**
+   * Updates the tags array for the current pair's metadata.
+   * Marks the current pair as having user changes that need to be persisted.
+   * @param tags - The new array of tag strings.
+   */
   const updateTags = (tags: string[]) => {
     hasUserChangedRef.current = true;
     setMetadata((current) => ({ ...current, tags }));
   };
 
+  /**
+   * Adds a new tag from user input to the current pair's metadata if it doesn't already exist.
+   * Moves the added tag to the front of recent tags and clears the input field.
+   */
   const addTag = () => {
     const tag = tagInput.trim();
     if (!tag) {
@@ -851,6 +960,10 @@ function App() {
     setTagInput("");
   };
 
+  /**
+   * Toggles a tag in the selected tags array - removes it if present, adds it if absent.
+   * @param tag - The tag string to toggle (add or remove).
+   */
   const toggleTag = (tag: string) => {
     const selectedTagIndex = metadata.tags.findIndex(
       (selectedTag) =>
@@ -863,6 +976,11 @@ function App() {
     );
   };
 
+  /**
+   * Updates date segment values (month/day/year) and synchronizes with the metadata date field.
+   * When a complete valid date is entered, the date form field is updated accordingly.
+   * @param next - The updated date segments object with month, day, and year digits.
+   */
   const updateDateSegments = (next: DateSegments) => {
     dateSegmentsRef.current = next;
     setDateSegments(next);
@@ -872,6 +990,12 @@ function App() {
     }
   };
 
+  /**
+   * Handles individual date segment (month/day/year) input changes with digit validation and focus jumping.
+   * Automatically moves focus to the next field when a valid partial value is entered.
+   * @param field - The date segment field that changed ("month", "day", or "year").
+   * @param value - The new digit string value for the field.
+   */
   const handleDateSegmentChange = (
     field: keyof DateSegments,
     value: string,
@@ -892,6 +1016,11 @@ function App() {
     }
   };
 
+  /**
+   * Handles keyboard events for the image number navigation input field.
+   * Navigates to the specified image index when Enter is pressed with a valid number.
+   * @param event - The React keyboard event containing the key pressed.
+   */
   const handleImageNumberKeyDown = (
     event: ReactKeyboardEvent<HTMLInputElement>,
   ) => {
@@ -913,6 +1042,11 @@ function App() {
     void navigateToIndex(imageNumber - 1);
   };
 
+  /**
+   * Validates and completes a date segment value on blur by filling missing digits with defaults.
+   * Updates the metadata date field if the resulting ISO date differs from the current value.
+   * @param field - The date segment that lost focus ("month", "day", or "year").
+   */
   const handleDateSegmentBlur = (field: keyof DateSegments) => {
     const current = dateSegmentsRef.current;
     const next = {
@@ -925,6 +1059,11 @@ function App() {
     }
   };
 
+  /**
+   * Handles keyboard events for the description input field, navigating to the next image on Enter.
+   * Persists current pair's changes and advances navigation when at the last image.
+   * @param event - The React keyboard event containing the key pressed.
+   */
   const handleDescriptionKeyDown = async (
     event: ReactKeyboardEvent<HTMLInputElement>,
   ) => {
@@ -953,6 +1092,12 @@ function App() {
     await navigateToIndex(selectedIndex + 1);
   };
 
+  /**
+   * Handles keyboard events for date segment inputs, validating and completing values on Enter key.
+   * Navigates to the next image after persisting changes or shows an error if date is invalid.
+   * @param event - The React keyboard event containing the key pressed.
+   * @param field - The date segment field associated with this input ("month", "day", or "year").
+   */
   const handleDateKeyDown = async (
     event: ReactKeyboardEvent<HTMLInputElement>,
     field: keyof DateSegments,
@@ -997,6 +1142,14 @@ function App() {
     await navigateToIndex(selectedIndex + 1, formValues);
   };
 
+  /**
+   * Loads images from a selected directory by persisting any pending changes first.
+   * Scans the directory for photos and displays them in pairs based on file creation time.
+   */
+  /**
+   * Loads images from a selected directory by persisting any pending changes first.
+   * Scans the directory for photos and displays them in pairs based on file creation time.
+   */
   const handleChooseDirectory = async () => {
     if (!window.electronAPI) {
       setStatus("This application must run inside Electron.");
@@ -1048,6 +1201,11 @@ function App() {
     }
   };
 
+  /**
+   * Reloads and re-sorts images in the current directory with a new sort option.
+   * Persists any pending changes before refreshing the image list.
+   * @param nextSortBy - The new sort field and direction to apply (e.g., "createdAt-asc").
+   */
   const reloadDirectory = useCallback(
     async (nextSortBy: SortOption) => {
       if (!window.electronAPI || !directoryPath) {
@@ -1089,6 +1247,12 @@ function App() {
     [directoryPath, persistCurrentPair],
   );
 
+  /**
+   * Updates an Immich setting field with a new value and persists it to storage.
+   * @template Field - The name of the setting field to update (e.g., "serverUrl", "userApiKey").
+   * @param field - The setting field identifier.
+   * @param value - The new value for this field.
+   */
   const updateImmichSetting = <Field extends keyof ImmichSettings>(
     field: Field,
     value: ImmichSettings[Field],
@@ -1096,6 +1260,10 @@ function App() {
     setImmichSettings((current) => ({ ...current, [field]: value }));
   };
 
+  /**
+   * Handles the upload of images to Immich after applying pending image rotations.
+   * Saves settings, processes any outstanding rotation tasks, then uploads the directory.
+   */
   const handleImmichUpload = async () => {
     const electronApi = window.electronAPI;
     if (!electronApi) {
