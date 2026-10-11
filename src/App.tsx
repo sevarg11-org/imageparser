@@ -225,6 +225,7 @@ const MagnifiedImage = ({
   rotation: number;
 }) => {
   const src = useResolvedPreviewSrc(filePath, rotation);
+  const [isLoading, setIsLoading] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const [lensStyle, setLensStyle] = useState<{
@@ -306,8 +307,13 @@ const MagnifiedImage = ({
       onMouseMove={handleMouseMove}
       onMouseLeave={() => setLensStyle(null)}
     >
-      <img ref={imageRef} src={src} alt={altText} />
-      {lensStyle && src ? (
+      <img
+        ref={imageRef}
+        src={src}
+        alt={altText}
+        onLoad={() => setIsLoading(false)}
+      />
+      {!isLoading && lensStyle && src ? (
         <div
           className="magnifier-lens"
           style={{
@@ -415,12 +421,15 @@ function App() {
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
   const displayPairs = useMemo(
-    () => (filterOnlyPairs ? pairs.filter((p) => p.backPath !== null) : pairs),
+    () => (filterOnlyPairs ? pairs.filter((p) => !!p.backPath) : pairs),
     [pairs, filterOnlyPairs],
   );
 
   const selectedPair = useMemo(
-    () => (displayPairs[selectedIndex] ? displayPairs[selectedIndex] : null),
+    () =>
+      displayPairs.length > 0 && selectedIndex < displayPairs.length
+        ? displayPairs[selectedIndex]
+        : null,
     [displayPairs, selectedIndex],
   );
 
@@ -665,7 +674,13 @@ function App() {
       setImageNumberInput(String(boundedIndex + 1));
       setSelectedIndex(boundedIndex);
     },
-    [isHydrated, isUploading, pairs.length, persistCurrentPair, selectedIndex],
+    [
+      displayPairs.length,
+      isHydrated,
+      isUploading,
+      persistCurrentPair,
+      selectedIndex,
+    ],
   );
 
   /**
@@ -1341,7 +1356,7 @@ function App() {
         {directoryPath ? <strong>{directoryPath}</strong> : null}
       </div>
 
-      {!selectedPair ? (
+      {!directoryPath ? (
         <section className="empty-state">
           <p>Select a local directory to review your images.</p>
         </section>
@@ -1360,7 +1375,12 @@ function App() {
                     maxLength={2}
                     aria-label="Month"
                     value={dateSegments.month}
-                    onFocus={(event) => event.currentTarget.select()}
+                    onFocus={(event) => {
+                      // Only select text if it's empty (new image load), allow overwrite otherwise
+                      if (!dateSegments.month) {
+                        event.currentTarget.select();
+                      }
+                    }}
                     onChange={(event) =>
                       handleDateSegmentChange("month", event.target.value)
                     }
@@ -1585,80 +1605,86 @@ function App() {
 
             <div
               className={`image-stack${
-                !selectedPair.backPath || isExpanded
+                !selectedPair || !selectedPair.backPath || isExpanded
                   ? " image-stack--single"
                   : ""
               }${isExpanded ? " image-stack--expanded" : ""}`}
             >
-              <div className="image-card">
-                <div className="image-card-header">
-                  <div className="image-label">Front image</div>
-                  <div className="image-actions">
-                    <button
-                      type="button"
-                      onClick={() => rotateImage("front", -90)}
-                      disabled={isImageControlLocked}
-                    >
-                      Rotate left
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => rotateImage("front", 90)}
-                      disabled={isImageControlLocked}
-                    >
-                      Rotate right
-                    </button>
-                    <button
-                      type="button"
-                      onClick={toggleExpanded}
-                      disabled={isImageControlLocked}
-                    >
-                      {isExpanded ? "Collapse" : "Expand"}
-                    </button>
-                  </div>
-                </div>
-                <MagnifiedImage
-                  filePath={selectedPair.frontPath}
-                  altText={selectedPair.imageLabel}
-                  rotation={rotations.front}
-                />
-              </div>
-
-              {selectedPair.backPath ? (
-                <div className="image-card">
-                  <div className="image-card-header">
-                    <div className="image-label">Back image</div>
-                    <div className="image-actions">
-                      <button
-                        type="button"
-                        onClick={() => rotateImage("back", -90)}
-                        disabled={isImageControlLocked}
-                      >
-                        Rotate left
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => rotateImage("back", 90)}
-                        disabled={isImageControlLocked}
-                      >
-                        Rotate right
-                      </button>
-                      <button
-                        type="button"
-                        onClick={toggleExpanded}
-                        disabled={isImageControlLocked}
-                      >
-                        {isExpanded ? "Collapse" : "Expand"}
-                      </button>
+              {displayPairs.length > 0 ? (
+                <div>
+                  <div className="image-card">
+                    <div className="image-card-header">
+                      <div className="image-label">Front image</div>
+                      <div className="image-actions">
+                        <button
+                          type="button"
+                          onClick={() => rotateImage("front", -90)}
+                          disabled={isImageControlLocked}
+                        >
+                          Rotate left
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => rotateImage("front", 90)}
+                          disabled={isImageControlLocked}
+                        >
+                          Rotate right
+                        </button>
+                        <button
+                          type="button"
+                          onClick={toggleExpanded}
+                          disabled={isImageControlLocked}
+                        >
+                          {isExpanded ? "Collapse" : "Expand"}
+                        </button>
+                      </div>
                     </div>
+                    <MagnifiedImage
+                      filePath={selectedPair?.frontPath ?? ""}
+                      altText={`${selectedPair?.imageLabel ?? ""}`}
+                      rotation={rotations.front}
+                    />
                   </div>
-                  <MagnifiedImage
-                    filePath={selectedPair.backPath}
-                    altText={`${selectedPair.imageLabel} backside`}
-                    rotation={rotations.back}
-                  />
+
+                  {selectedPair && selectedPair.backPath ? (
+                    <div className="image-card">
+                      <div className="image-card-header">
+                        <div className="image-label">Back image</div>
+                        <div className="image-actions">
+                          <button
+                            type="button"
+                            onClick={() => rotateImage("back", -90)}
+                            disabled={isImageControlLocked}
+                          >
+                            Rotate left
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => rotateImage("back", 90)}
+                            disabled={isImageControlLocked}
+                          >
+                            Rotate right
+                          </button>
+                          <button
+                            type="button"
+                            onClick={toggleExpanded}
+                            disabled={isImageControlLocked}
+                          >
+                            {isExpanded ? "Collapse" : "Expand"}
+                          </button>
+                        </div>
+                      </div>
+                      <MagnifiedImage
+                        filePath={selectedPair?.backPath ?? ""}
+                        altText={`${selectedPair?.imageLabel ?? ""} backside`}
+                        rotation={rotations.back}
+                      />
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
+              ) : (
+                <p>No Pairs Available</p>
+              )}
             </div>
           </section>
 
