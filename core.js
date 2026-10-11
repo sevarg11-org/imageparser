@@ -108,7 +108,7 @@ const buildImmichUploadArguments = (settings, directoryPath) => {
     `--api-key=${settings.userApiKey}`,
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
     `--into-album=${settings.albumName}`,
-    "--ban-file=**_b.**",
+    `--ban-file=**_b.**`,
   ];
 
   if (settings.adminApiKey) {

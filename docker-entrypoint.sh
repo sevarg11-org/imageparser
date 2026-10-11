@@ -30,7 +30,7 @@ if [ "$(id -u)" = "0" ]; then
         echo "Image browsing will work, but XMP and EXIF updates may fail." >&2
     fi
 
-    exec gosu "$PUID:$PGID" "$@"
+    exec gosu "$PUID:$PGID" env HOME=/tmp "$@"
 fi
 
 if [ ! -w "$CONFIG_DIRECTORY" ]; then
