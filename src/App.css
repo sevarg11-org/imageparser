@@ -209,6 +209,7 @@
 }
 
 .image-card {
+  grid-column: span 1;
   background: rgba(15, 23, 42, 0.96);
   border-radius: 14px;
   overflow: hidden;

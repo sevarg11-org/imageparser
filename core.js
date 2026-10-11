@@ -191,26 +191,26 @@ const buildImmichUploadArguments = (settings, directoryPath) => {
     "upload",
     "from-folder",
     "--concurrent-tasks",
-    `${String(settings.concurrentTasks)}`,
+    String(settings.concurrentTasks),
     "--no-ui",
     "--server",
-    `${settings.serverUrl}`,
+    String(settings.serverUrl),
     "--recursive=false",
     "--api-key",
-    `${settings.userApiKey}`,
+    String(settings.userApiKey),
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
     "--into-album",
-    `${settings.albumName}`,
+    String(settings.albumName),
     "--ban-file",
     "**_b.**",
   ];
 
   if (settings.adminApiKey) {
-    uploadArguments.push(`--admin-api-key=${settings.adminApiKey}`);
+    uploadArguments.push("--admin-api-key", String(settings.adminApiKey));
   }
 
   for (const tag of tags) {
-    uploadArguments.push(`--tag=${tag}`);
+    uploadArguments.push("--tag", String(tag));
   }
 
   uploadArguments.push(directoryPath);
