@@ -66,11 +66,22 @@ class HttpError extends Error {
 
 let rootDirectory = configuredRoot;
 
+/**
+ * Checks if a path is within the root directory.
+ * @param {string} candidatePath - The path to check.
+ * @returns {boolean} True if the path is inside the root directory.
+ */
 const isInsideRoot = (candidatePath) =>
   candidatePath === rootDirectory ||
   candidatePath.startsWith(rootDirectory + path.sep);
 
 // Resolves symlinks so a link inside the share cannot be used to escape it.
+/**
+ * Resolves a requested path within the root directory, handling symlinks.
+ * @param {string} requestedPath - The requested path to resolve.
+ * @returns {Promise<string>} The resolved absolute path within root.
+ * @throws {HttpError} 400 if no path provided, 404 if not found, 403 if outside root.
+ */
 const resolvePathInRoot = async (requestedPath) => {
   const rawPath = String(requestedPath ?? "").trim();
   if (!rawPath) {
@@ -98,9 +109,18 @@ const resolvePathInRoot = async (requestedPath) => {
   return realPath;
 };
 
+/**
+ * Resolves an optional requested path within the root directory.
+ * @param {string} requestedPath - The requested path to resolve (optional).
+ * @returns {Promise<string|null>} The resolved absolute path or null if not provided.
+ */
 const resolveOptionalPathInRoot = async (requestedPath) =>
   requestedPath ? resolvePathInRoot(requestedPath) : null;
 
+/**
+ * Loads the secret key for AES-GCM encryption, from environment or generating a new one.
+ * @returns {Promise<Buffer>} The 32-byte secret key as a Buffer.
+ */
 const loadSecretKey = async () => {
   if (process.env.IMAGEPARSER_SECRET_KEY) {
     const key = Buffer.from(process.env.IMAGEPARSER_SECRET_KEY, "base64");
@@ -130,8 +150,18 @@ const loadSecretKey = async () => {
   return key;
 };
 
+/**
+ * Creates an AES-GCM codec for encrypting and decrypting sensitive data.
+ * @param {Buffer} key - The 32-byte secret key.
+ * @returns {Object} Object with encrypt and decrypt methods.
+ */
 const createAesGcmCodec = (key) =>
   Object.freeze({
+    /**
+     * Encrypts a value using AES-256-GCM.
+     * @param {string} value - The plaintext value to encrypt.
+     * @returns {string} The encrypted value as a base64 string with prefix.
+     */
     encrypt: (value) => {
       const iv = randomBytes(12);
       const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -171,6 +201,12 @@ const createAesGcmCodec = (key) =>
     },
   });
 
+/**
+ * Compares two strings using timing-safe comparison to prevent timing attacks.
+ * @param {string} left - The first string to compare.
+ * @param {string} right - The second string to compare.
+ * @returns {boolean} True if the strings are equal.
+ */
 const safeEqual = (left, right) => {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
@@ -180,6 +216,11 @@ const safeEqual = (left, right) => {
   );
 };
 
+/**
+ * Checks if an HTTP request is authorized using basic authentication.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @returns {boolean} True if authenticated or auth is disabled.
+ */
 const isAuthorized = (request) => {
   if (!authPassword) {
     return true;
@@ -201,6 +242,12 @@ const isAuthorized = (request) => {
   return safeEqual(username, authUsername) && safeEqual(password, authPassword);
 };
 
+/**
+ * Sends a JSON response with the given status code and payload.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {number} statusCode - The HTTP status code.
+ * @param {Object} payload - The JSON payload to send.
+ */
 const sendJson = (response, statusCode, payload) => {
   const body = JSON.stringify(payload);
   response.writeHead(statusCode, {
@@ -211,6 +258,12 @@ const sendJson = (response, statusCode, payload) => {
   response.end(body);
 };
 
+/**
+ * Reads and parses the JSON body from an HTTP request.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @returns {Promise<Object>} The parsed JSON object.
+ * @throws {HttpError} 415 if not JSON, 413 if too large, 400 if invalid JSON.
+ */
 const readJsonBody = async (request) => {
   if (
     !String(request.headers["content-type"] ?? "").startsWith(
@@ -239,6 +292,12 @@ const readJsonBody = async (request) => {
   }
 };
 
+/**
+ * Builds an image URL with rotation and revision parameters.
+ * @param {string} filePath - The path to the image file.
+ * @param {number} rotation - The rotation value (0-360).
+ * @returns {string} The constructed image URL.
+ */
 const buildImageUrl = (filePath, rotation) => {
   const params = new URLSearchParams({
     path: filePath,
@@ -250,6 +309,10 @@ const buildImageUrl = (filePath, rotation) => {
 
 const progressClients = new Set();
 
+/**
+ * Broadcasts a progress message to all connected clients.
+ * @param {Object} progress - The progress data to broadcast.
+ */
 const broadcastProgress = (progress) => {
   const message = `data: ${JSON.stringify(progress)}\n\n`;
   for (const client of progressClients) {
@@ -257,6 +320,11 @@ const broadcastProgress = (progress) => {
   }
 };
 
+/**
+ * Handles an SSE progress stream connection.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ */
 const handleProgressStream = (request, response) => {
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -273,6 +341,12 @@ const handleProgressStream = (request, response) => {
   });
 };
 
+/**
+ * Handles a directory browse request and returns directory metadata.
+ * @param {URL} url - The parsed URL object containing query parameters.
+ * @returns {Promise<Object>} Object with path, rootPath, parent, directories, and imageCount.
+ * @throws {HttpError} 400 if the path is not a directory.
+ */
 const handleBrowse = async (url) => {
   const directoryPath = await resolvePathInRoot(
     url.searchParams.get("path") || rootDirectory,
@@ -308,6 +382,14 @@ const handleBrowse = async (url) => {
   };
 };
 
+/**
+ * Handles an image request, returning the raw file or a rendered preview.
+ * @param {ClientRequest} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {URL} url - The parsed URL object containing query parameters.
+ * @returns {Promise<void>}
+ * @throws {HttpError} 400 if unsupported image type.
+ */
 const handleImage = async (request, response, url) => {
   const filePath = await resolvePathInRoot(url.searchParams.get("path"));
   const extension = path.extname(filePath).toLowerCase();
@@ -332,7 +414,7 @@ const handleImage = async (request, response, url) => {
     );
     response.writeHead(200, {
       ...cacheHeaders,
-      "Content-Type": "image/png",
+      "Content-Type": "image/webp",
       "Content-Length": pngBuffer.length,
     });
     response.end(pngBuffer);
@@ -348,12 +430,22 @@ const handleImage = async (request, response, url) => {
   fsSync.createReadStream(filePath).pipe(response);
 };
 
+/**
+ * Validates and resolves metadata paths within the root directory.
+ * @param {Object} payload - Object with frontPath and backPath properties.
+ * @returns {Promise<Object>} The payload with resolved paths.
+ */
 const validateMetadataPaths = async (payload) => ({
   ...payload,
   frontPath: await resolvePathInRoot(payload?.frontPath),
   backPath: await resolveOptionalPathInRoot(payload?.backPath),
 });
 
+/**
+ * Creates an API routes object with handlers for all endpoints.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @returns {Object} Object mapping route strings to async handler functions.
+ */
 const createApiRoutes = (secretCodec) => ({
   "GET /api/config": async () => ({ rootPath: rootDirectory }),
   "GET /api/browse": async (_request, url) => handleBrowse(url),
@@ -394,6 +486,11 @@ const createApiRoutes = (secretCodec) => ({
   },
 });
 
+/**
+ * Serves static files from the dist directory.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {string} pathname - The requested URL pathname.
+ */
 const serveStatic = async (response, pathname) => {
   const relativePath =
     decodeURIComponent(pathname).replace(/^\/+/, "") || "index.html";
@@ -429,6 +526,11 @@ const serveStatic = async (response, pathname) => {
   response.end(content);
 };
 
+/**
+ * Creates an HTTP request handler with authentication, routing, and error handling.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @returns {Function} An async function that handles HTTP requests and responses.
+ */
 const createRequestHandler = (secretCodec) => {
   const apiRoutes = createApiRoutes(secretCodec);
 
@@ -491,6 +593,9 @@ const createRequestHandler = (secretCodec) => {
   };
 };
 
+/**
+ * Starts the Image Parser server on the configured port and host.
+ */
 const start = async () => {
   if (authPassword && !authUsername) {
     throw new Error(
@@ -502,6 +607,9 @@ const start = async () => {
   const secretCodec = createAesGcmCodec(await loadSecretKey());
   const server = http.createServer(createRequestHandler(secretCodec));
 
+  /**
+   * Shuts down the server and cleans up progress clients.
+   */
   const shutdown = () => {
     server.close();
     for (const client of progressClients) {
