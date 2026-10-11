@@ -97,7 +97,7 @@ const defaultImmichSettings = Object.freeze({
   adminApiKey: "",
   albumName: "",
   tags: "",
-  pauseImmichJobs: true,
+  pauseImmichJobs: false,
   concurrentTasks: 2,
 });
 
@@ -138,7 +138,7 @@ const normalizeImmichSettings = (settings) => {
     adminApiKey: String(settings?.adminApiKey ?? "").trim(),
     albumName: String(settings?.albumName ?? "").trim(),
     tags: normalizeImmichTags(settings?.tags).join(", "),
-    pauseImmichJobs: settings?.pauseImmichJobs !== false,
+    pauseImmichJobs: String(settings?.adminApiKey ?? "") !== "",
     concurrentTasks: Number(settings?.concurrentTasks),
   };
 
