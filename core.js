@@ -97,7 +97,7 @@ const defaultImmichSettings = Object.freeze({
   adminApiKey: "",
   albumName: "",
   tags: "",
-  pauseImmichJobs: true,
+  pauseImmichJobs: false,
   concurrentTasks: 2,
 });
 
@@ -138,7 +138,7 @@ const normalizeImmichSettings = (settings) => {
     adminApiKey: String(settings?.adminApiKey ?? "").trim(),
     albumName: String(settings?.albumName ?? "").trim(),
     tags: normalizeImmichTags(settings?.tags).join(", "),
-    pauseImmichJobs: settings?.pauseImmichJobs !== false,
+    pauseImmichJobs: String(settings?.adminApiKey ?? "") !== "",
     concurrentTasks: Number(settings?.concurrentTasks),
   };
 
@@ -191,26 +191,26 @@ const buildImmichUploadArguments = (settings, directoryPath) => {
     "upload",
     "from-folder",
     "--concurrent-tasks",
-    `${String(settings.concurrentTasks)}`,
+    String(settings.concurrentTasks),
     "--no-ui",
     "--server",
-    `${settings.serverUrl}`,
+    String(settings.serverUrl),
     "--recursive=false",
     "--api-key",
-    `${settings.userApiKey}`,
+    String(settings.userApiKey),
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
     "--into-album",
-    `${settings.albumName}`,
+    String(settings.albumName),
     "--ban-file",
     "**_b.**",
   ];
 
   if (settings.adminApiKey) {
-    uploadArguments.push(`--admin-api-key=${settings.adminApiKey}`);
+    uploadArguments.push("--admin-api-key", String(settings.adminApiKey));
   }
 
   for (const tag of tags) {
-    uploadArguments.push(`--tag=${tag}`);
+    uploadArguments.push("--tag", String(tag));
   }
 
   uploadArguments.push(directoryPath);

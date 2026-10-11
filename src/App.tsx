@@ -1611,7 +1611,7 @@ function App() {
               }${isExpanded ? " image-stack--expanded" : ""}`}
             >
               {displayPairs.length > 0 ? (
-                <div>
+                  <>
                   <div className="image-card">
                     <div className="image-card-header">
                       <div className="image-label">Front image</div>
@@ -1681,7 +1681,7 @@ function App() {
                       />
                     </div>
                   ) : null}
-                </div>
+                  </>
               ) : (
                 <p>No Pairs Available</p>
               )}
