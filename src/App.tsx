@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FocusEvent as ReactFocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
 } from "react";
@@ -161,6 +162,28 @@ const formatImageStatus = (index: number, total: number, label: string) =>
  * @returns A formatted status string.
  */
 const formatSavedStatus = (label: string) => `Saved changes to ${label}.`;
+
+/**
+ * Input props that select the whole value when the field gains focus, so typing replaces it.
+ * A mouse click would normally collapse the selection on mouseup, so that default is suppressed
+ * only for the click that focused the field; later clicks still position the caret normally.
+ */
+const selectAllOnFocusProps = {
+  onFocus: (event: ReactFocusEvent<HTMLInputElement>) => {
+    event.currentTarget.select();
+  },
+  onMouseDown: (event: ReactMouseEvent<HTMLInputElement>) => {
+    if (document.activeElement !== event.currentTarget) {
+      event.currentTarget.dataset.selectOnMouseUp = "true";
+    }
+  },
+  onMouseUp: (event: ReactMouseEvent<HTMLInputElement>) => {
+    if (event.currentTarget.dataset.selectOnMouseUp) {
+      delete event.currentTarget.dataset.selectOnMouseUp;
+      event.preventDefault();
+    }
+  },
+};
 
 /**
  * Resolves the preview source URL for an image, accounting for rotation.
@@ -1020,14 +1043,21 @@ function App() {
     clearPendingSave();
     updateDateSegments(next);
 
-    if (digits.length === 2 && Number(digits) >= 1) {
-      if (field === "month" && Number(digits) <= 12) {
-        dayInputRef.current?.focus();
-        dayInputRef.current?.select();
-      } else if (field === "day" && Number(digits) <= 31) {
-        yearInputRef.current?.focus();
-        yearInputRef.current?.select();
-      }
+    // Advance once the segment is complete, including single digits that cannot start a
+    // valid two-digit value (e.g. "3" for March); blur pads them to two digits.
+    const segmentNumber = Number(digits);
+    const isMonthComplete =
+      digits.length === 2
+        ? segmentNumber >= 1 && segmentNumber <= 12
+        : segmentNumber >= 2;
+    const isDayComplete =
+      digits.length === 2
+        ? segmentNumber >= 1 && segmentNumber <= 31
+        : segmentNumber >= 4;
+    if (field === "month" && digits && isMonthComplete) {
+      dayInputRef.current?.focus();
+    } else if (field === "day" && digits && isDayComplete) {
+      yearInputRef.current?.focus();
     }
   };
 
@@ -1375,12 +1405,7 @@ function App() {
                     maxLength={2}
                     aria-label="Month"
                     value={dateSegments.month}
-                    onFocus={(event) => {
-                      // Only select text if it's empty (new image load), allow overwrite otherwise
-                      if (!dateSegments.month) {
-                        event.currentTarget.select();
-                      }
-                    }}
+                    {...selectAllOnFocusProps}
                     onChange={(event) =>
                       handleDateSegmentChange("month", event.target.value)
                     }
@@ -1398,7 +1423,7 @@ function App() {
                     maxLength={2}
                     aria-label="Day"
                     value={dateSegments.day}
-                    onFocus={(event) => event.currentTarget.select()}
+                    {...selectAllOnFocusProps}
                     onChange={(event) =>
                       handleDateSegmentChange("day", event.target.value)
                     }
@@ -1414,7 +1439,7 @@ function App() {
                     maxLength={4}
                     aria-label="Year"
                     value={dateSegments.year}
-                    onFocus={(event) => event.currentTarget.select()}
+                    {...selectAllOnFocusProps}
                     onChange={(event) =>
                       handleDateSegmentChange("year", event.target.value)
                     }
@@ -1431,6 +1456,7 @@ function App() {
                   ref={descriptionInputRef}
                   type="text"
                   value={metadata.description}
+                  {...selectAllOnFocusProps}
                   onChange={(event) =>
                     updateFormField("description", event.target.value)
                   }
@@ -1611,7 +1637,7 @@ function App() {
               }${isExpanded ? " image-stack--expanded" : ""}`}
             >
               {displayPairs.length > 0 ? (
-                  <>
+                <>
                   <div className="image-card">
                     <div className="image-card-header">
                       <div className="image-label">Front image</div>
@@ -1681,7 +1707,7 @@ function App() {
                       />
                     </div>
                   ) : null}
-                  </>
+                </>
               ) : (
                 <p>No Pairs Available</p>
               )}
