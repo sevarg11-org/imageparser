@@ -45,8 +45,16 @@ sequenceDiagram
 ```
 
 Implementation: `openid-client` v6 handles discovery (lazy, retried after failure), PKCE S256, `state`, `nonce`,
-ID token validation, and userinfo. The token request's `redirect_uri` is built from `OIDC_REDIRECT_URI`, not from
-the request host, because the server runs behind a reverse proxy.
+ID token claim validation (`iss`, `aud`, `exp`, `iat`, `nonce`), and userinfo. The token request's
+`redirect_uri` is built from `OIDC_REDIRECT_URI`, not from the request host, because the server runs behind a
+reverse proxy.
+
+**Signature verification.** By default, `openid-client` does not verify the signature of an ID token received
+directly from the token endpoint; it relies on TLS, which OIDC Core §3.1.3.7 permits. Image Parser also calls
+`enableNonRepudiationChecks`, so signatures are verified against the provider's JWKS. That also covers an
+issuer reached over plain HTTP with `OIDC_ALLOW_INSECURE_REQUESTS`. As a result, the provider must sign with an
+asymmetric key: Authentik's HS256 tokens (issued when no signing key is selected) are rejected. Failures are logged
+with the underlying reason (for example `JWT signature verification failed`).
 
 ## 3. Authentik configuration
 
@@ -67,16 +75,19 @@ the request host, because the server runs behind a reverse proxy.
    }
    ```
 
-2. **OAuth2/OpenID provider**: confidential client, strict redirect URI `https://<host>/auth/callback`, and the
-   `imageparser` mapping added under _Advanced protocol settings → Scopes_ (scopes requested:
-   `openid profile email imageparser`).
-3. **Admin access** (see every folder and the debug log), granted either way:
-   - membership of `OIDC_ADMIN_GROUP` (default `imageparser-admin`), from the `groups` claim the default `profile`
-     scope already sends;
-   - a per-user `imageparser_admin: true` attribute, sent as the `OIDC_ADMIN_CLAIM` claim (default
-     `imageparser_admin`). Only boolean `true` or the string `"true"` count.
+2. **OAuth2/OpenID provider**: confidential client, strict redirect URI `https://<host>/auth/callback`, a
+   **signing key** (required; see §2), and the `imageparser` mapping added under _Advanced protocol settings →
+   Scopes_ (scopes requested: `openid profile email imageparser`). Keep the default subject mode, because `userKey`
+   is derived from `sub`.
 
-   There is no `"*"` folder grant.
+The step-by-step operator guide is [Authentik-Setup.md](Authentik-Setup.md). 3. **Admin access** (see every folder and the debug log), granted either way:
+
+- membership of `OIDC_ADMIN_GROUP` (default `imageparser-admin`), from the `groups` claim the default `profile`
+  scope already sends;
+- a per-user `imageparser_admin: true` attribute, sent as the `OIDC_ADMIN_CLAIM` claim (default
+  `imageparser_admin`). Only boolean `true` or the string `"true"` count.
+
+There is no `"*"` folder grant.
 
 ## 4. Path confinement (`pathAccess.js`)
 
@@ -161,23 +172,23 @@ An Authentik instance with a private CA needs `NODE_EXTRA_CA_CERTS` in the conta
 
 ## 10. Threat model
 
-| Threat                                         | Defense                                                                                            |
-| :--------------------------------------------- | :------------------------------------------------------------------------------------------------- |
-| Traversal (`../other`) in request paths        | `path.resolve` + `realpath`, then a prefix check against the user's re-resolved grants             |
-| Traversal or absolute paths in claims          | `normalizeFolderGrant` rejects them; resolved grants must be inside the root                       |
-| Symlink escape                                 | Both the requested path and the grants are `realpath`-resolved before the check                    |
-| Prefix collision (`family-secret` vs `family`) | The `path.sep` boundary in the check                                                               |
-| Username used as a path / renamed users        | Settings are keyed by `sha256(sub)`, validated as 64 hex characters before use                     |
-| Cross-user Immich key or output leakage        | Per-user settings directory; per-user SSE fan-out; debug log admin-only                            |
-| Cookie tampering or forgery                    | AES-256-GCM authenticated encryption with HKDF-separated keys; a tampered cookie means no session  |
-| Login CSRF / code injection                    | `state` + `nonce` + PKCE S256, held in a short-lived (10 min) sealed cookie                        |
-| Forged ID token                                | `openid-client` verifies signature (JWKS), `iss`, `aud`, `exp`, `nonce`; userinfo `sub` must match |
-| CSRF on API POSTs                              | `SameSite=Lax` session cookie + JSON-only request bodies                                           |
+| Threat                                         | Defense                                                                                                                          |
+| :--------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
+| Traversal (`../other`) in request paths        | `path.resolve` + `realpath`, then a prefix check against the user's re-resolved grants                                           |
+| Traversal or absolute paths in claims          | `normalizeFolderGrant` rejects them; resolved grants must be inside the root                                                     |
+| Symlink escape                                 | Both the requested path and the grants are `realpath`-resolved before the check                                                  |
+| Prefix collision (`family-secret` vs `family`) | The `path.sep` boundary in the check                                                                                             |
+| Username used as a path / renamed users        | Settings are keyed by `sha256(sub)`, validated as 64 hex characters before use                                                   |
+| Cross-user Immich key or output leakage        | Per-user settings directory; per-user SSE fan-out; debug log admin-only                                                          |
+| Cookie tampering or forgery                    | AES-256-GCM authenticated encryption with HKDF-separated keys; a tampered cookie means no session                                |
+| Login CSRF / code injection                    | `state` + `nonce` + PKCE S256, held in a short-lived (10 min) sealed cookie                                                      |
+| Forged ID token                                | Signature verified against the JWKS (`enableNonRepudiationChecks`), plus `iss`, `aud`, `exp`, `nonce`; userinfo `sub` must match |
+| CSRF on API POSTs                              | `SameSite=Lax` session cookie + JSON-only request bodies                                                                         |
 
 ## 11. Tests
 
 - `pathAccess.test.mjs`: grant validation, boundaries, nested grants, a symlink (junction) escape.
 - `auth.test.mjs`: sealing, tamper/expiry/key separation, cookie attributes, user context, path-safe user keys.
 - `oidcServer.test.mjs`: spawns `server.js` against an in-process mock IdP (RS256 JWKS, PKCE and client-secret
-  checks). Covers the full sign-in, 401/302 handling, the virtual root, 403 on every file route, admin access,
+  checks). Covers the full sign-in, rejection of an ID token signed with an unpublished key, 401/302 handling, the virtual root, 403 on every file route, admin access,
   per-user Immich settings on disk, and RP-initiated logout.

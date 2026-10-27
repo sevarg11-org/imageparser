@@ -165,6 +165,9 @@ the PR build will write metadata to them.
 The web server can sign users in with OpenID Connect (authorization code flow with PKCE). Each user then sees only
 the folders granted to them, including all subfolders, and keeps their own Immich settings and API keys.
 
+This section is a summary. For a full walkthrough with every Authentik screen, verification steps, and
+troubleshooting, see [docs/Authentik-Setup.md](docs/Authentik-Setup.md).
+
 **Requirements:** serve Image Parser through a reverse proxy with HTTPS (for example
 `https://photos.example.com`). While sign-in is on, `IMAGEPARSER_USERNAME`/`IMAGEPARSER_PASSWORD` are ignored;
 keep them set as backup credentials for [emergency access](#emergency-access-when-the-identity-provider-is-down).
@@ -187,7 +190,10 @@ keep them set as backup credentials for [emergency access](#emergency-access-whe
    ```
 
 2. Create an **OAuth2/OpenID Provider**: client type _Confidential_, redirect URI
-   `https://photos.example.com/auth/callback` (strict), and under _Advanced protocol settings → Scopes_ add the
+   `https://photos.example.com/auth/callback` (strict), and a **Signing Key** (for example the
+   "authentik Self-signed Certificate"). The signing key is required: Image Parser verifies ID token signatures
+   against the provider's published keys and rejects HS256 tokens, which is what Authentik issues without a key.
+   Under _Advanced protocol settings → Scopes_ add the
    `imageparser` mapping next to the default `openid`, `profile`, and `email` mappings. Create an **Application** for
    the provider and bind the users or groups who may sign in.
 3. Grant folders by adding an attribute to a user or group, relative to `/data`:

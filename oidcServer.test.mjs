@@ -42,9 +42,14 @@ const startMockProvider = async () => {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const issuer = `http://127.0.0.1:${server.address().port}`;
 
-  const signIdToken = (claims) => {
+  // A key the JWKS does not publish, used to forge ID token signatures.
+  const { privateKey: forgedKey } = generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+
+  const signIdToken = (claims, { forged = false } = {}) => {
     const input = `${base64url({ alg: "RS256", kid: "k1", typ: "JWT" })}.${base64url(claims)}`;
-    return `${input}.${sign("sha256", Buffer.from(input), privateKey).toString("base64url")}`;
+    return `${input}.${sign("sha256", Buffer.from(input), forged ? forgedKey : privateKey).toString("base64url")}`;
   };
 
   const sendJson = (response, statusCode, payload) => {
@@ -110,14 +115,17 @@ const startMockProvider = async () => {
         access_token: accessToken,
         token_type: "Bearer",
         expires_in: 300,
-        id_token: signIdToken({
-          iss: issuer,
-          aud: clientId,
-          sub: pending.claims.sub,
-          nonce: pending.nonce,
-          iat: now,
-          exp: now + 300,
-        }),
+        id_token: signIdToken(
+          {
+            iss: issuer,
+            aud: clientId,
+            sub: pending.claims.sub,
+            nonce: pending.nonce,
+            iat: now,
+            exp: now + 300,
+          },
+          { forged: pending.forgeSignature },
+        ),
       });
       return;
     }
@@ -139,10 +147,11 @@ const startMockProvider = async () => {
     issuer,
     server,
     /** Records an authorization the way the provider would after the user signs in. */
-    authorize: (authorizationUrl, claims) => {
+    authorize: (authorizationUrl, claims, { forgeSignature = false } = {}) => {
       const code = randomBytes(16).toString("hex");
       pendingCodes.set(code, {
         claims,
+        forgeSignature,
         challenge: authorizationUrl.searchParams.get("code_challenge"),
         nonce: authorizationUrl.searchParams.get("nonce"),
         redirectUri: authorizationUrl.searchParams.get("redirect_uri"),
@@ -183,8 +192,8 @@ const request = (pathname, { cookie, ...init } = {}) =>
     headers: { ...(cookie ? { Cookie: cookie } : {}), ...init.headers },
   });
 
-/** Runs the full browser sign-in flow and returns the session cookie header value. */
-const signIn = async (claims) => {
+/** Runs the browser sign-in flow up to the callback and returns the callback response. */
+const attemptSignIn = async (claims, authorizeOptions) => {
   const login = await request("auth/login");
   assert.equal(login.status, 302);
   const authorizationUrl = new URL(login.headers.get("location"));
@@ -198,11 +207,16 @@ const signIn = async (claims) => {
     .map(([name, value]) => `${name}=${value}`)
     .join("; ");
 
-  const code = provider.authorize(authorizationUrl, claims);
-  const callback = await request(
+  const code = provider.authorize(authorizationUrl, claims, authorizeOptions);
+  return request(
     `auth/callback?${new URLSearchParams({ code, state: authorizationUrl.searchParams.get("state") })}`,
     { cookie: loginCookie },
   );
+};
+
+/** Runs the full browser sign-in flow and returns the session cookie header value. */
+const signIn = async (claims) => {
+  const callback = await attemptSignIn(claims);
   assert.equal(
     callback.status,
     302,
@@ -373,6 +387,13 @@ test("a callback without the login cookie is refused", async () => {
     await callback.text(),
     /expired or was started in another browser/,
   );
+});
+
+test("an ID token with a forged signature is refused", async () => {
+  const callback = await attemptSignIn(alice, { forgeSignature: true });
+  assert.equal(callback.status, 400);
+  assert.equal(readSetCookies(callback).imageparser_session, undefined);
+  assert.match(serverOutput(), /JWT signature verification failed/);
 });
 
 test("signs in and reports the current user", async () => {

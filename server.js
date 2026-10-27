@@ -895,7 +895,9 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
           },
         );
       } catch (error) {
-        logger.warn("OpenID Connect sign-in failed.", error);
+        // openid-client wraps the specific reason (e.g. a bad signature or unexpected "alg") in `cause`.
+        const reason = error?.cause?.message ?? error?.message;
+        logger.warn(`OpenID Connect sign-in failed: ${reason}`, error);
         sendAuthError(
           response,
           400,

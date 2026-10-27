@@ -179,6 +179,8 @@ const buildUserContext = (
 /**
  * Creates an OpenID Connect client for the authorization code flow with PKCE.
  * Discovery runs lazily and is retried on the next login if the identity provider was unreachable.
+ * ID token signatures are verified against the provider's JWKS, so the provider must sign with an
+ * asymmetric key (for example RS256); symmetric HS256 tokens are rejected.
  * @param {{issuerUrl: string, clientId: string, clientSecret: string, redirectUri: string, scopes: string, allowInsecureRequests?: boolean}} config - Client settings.
  * @returns {Object} Methods to start a login, finish it from the callback, and build a logout URL.
  */
@@ -195,7 +197,11 @@ const createOidcClient = ({
   const getConfiguration = () => {
     configurationPromise ??= oidc
       .discovery(new URL(issuerUrl), clientId, clientSecret, undefined, {
-        execute: allowInsecureRequests ? [oidc.allowInsecureRequests] : [],
+        execute: [
+          // openid-client otherwise relies on TLS alone for ID tokens from the token endpoint.
+          oidc.enableNonRepudiationChecks,
+          ...(allowInsecureRequests ? [oidc.allowInsecureRequests] : []),
+        ],
         timeout: 15,
       })
       .catch((error) => {
