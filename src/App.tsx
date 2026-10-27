@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type FocusEvent as ReactFocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -378,6 +379,31 @@ const toFileUrl = (filePath: string) => {
 
 const defaultDate = new Date().toISOString().slice(0, 10);
 const METADATA_ENTRY_SESSION_KEY = "imageparser.metadata-entry-expanded";
+const COLLAPSED_IMAGE_HEIGHT_STORAGE_KEY = "imageparser.collapsed-image-height";
+const MIN_COLLAPSED_IMAGE_HEIGHT = 200;
+const MAX_COLLAPSED_IMAGE_HEIGHT = 1000;
+const COLLAPSED_IMAGE_HEIGHT_STEP = 20;
+const DEFAULT_COLLAPSED_IMAGE_HEIGHT = 600;
+
+type ImageStackStyle = CSSProperties & { "--collapsed-image-height": string };
+
+/**
+ * Clamps a collapsed image height to the slider range and step.
+ * @param value - The requested height in pixels.
+ * @returns A valid height in pixels, or the default when the value is not a finite number.
+ */
+const clampCollapsedImageHeight = (value: number) => {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_COLLAPSED_IMAGE_HEIGHT;
+  }
+  const stepped =
+    Math.round(value / COLLAPSED_IMAGE_HEIGHT_STEP) *
+    COLLAPSED_IMAGE_HEIGHT_STEP;
+  return Math.min(
+    Math.max(stepped, MIN_COLLAPSED_IMAGE_HEIGHT),
+    MAX_COLLAPSED_IMAGE_HEIGHT,
+  );
+};
 const defaultImmichSettings: ImmichSettings = {
   serverUrl: "",
   userApiKey: "",
@@ -422,6 +448,18 @@ function App() {
   });
   const [isPersistingRotation, setIsPersistingRotation] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [collapsedImageHeight, setCollapsedImageHeight] = useState(() => {
+    try {
+      const savedHeight = window.localStorage.getItem(
+        COLLAPSED_IMAGE_HEIGHT_STORAGE_KEY,
+      );
+      return savedHeight === null
+        ? DEFAULT_COLLAPSED_IMAGE_HEIGHT
+        : clampCollapsedImageHeight(Number(savedHeight));
+    } catch {
+      return DEFAULT_COLLAPSED_IMAGE_HEIGHT;
+    }
+  });
   const [immichSettings, setImmichSettings] = useState<ImmichSettings>(
     defaultImmichSettings,
   );
@@ -500,6 +538,20 @@ function App() {
       String(isMetadataEntryExpanded),
     );
   }, [isMetadataEntryExpanded]);
+
+  /**
+   * Persists the collapsed image height preference to localStorage so it survives restarts.
+   */
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        COLLAPSED_IMAGE_HEIGHT_STORAGE_KEY,
+        String(collapsedImageHeight),
+      );
+    } catch {
+      // Storage can be unavailable; the slider still works for this session.
+    }
+  }, [collapsedImageHeight]);
 
   /**
    * Sets up an event listener for Immich upload progress updates.
@@ -1363,6 +1415,9 @@ function App() {
     Boolean(immichSettings.userApiKey.trim());
   const isTransitionLocked = isBusy || isPersistingRotation || isUploading;
   const isImageControlLocked = isTransitionLocked || !isHydrated;
+  const imageStackStyle: ImageStackStyle = {
+    "--collapsed-image-height": `${collapsedImageHeight}px`,
+  };
 
   return (
     <div className="app-shell">
@@ -1596,6 +1651,31 @@ function App() {
                 />
                 <span>Only pairs</span>
               </label>
+              <label
+                className="size-control"
+                title={
+                  isExpanded
+                    ? "Image height applies to the collapsed view"
+                    : undefined
+                }
+              >
+                <span>Image height</span>
+                <input
+                  type="range"
+                  min={MIN_COLLAPSED_IMAGE_HEIGHT}
+                  max={MAX_COLLAPSED_IMAGE_HEIGHT}
+                  step={COLLAPSED_IMAGE_HEIGHT_STEP}
+                  value={collapsedImageHeight}
+                  onChange={(event) =>
+                    setCollapsedImageHeight(
+                      clampCollapsedImageHeight(Number(event.target.value)),
+                    )
+                  }
+                  aria-valuetext={`${collapsedImageHeight} pixels`}
+                  disabled={isExpanded}
+                />
+                <output aria-hidden="true">{collapsedImageHeight}px</output>
+              </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex - 1)}
@@ -1635,6 +1715,7 @@ function App() {
                   ? " image-stack--single"
                   : ""
               }${isExpanded ? " image-stack--expanded" : ""}`}
+              style={imageStackStyle}
             >
               {displayPairs.length > 0 ? (
                 <>
