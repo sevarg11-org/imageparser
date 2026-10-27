@@ -695,6 +695,7 @@ function App() {
       }
 
       setImageNumberInput(String(boundedIndex + 1));
+      setIsHydrated(false);
       setSelectedIndex(boundedIndex);
     },
     [
