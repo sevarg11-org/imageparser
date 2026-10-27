@@ -14,6 +14,7 @@ import {
   applyImageRotations,
   defaultSortBy,
   getImageRevision,
+  getImmichGoDiagnostics,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeSortBy,
@@ -26,6 +27,7 @@ import {
   saveMetadata,
   shutdownCore,
 } from "./core.js";
+import { createServerLogger } from "./serverLogger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.join(__dirname, "dist");
@@ -37,6 +39,11 @@ const configDirectory = path.resolve(
 );
 const authUsername = process.env.IMAGEPARSER_USERNAME || "";
 const authPassword = process.env.IMAGEPARSER_PASSWORD || "";
+const debugEnabled = /^(1|true|yes|on)$/i.test(
+  process.env.IMAGEPARSER_DEBUG ?? "",
+);
+const logger = createServerLogger({ debug: debugEnabled });
+logger.addSecret(authPassword);
 const maxRequestBodyBytes = 1_000_000;
 const secretKeyFileName = "secret.key";
 const encryptedValuePrefix = "v1:";
@@ -341,6 +348,93 @@ const handleProgressStream = (request, response) => {
   });
 };
 
+const debugLogClients = new Set();
+
+/**
+ * Paths excluded from request logging: health checks and long-lived streams.
+ */
+const unloggedPaths = new Set([
+  "/healthz",
+  "/api/immich-progress",
+  "/api/debug-log",
+]);
+
+/**
+ * Streams server log entries to the browser when debug mode is enabled.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @throws {HttpError} 404 when debug mode is disabled.
+ */
+const handleDebugLogStream = (request, response) => {
+  if (!debugEnabled) {
+    throw new HttpError(404, "Unknown API endpoint.");
+  }
+
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  response.write(": connected\n\n");
+  debugLogClients.add(response);
+  const unsubscribe = logger.subscribe((entry) => {
+    response.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
+  });
+  const keepAlive = setInterval(() => response.write(": ping\n\n"), 25_000);
+  request.on("close", () => {
+    clearInterval(keepAlive);
+    unsubscribe();
+    debugLogClients.delete(response);
+  });
+};
+
+/**
+ * Registers Immich API keys with the logger so they are redacted from all log output.
+ * @param {{userApiKey?: string, adminApiKey?: string}} [settings] - Settings that may contain API keys.
+ * @returns {Object|undefined} The same settings, for chaining.
+ */
+const registerImmichSecrets = (settings) => {
+  logger.addSecret(settings?.userApiKey);
+  logger.addSecret(settings?.adminApiKey);
+  return settings;
+};
+
+/**
+ * Logs runtime details that commonly differ between the desktop app and a container.
+ */
+const logStartupDiagnostics = async () => {
+  const canAccess = (filePath, mode) =>
+    fs.access(filePath, mode).then(
+      () => true,
+      () => false,
+    );
+  const immichGo = await getImmichGoDiagnostics();
+  logger.info("Startup diagnostics.", {
+    node: process.version,
+    platform: `${process.platform}/${process.arch}`,
+    user:
+      typeof process.getuid === "function"
+        ? `${process.getuid()}:${process.getgid()}`
+        : "n/a",
+    rootDirectory,
+    rootWritable: await canAccess(rootDirectory, fsSync.constants.W_OK),
+    configDirectory,
+    configWritable: await canAccess(configDirectory, fsSync.constants.W_OK),
+    caCertificates:
+      process.platform === "linux"
+        ? await canAccess(
+            "/etc/ssl/certs/ca-certificates.crt",
+            fsSync.constants.R_OK,
+          )
+        : "n/a",
+    immichGo,
+  });
+  if (!immichGo.ok) {
+    logger.warn("immich-go is not runnable; Immich uploads will fail.");
+  }
+};
+
 /**
  * Handles a directory browse request and returns directory metadata.
  * @param {URL} url - The parsed URL object containing query parameters.
@@ -447,7 +541,10 @@ const validateMetadataPaths = async (payload) => ({
  * @returns {Object} Object mapping route strings to async handler functions.
  */
 const createApiRoutes = (secretCodec) => ({
-  "GET /api/config": async () => ({ rootPath: rootDirectory }),
+  "GET /api/config": async () => ({
+    rootPath: rootDirectory,
+    debug: debugEnabled,
+  }),
   "GET /api/browse": async (_request, url) => handleBrowse(url),
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);
@@ -472,17 +569,23 @@ const createApiRoutes = (secretCodec) => ({
       await validateMetadataPaths(await readJsonBody(request)),
     ),
   "GET /api/immich-settings": async () =>
-    loadImmichSettings(configDirectory, secretCodec),
+    registerImmichSecrets(
+      await loadImmichSettings(configDirectory, secretCodec),
+    ),
   "POST /api/immich-settings": async (request) =>
     saveImmichSettings(
       configDirectory,
       secretCodec,
-      await readJsonBody(request),
+      registerImmichSecrets(await readJsonBody(request)),
     ),
   "POST /api/upload-to-immich": async (request) => {
     const body = await readJsonBody(request);
+    registerImmichSecrets(body.settings);
     const directoryPath = await resolvePathInRoot(body.directoryPath);
-    return runImmichUpload(body.settings, directoryPath, broadcastProgress);
+    return runImmichUpload(body.settings, directoryPath, broadcastProgress, {
+      debug: debugEnabled,
+      log: logger,
+    });
   },
 });
 
@@ -535,6 +638,16 @@ const createRequestHandler = (secretCodec) => {
   const apiRoutes = createApiRoutes(secretCodec);
 
   return async (request, response) => {
+    const startedAt = Date.now();
+    response.on("finish", () => {
+      const pathname = (request.url ?? "/").split("?")[0];
+      if (!unloggedPaths.has(pathname)) {
+        logger.debug(
+          `${request.method} ${pathname} ${response.statusCode} ${Date.now() - startedAt}ms`,
+        );
+      }
+    });
+
     try {
       if (!isAuthorized(request)) {
         response.writeHead(401, {
@@ -553,6 +666,11 @@ const createRequestHandler = (secretCodec) => {
 
       if (request.method === "GET" && url.pathname === "/api/immich-progress") {
         handleProgressStream(request, response);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/debug-log") {
+        handleDebugLogStream(request, response);
         return;
       }
 
@@ -579,7 +697,12 @@ const createRequestHandler = (secretCodec) => {
     } catch (error) {
       const statusCode = error instanceof HttpError ? error.statusCode : 500;
       if (statusCode === 500) {
-        console.error(error);
+        logger.error(
+          `Request failed: ${request.method} ${(request.url ?? "/").split("?")[0]}`,
+          error,
+        );
+      } else {
+        logger.debug(`Request rejected with ${statusCode}: ${error?.message}`);
       }
       if (response.headersSent) {
         response.destroy();
@@ -612,7 +735,7 @@ const start = async () => {
    */
   const shutdown = () => {
     server.close();
-    for (const client of progressClients) {
+    for (const client of [...progressClients, ...debugLogClients]) {
       client.end();
     }
     void shutdownCore().finally(() => process.exit(0));
@@ -621,18 +744,24 @@ const start = async () => {
   process.on("SIGINT", shutdown);
 
   server.listen(port, host, () => {
-    console.log(
+    logger.info(
       `Image Parser listening on http://${host}:${port} (root: ${rootDirectory})`,
     );
     if (!authPassword) {
-      console.log(
+      logger.warn(
         "Authentication is disabled. Set IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD to enable it.",
       );
+    }
+    if (debugEnabled) {
+      logger.warn(
+        "Debug logging is enabled (IMAGEPARSER_DEBUG). Server logs are streamed to the browser console.",
+      );
+      void logStartupDiagnostics();
     }
   });
 };
 
 start().catch((error) => {
-  console.error(error);
+  logger.error("Image Parser failed to start.", error);
   process.exit(1);
 });
