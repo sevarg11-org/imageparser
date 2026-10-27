@@ -16,6 +16,7 @@ import {
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import { fetchCurrentUser, type CurrentUser } from "./webApi";
 
 type ImagePair = {
   id: string;
@@ -415,6 +416,7 @@ const defaultImmichSettings: ImmichSettings = {
 };
 
 function App() {
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
   const [pairs, setPairs] = useState<ImagePair[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -493,6 +495,21 @@ function App() {
         : null,
     [displayPairs, selectedIndex],
   );
+
+  /**
+   * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
+   */
+  useEffect(() => {
+    let isMounted = true;
+    void fetchCurrentUser().then((user) => {
+      if (isMounted) {
+        setCurrentUser(user);
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   /**
    * Loads Immich settings from storage on app initialization.
@@ -1427,14 +1444,26 @@ function App() {
           <p className="eyebrow">Local workflow</p>
           <h1>Image Parser</h1>
         </div>
-        <button
-          type="button"
-          className="primary-button"
-          onClick={handleChooseDirectory}
-          disabled={isTransitionLocked}
-        >
-          {directoryPath ? "Choose different folder" : "Load directory"}
-        </button>
+        <div className="toolbar-actions">
+          {currentUser?.authMode === "oidc" ? (
+            <>
+              <span className="signed-in-user">
+                Signed in as <strong>{currentUser.username}</strong>
+              </span>
+              <a className="secondary-button" href="auth/logout">
+                Sign out
+              </a>
+            </>
+          ) : null}
+          <button
+            type="button"
+            className="primary-button"
+            onClick={handleChooseDirectory}
+            disabled={isTransitionLocked}
+          >
+            {directoryPath ? "Choose different folder" : "Load directory"}
+          </button>
+        </div>
       </header>
 
       <div className="status-bar">

@@ -4,7 +4,10 @@ import './DirectoryBrowser.css'
 export type DirectoryListing = {
   path: string
   rootPath: string
+  // "" means the virtual root that lists the user's shared folders; null means there is nothing above.
   parent: string | null
+  // False for the virtual root, which is not a real folder and cannot be opened.
+  selectable?: boolean
   directories: { name: string; path: string }[]
   imageCount: number
 }
@@ -15,7 +18,13 @@ type DirectoryBrowserProps = {
   onClose: (selectedPath: string | null) => void
 }
 
+const isSelectable = (listing: DirectoryListing) => listing.selectable !== false
+
 const toDisplayPath = (listing: DirectoryListing) => {
+  if (!isSelectable(listing)) {
+    return 'Your folders'
+  }
+
   if (listing.path === listing.rootPath) {
     return '/'
   }
@@ -83,9 +92,9 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
       <div className="directory-browser-body" aria-busy={isLoading}>
         {error ? <p role="alert" className="directory-browser-error">{error}</p> : null}
         <ul className="directory-browser-list">
-          {listing?.parent ? (
+          {listing && listing.parent !== null ? (
             <li>
-              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent)}>
+              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent || null)}>
                 <span aria-hidden="true">↑</span> Parent folder
               </button>
             </li>
@@ -98,14 +107,18 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             </li>
           ))}
           {listing && !listing.directories.length ? (
-            <li className="directory-browser-empty">No subfolders</li>
+            <li className="directory-browser-empty">
+              {isSelectable(listing) ? 'No subfolders' : 'No folders are shared with your account.'}
+            </li>
           ) : null}
         </ul>
       </div>
 
       <footer className="directory-browser-footer">
         <span>
-          {listing ? `${listing.imageCount} image${listing.imageCount === 1 ? '' : 's'} in this folder` : ''}
+          {listing && isSelectable(listing)
+            ? `${listing.imageCount} image${listing.imageCount === 1 ? '' : 's'} in this folder`
+            : ''}
         </span>
         <div className="directory-browser-actions">
           <button type="button" className="secondary-button" onClick={() => onClose(null)}>
@@ -114,7 +127,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
           <button
             type="button"
             className="primary-button"
-            disabled={!listing || isLoading}
+            disabled={!listing || isLoading || !isSelectable(listing)}
             onClick={() => listing && onClose(listing.path)}
           >
             Open this folder

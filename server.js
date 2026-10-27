@@ -10,6 +10,15 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  buildUserContext,
+  createOidcClient,
+  createSealedCodec,
+  deriveKey,
+  getCookieNames,
+  parseCookies,
+  serializeCookie,
+} from "./auth.js";
+import {
   allowedExtensions,
   applyImageRotations,
   defaultSortBy,
@@ -27,6 +36,11 @@ import {
   saveMetadata,
   shutdownCore,
 } from "./core.js";
+import {
+  isInsideDirectory,
+  isPathAllowed,
+  resolveAllowedRoots,
+} from "./pathAccess.js";
 import { createServerLogger } from "./serverLogger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,11 +56,33 @@ const authPassword = process.env.IMAGEPARSER_PASSWORD || "";
 const debugEnabled = /^(1|true|yes|on)$/i.test(
   process.env.IMAGEPARSER_DEBUG ?? "",
 );
+const oidcIssuerUrl = process.env.OIDC_ISSUER_URL || "";
+const oidcEnabled = Boolean(oidcIssuerUrl);
+const oidcClientId = process.env.OIDC_CLIENT_ID || "";
+const oidcClientSecret = process.env.OIDC_CLIENT_SECRET || "";
+const oidcRedirectUri = process.env.OIDC_REDIRECT_URI || "";
+const oidcScopes =
+  process.env.OIDC_SCOPES || "openid profile email imageparser";
+const oidcAdminGroup = process.env.OIDC_ADMIN_GROUP || "imageparser-admin";
+const oidcFoldersClaim =
+  process.env.OIDC_FOLDERS_CLAIM || "imageparser_folders";
+const oidcAllowInsecureRequests = /^(1|true|yes|on)$/i.test(
+  process.env.OIDC_ALLOW_INSECURE_REQUESTS ?? "",
+);
+const sessionMaxAgeSeconds =
+  Math.round((Number(process.env.OIDC_SESSION_HOURS) || 8) * 3600) || 3600;
+const loginStateMaxAgeSeconds = 600;
+const maxSessionCookieLength = 3800;
+// The public URL decides cookie security: the container itself only speaks HTTP behind a TLS proxy.
+const secureCookies = oidcRedirectUri.startsWith("https://");
+const cookieNames = getCookieNames(secureCookies);
 const logger = createServerLogger({ debug: debugEnabled });
 logger.addSecret(authPassword);
+logger.addSecret(oidcClientSecret);
 const maxRequestBodyBytes = 1_000_000;
 const secretKeyFileName = "secret.key";
 const encryptedValuePrefix = "v1:";
+const userKeyPattern = /^[0-9a-f]{64}$/;
 
 const contentTypeByExtension = Object.freeze({
   ".html": "text/html; charset=utf-8",
@@ -74,55 +110,100 @@ class HttpError extends Error {
 let rootDirectory = configuredRoot;
 
 /**
- * Checks if a path is within the root directory.
- * @param {string} candidatePath - The path to check.
- * @returns {boolean} True if the path is inside the root directory.
+ * The user for requests when OpenID Connect is disabled: full access to the shared root and the
+ * global Immich settings, exactly as before per-user access existed.
  */
-const isInsideRoot = (candidatePath) =>
-  candidatePath === rootDirectory ||
-  candidatePath.startsWith(rootDirectory + path.sep);
+const localUser = Object.freeze({
+  userKey: "",
+  username: authUsername,
+  isAdmin: true,
+  folders: [],
+});
+
+/**
+ * Returns the canonical folders a user may access, including their children.
+ * Folder grants are re-resolved on every request so a grant later replaced by a symlink cannot escape.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
+ * @returns {Promise<string[]>} The canonical allowed folders.
+ */
+const getAllowedRoots = async (user) =>
+  user.isAdmin
+    ? [rootDirectory]
+    : resolveAllowedRoots(rootDirectory, user.folders);
 
 // Resolves symlinks so a link inside the share cannot be used to escape it.
 /**
- * Resolves a requested path within the root directory, handling symlinks.
+ * Resolves a requested path for a user, handling symlinks and per-user folder grants.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {string} requestedPath - The requested path to resolve.
- * @returns {Promise<string>} The resolved absolute path within root.
- * @throws {HttpError} 400 if no path provided, 404 if not found, 403 if outside root.
+ * @returns {Promise<string>} The resolved absolute path within the user's allowed folders.
+ * @throws {HttpError} 400 if no path provided, 404 if not found, 403 if outside the allowed folders.
  */
-const resolvePathInRoot = async (requestedPath) => {
+const resolvePathForUser = async (user, requestedPath) => {
   const rawPath = String(requestedPath ?? "").trim();
   if (!rawPath) {
     throw new HttpError(400, "A path is required.");
   }
 
+  const allowedRoots = await getAllowedRoots(user);
   const absolutePath = path.resolve(rootDirectory, rawPath);
+  const forbidden = new HttpError(
+    403,
+    user.isAdmin
+      ? "The requested path is outside the shared directory."
+      : "The requested path is outside your shared folders.",
+  );
   let realPath;
   try {
     realPath = await fs.realpath(absolutePath);
   } catch (error) {
     if (error?.code === "ENOENT") {
-      throw new HttpError(404, "The requested path does not exist.");
+      // Report missing paths as forbidden outside the user's folders, so their existence is not revealed.
+      throw isPathAllowed(absolutePath, allowedRoots)
+        ? new HttpError(404, "The requested path does not exist.")
+        : forbidden;
     }
     throw error;
   }
 
-  if (!isInsideRoot(realPath)) {
-    throw new HttpError(
-      403,
-      "The requested path is outside the shared directory.",
-    );
+  if (!isPathAllowed(realPath, allowedRoots)) {
+    throw forbidden;
   }
 
   return realPath;
 };
 
 /**
- * Resolves an optional requested path within the root directory.
+ * Resolves an optional requested path for a user.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {string} requestedPath - The requested path to resolve (optional).
  * @returns {Promise<string|null>} The resolved absolute path or null if not provided.
  */
-const resolveOptionalPathInRoot = async (requestedPath) =>
-  requestedPath ? resolvePathInRoot(requestedPath) : null;
+const resolveOptionalPathForUser = async (user, requestedPath) =>
+  requestedPath ? resolvePathForUser(user, requestedPath) : null;
+
+/**
+ * Returns the directory holding a user's Immich settings.
+ * OpenID Connect users each get a private directory keyed by a hash of their subject.
+ * @param {{userKey: string}} user - The request's user context.
+ * @param {{create?: boolean}} [options] - Set create to make the directory (mode 0700) if missing.
+ * @returns {Promise<string>} The settings directory.
+ */
+const getUserSettingsDirectory = async (user, { create = false } = {}) => {
+  if (!user.userKey) {
+    return configDirectory;
+  }
+  if (!userKeyPattern.test(user.userKey)) {
+    throw new HttpError(400, "The session user is invalid. Sign in again.");
+  }
+
+  const directory = path.join(configDirectory, "users", user.userKey);
+  if (create) {
+    await fs.mkdir(path.dirname(directory), { recursive: true, mode: 0o700 });
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  }
+  return directory;
+};
 
 /**
  * Loads the secret key for AES-GCM encryption, from environment or generating a new one.
@@ -250,6 +331,23 @@ const isAuthorized = (request) => {
 };
 
 /**
+ * Identifies the user making a request.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @param {{open: Function}|null} sessionCodec - Opens session cookies when OpenID Connect is enabled.
+ * @returns {Object|null} The user context, or null when the request is not authenticated.
+ */
+const authenticateRequest = (request, sessionCodec) => {
+  if (!oidcEnabled) {
+    return isAuthorized(request) ? localUser : null;
+  }
+
+  const session = sessionCodec.open(
+    parseCookies(request.headers.cookie).get(cookieNames.session),
+  );
+  return session?.user ?? null;
+};
+
+/**
  * Sends a JSON response with the given status code and payload.
  * @param {ServerResponse} response - The HTTP response object.
  * @param {number} statusCode - The HTTP status code.
@@ -261,6 +359,57 @@ const sendJson = (response, statusCode, payload) => {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-store",
+  });
+  response.end(body);
+};
+
+/**
+ * Sends a redirect that is never cached.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {string} location - The redirect target.
+ * @param {string[]} [cookies] - Set-Cookie header values to send with the redirect.
+ */
+const sendRedirect = (response, location, cookies = []) => {
+  response.writeHead(302, {
+    Location: location,
+    "Cache-Control": "no-store",
+    ...(cookies.length ? { "Set-Cookie": cookies } : {}),
+  });
+  response.end();
+};
+
+/**
+ * Escapes text for inclusion in HTML.
+ * @param {string} value - The text to escape.
+ * @returns {string} The escaped text.
+ */
+const escapeHtml = (value) =>
+  String(value).replace(
+    /[&<>"']/g,
+    (character) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[character],
+  );
+
+/**
+ * Sends a small HTML page explaining a sign-in failure, with a link to try again.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {number} statusCode - The HTTP status code.
+ * @param {string} message - The user-visible explanation.
+ * @param {string[]} [cookies] - Set-Cookie header values to send with the page.
+ */
+const sendAuthError = (response, statusCode, message, cookies = []) => {
+  const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sign-in failed - Image Parser</title></head><body><main><h1>Sign-in failed</h1><p role="alert">${escapeHtml(message)}</p><p><a href="login">Try again</a></p></main></body></html>`;
+  response.writeHead(statusCode, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
+    ...(cookies.length ? { "Set-Cookie": cookies } : {}),
   });
   response.end(body);
 };
@@ -314,15 +463,20 @@ const buildImageUrl = (filePath, rotation) => {
   return `api/image?${params.toString()}`;
 };
 
-const progressClients = new Set();
+/**
+ * Progress stream clients grouped by user key, so upload output only reaches its owner.
+ * @type {Map<string, Set<ServerResponse>>}
+ */
+const progressClients = new Map();
 
 /**
- * Broadcasts a progress message to all connected clients.
- * @param {Object} progress - The progress data to broadcast.
+ * Creates a reporter that sends progress messages to one user's connected clients.
+ * @param {string} userKey - The user's key ("" when OpenID Connect is disabled).
+ * @returns {(progress: Object) => void} The progress reporter.
  */
-const broadcastProgress = (progress) => {
+const createProgressReporter = (userKey) => (progress) => {
   const message = `data: ${JSON.stringify(progress)}\n\n`;
-  for (const client of progressClients) {
+  for (const client of progressClients.get(userKey) ?? []) {
     client.write(message);
   }
 };
@@ -333,6 +487,7 @@ const broadcastProgress = (progress) => {
  * @param {ServerResponse} response - The HTTP response object.
  */
 const handleProgressStream = (request, response) => {
+  const { userKey } = request.user;
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-store",
@@ -340,11 +495,16 @@ const handleProgressStream = (request, response) => {
     "X-Accel-Buffering": "no",
   });
   response.write(": connected\n\n");
-  progressClients.add(response);
+  const clients = progressClients.get(userKey) ?? new Set();
+  clients.add(response);
+  progressClients.set(userKey, clients);
   const keepAlive = setInterval(() => response.write(": ping\n\n"), 25_000);
   request.on("close", () => {
     clearInterval(keepAlive);
-    progressClients.delete(response);
+    clients.delete(response);
+    if (!clients.size && progressClients.get(userKey) === clients) {
+      progressClients.delete(userKey);
+    }
   });
 };
 
@@ -361,13 +521,17 @@ const unloggedPaths = new Set([
 
 /**
  * Streams server log entries to the browser when debug mode is enabled.
+ * Logs include every user's paths, so only administrators may read them.
  * @param {IncomingMessage} request - The HTTP request object.
  * @param {ServerResponse} response - The HTTP response object.
- * @throws {HttpError} 404 when debug mode is disabled.
+ * @throws {HttpError} 404 when debug mode is disabled, 403 for non-administrators.
  */
 const handleDebugLogStream = (request, response) => {
   if (!debugEnabled) {
     throw new HttpError(404, "Unknown API endpoint.");
+  }
+  if (!request.user.isAdmin) {
+    throw new HttpError(403, "Only administrators can read the server log.");
   }
 
   response.writeHead(200, {
@@ -436,14 +600,50 @@ const logStartupDiagnostics = async () => {
 };
 
 /**
+ * Converts a canonical folder inside the root to a forward-slash path relative to it.
+ * @param {string} folderPath - The canonical folder path.
+ * @returns {string} The relative display name.
+ */
+const toRootRelativeName = (folderPath) =>
+  path.relative(rootDirectory, folderPath).split(path.sep).join("/") ||
+  path.basename(folderPath);
+
+/**
  * Handles a directory browse request and returns directory metadata.
+ * Non-administrators with several shared folders start at a virtual root listing only those folders.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {URL} url - The parsed URL object containing query parameters.
- * @returns {Promise<Object>} Object with path, rootPath, parent, directories, and imageCount.
+ * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, and imageCount.
+ *   A parent of "" means the virtual root; null means there is nothing above.
  * @throws {HttpError} 400 if the path is not a directory.
  */
-const handleBrowse = async (url) => {
-  const directoryPath = await resolvePathInRoot(
-    url.searchParams.get("path") || rootDirectory,
+const handleBrowse = async (user, url) => {
+  const allowedRoots = await getAllowedRoots(user);
+  let requestedPath = url.searchParams.get("path");
+  if (!requestedPath && !user.isAdmin) {
+    if (allowedRoots.length !== 1) {
+      return {
+        path: "",
+        rootPath: rootDirectory,
+        parent: null,
+        selectable: false,
+        directories: allowedRoots
+          .map((allowedRoot) => ({
+            name: toRootRelativeName(allowedRoot),
+            path: allowedRoot,
+          }))
+          .sort((left, right) =>
+            left.name.localeCompare(right.name, undefined, { numeric: true }),
+          ),
+        imageCount: 0,
+      };
+    }
+    requestedPath = allowedRoots[0];
+  }
+
+  const directoryPath = await resolvePathForUser(
+    user,
+    requestedPath || rootDirectory,
   );
   const stats = await fs.stat(directoryPath);
   if (!stats.isDirectory()) {
@@ -466,11 +666,16 @@ const handleBrowse = async (url) => {
       allowedExtensions.has(path.extname(entry.name).toLowerCase()),
   ).length;
 
+  let parent = path.dirname(directoryPath);
+  if (allowedRoots.includes(directoryPath)) {
+    parent = user.isAdmin || allowedRoots.length === 1 ? null : "";
+  }
+
   return {
     path: directoryPath,
     rootPath: rootDirectory,
-    parent:
-      directoryPath === rootDirectory ? null : path.dirname(directoryPath),
+    parent,
+    selectable: true,
     directories,
     imageCount,
   };
@@ -485,7 +690,10 @@ const handleBrowse = async (url) => {
  * @throws {HttpError} 400 if unsupported image type.
  */
 const handleImage = async (request, response, url) => {
-  const filePath = await resolvePathInRoot(url.searchParams.get("path"));
+  const filePath = await resolvePathForUser(
+    request.user,
+    url.searchParams.get("path"),
+  );
   const extension = path.extname(filePath).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new HttpError(400, "Unsupported image type.");
@@ -525,69 +733,213 @@ const handleImage = async (request, response, url) => {
 };
 
 /**
- * Validates and resolves metadata paths within the root directory.
+ * Validates and resolves metadata paths within the user's allowed folders.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {Object} payload - Object with frontPath and backPath properties.
  * @returns {Promise<Object>} The payload with resolved paths.
  */
-const validateMetadataPaths = async (payload) => ({
+const validateMetadataPaths = async (user, payload) => ({
   ...payload,
-  frontPath: await resolvePathInRoot(payload?.frontPath),
-  backPath: await resolveOptionalPathInRoot(payload?.backPath),
+  frontPath: await resolvePathForUser(user, payload?.frontPath),
+  backPath: await resolveOptionalPathForUser(user, payload?.backPath),
 });
 
 /**
  * Creates an API routes object with handlers for all endpoints.
+ * Every handler reads the authenticated user from `request.user`.
  * @param {Object} secretCodec - Object with encrypt and decrypt methods.
  * @returns {Object} Object mapping route strings to async handler functions.
  */
 const createApiRoutes = (secretCodec) => ({
-  "GET /api/config": async () => ({
+  "GET /api/config": async (request) => ({
     rootPath: rootDirectory,
-    debug: debugEnabled,
+    debug: debugEnabled && request.user.isAdmin,
   }),
-  "GET /api/browse": async (_request, url) => handleBrowse(url),
+  "GET /api/me": async (request) => ({
+    username: request.user.username,
+    isAdmin: request.user.isAdmin,
+    authMode: oidcEnabled ? "oidc" : authPassword ? "basic" : "none",
+  }),
+  "GET /api/browse": async (request, url) => handleBrowse(request.user, url),
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);
-    const directoryPath = await resolvePathInRoot(body.directoryPath);
+    const directoryPath = await resolvePathForUser(
+      request.user,
+      body.directoryPath,
+    );
     const { field, direction } = normalizeSortBy(body.sortBy ?? defaultSortBy);
     return readDirectory(directoryPath, `${field}-${direction}`);
   },
   "POST /api/read-sidecar-metadata": async (request) => {
     const body = await readJsonBody(request);
-    return readSidecarMetadata(await resolvePathInRoot(body.filePath));
+    return readSidecarMetadata(
+      await resolvePathForUser(request.user, body.filePath),
+    );
   },
   "POST /api/save-metadata": async (request) =>
-    saveMetadata(await validateMetadataPaths(await readJsonBody(request))),
+    saveMetadata(
+      await validateMetadataPaths(request.user, await readJsonBody(request)),
+    ),
   "POST /api/preview-url": async (request) => {
     const body = await readJsonBody(request);
     return {
-      url: buildImageUrl(await resolvePathInRoot(body.filePath), body.rotation),
+      url: buildImageUrl(
+        await resolvePathForUser(request.user, body.filePath),
+        body.rotation,
+      ),
     };
   },
   "POST /api/apply-image-rotations": async (request) =>
     applyImageRotations(
-      await validateMetadataPaths(await readJsonBody(request)),
+      await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
-  "GET /api/immich-settings": async () =>
+  "GET /api/immich-settings": async (request) =>
     registerImmichSecrets(
-      await loadImmichSettings(configDirectory, secretCodec),
+      await loadImmichSettings(
+        await getUserSettingsDirectory(request.user),
+        secretCodec,
+      ),
     ),
-  "POST /api/immich-settings": async (request) =>
-    saveImmichSettings(
-      configDirectory,
+  "POST /api/immich-settings": async (request) => {
+    const body = registerImmichSecrets(await readJsonBody(request));
+    return saveImmichSettings(
+      await getUserSettingsDirectory(request.user, { create: true }),
       secretCodec,
-      registerImmichSecrets(await readJsonBody(request)),
-    ),
+      body,
+    );
+  },
   "POST /api/upload-to-immich": async (request) => {
     const body = await readJsonBody(request);
     registerImmichSecrets(body.settings);
-    const directoryPath = await resolvePathInRoot(body.directoryPath);
-    return runImmichUpload(body.settings, directoryPath, broadcastProgress, {
-      debug: debugEnabled,
-      log: logger,
-    });
+    const directoryPath = await resolvePathForUser(
+      request.user,
+      body.directoryPath,
+    );
+    // The settings come from the user's own form (loaded from their own settings file), so
+    // each upload runs with the signed-in user's Immich credentials.
+    return runImmichUpload(
+      body.settings,
+      directoryPath,
+      createProgressReporter(request.user.userKey),
+      {
+        debug: debugEnabled,
+        log: logger,
+        lockKey: request.user.userKey || "default",
+      },
+    );
   },
 });
+
+/**
+ * Creates the OpenID Connect sign-in, callback, and sign-out handlers.
+ * @param {{oidcClient: Object, sessionCodec: Object, loginCodec: Object}} auth - The client and cookie codecs.
+ * @returns {Object} Object mapping /auth/* paths to handlers.
+ */
+const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
+  // The app's public base URL: the redirect URI with its trailing "auth/callback" removed.
+  const appLocation = new URL("../", oidcRedirectUri).href;
+  const clearLoginCookie = serializeCookie(cookieNames.login, "", {
+    maxAgeSeconds: 0,
+    secure: secureCookies,
+  });
+
+  return {
+    "/auth/login": async (_request, response) => {
+      const { url, checks } = await oidcClient.startLogin();
+      sendRedirect(response, url.href, [
+        serializeCookie(
+          cookieNames.login,
+          loginCodec.seal({
+            ...checks,
+            expiresAt: Date.now() + loginStateMaxAgeSeconds * 1000,
+          }),
+          { maxAgeSeconds: loginStateMaxAgeSeconds, secure: secureCookies },
+        ),
+      ]);
+    },
+    "/auth/callback": async (request, response, url) => {
+      const checks = loginCodec.open(
+        parseCookies(request.headers.cookie).get(cookieNames.login),
+      );
+      if (url.searchParams.has("error")) {
+        sendAuthError(
+          response,
+          400,
+          `The identity provider refused the sign-in: ${url.searchParams.get("error_description") || url.searchParams.get("error")}`,
+          [clearLoginCookie],
+        );
+        return;
+      }
+      if (!checks) {
+        sendAuthError(
+          response,
+          400,
+          "The sign-in attempt expired or was started in another browser.",
+          [clearLoginCookie],
+        );
+        return;
+      }
+
+      let user;
+      try {
+        user = buildUserContext(
+          await oidcClient.finishLogin(url.searchParams, checks),
+          { foldersClaim: oidcFoldersClaim, adminGroup: oidcAdminGroup },
+        );
+      } catch (error) {
+        logger.warn("OpenID Connect sign-in failed.", error);
+        sendAuthError(
+          response,
+          400,
+          "Sign-in could not be completed. Check the server log for details.",
+          [clearLoginCookie],
+        );
+        return;
+      }
+
+      const session = sessionCodec.seal({
+        user,
+        expiresAt: Date.now() + sessionMaxAgeSeconds * 1000,
+      });
+      if (session.length > maxSessionCookieLength) {
+        sendAuthError(
+          response,
+          400,
+          "Your account has too many shared folders to fit in a session. Ask an administrator to grant fewer, broader folders.",
+          [clearLoginCookie],
+        );
+        return;
+      }
+
+      logger.info("User signed in.", {
+        username: user.username,
+        isAdmin: user.isAdmin,
+        folders: user.folders.length,
+      });
+      sendRedirect(response, appLocation, [
+        serializeCookie(cookieNames.session, session, {
+          maxAgeSeconds: sessionMaxAgeSeconds,
+          secure: secureCookies,
+        }),
+        clearLoginCookie,
+      ]);
+    },
+    "/auth/logout": async (_request, response) => {
+      let location = appLocation;
+      try {
+        location = (await oidcClient.buildLogoutUrl())?.href ?? appLocation;
+      } catch (error) {
+        logger.warn("Could not build the identity provider logout URL.", error);
+      }
+      sendRedirect(response, location, [
+        serializeCookie(cookieNames.session, "", {
+          maxAgeSeconds: 0,
+          secure: secureCookies,
+        }),
+      ]);
+    },
+  };
+};
 
 /**
  * Serves static files from the dist directory.
@@ -598,10 +950,7 @@ const serveStatic = async (response, pathname) => {
   const relativePath =
     decodeURIComponent(pathname).replace(/^\/+/, "") || "index.html";
   let filePath = path.resolve(distDirectory, relativePath);
-  if (
-    filePath !== distDirectory &&
-    !filePath.startsWith(distDirectory + path.sep)
-  ) {
+  if (!isInsideDirectory(filePath, distDirectory)) {
     throw new HttpError(403, "Forbidden.");
   }
 
@@ -630,12 +979,46 @@ const serveStatic = async (response, pathname) => {
 };
 
 /**
+ * Rejects an unauthenticated request: a Basic auth challenge, a 401 for API calls, or a sign-in redirect.
+ * @param {IncomingMessage} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {URL} url - The parsed request URL.
+ */
+const rejectUnauthenticated = (request, response, url) => {
+  if (!oidcEnabled) {
+    response.writeHead(401, {
+      "WWW-Authenticate": 'Basic realm="Image Parser", charset="UTF-8"',
+    });
+    response.end("Authentication required.");
+    return;
+  }
+
+  if (
+    url.pathname.startsWith("/api/") ||
+    (request.method !== "GET" && request.method !== "HEAD")
+  ) {
+    sendJson(response, 401, { error: "Sign in to continue." });
+    return;
+  }
+
+  sendRedirect(response, new URL("login", oidcRedirectUri).href);
+};
+
+/**
  * Creates an HTTP request handler with authentication, routing, and error handling.
- * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {{secretCodec: Object, sessionCodec: Object|null, loginCodec: Object|null, oidcClient: Object|null}} context - Settings codec, and the OpenID Connect client and cookie codecs when enabled.
  * @returns {Function} An async function that handles HTTP requests and responses.
  */
-const createRequestHandler = (secretCodec) => {
+const createRequestHandler = ({
+  secretCodec,
+  sessionCodec,
+  loginCodec,
+  oidcClient,
+}) => {
   const apiRoutes = createApiRoutes(secretCodec);
+  const authRoutes = oidcEnabled
+    ? createAuthRoutes({ oidcClient, sessionCodec, loginCodec })
+    : {};
 
   return async (request, response) => {
     const startedAt = Date.now();
@@ -649,20 +1032,26 @@ const createRequestHandler = (secretCodec) => {
     });
 
     try {
-      if (!isAuthorized(request)) {
-        response.writeHead(401, {
-          "WWW-Authenticate": 'Basic realm="Image Parser", charset="UTF-8"',
-        });
-        response.end("Authentication required.");
-        return;
-      }
-
       const url = new URL(request.url ?? "/", "http://localhost");
 
+      // Health checks run without credentials (the container HEALTHCHECK has none).
       if (url.pathname === "/healthz") {
         sendJson(response, 200, { ok: true });
         return;
       }
+
+      const authRoute = authRoutes[url.pathname];
+      if (authRoute && request.method === "GET") {
+        await authRoute(request, response, url);
+        return;
+      }
+
+      const user = authenticateRequest(request, sessionCodec);
+      if (!user) {
+        rejectUnauthenticated(request, response, url);
+        return;
+      }
+      request.user = user;
 
       if (request.method === "GET" && url.pathname === "/api/immich-progress") {
         handleProgressStream(request, response);
@@ -717,6 +1106,54 @@ const createRequestHandler = (secretCodec) => {
 };
 
 /**
+ * Validates the OpenID Connect settings and creates the client and cookie codecs.
+ * @param {Buffer} masterKey - The server's master key; session keys are derived from it.
+ * @returns {{oidcClient: Object|null, sessionCodec: Object|null, loginCodec: Object|null}} The OIDC context, or nulls when disabled.
+ * @throws {Error} If the configuration is incomplete or conflicts with HTTP Basic auth.
+ */
+const createOidcContext = (masterKey) => {
+  if (!oidcEnabled) {
+    return { oidcClient: null, sessionCodec: null, loginCodec: null };
+  }
+
+  if (authPassword) {
+    throw new Error(
+      "Set either OIDC_ISSUER_URL or IMAGEPARSER_PASSWORD, not both.",
+    );
+  }
+  for (const [name, value] of Object.entries({
+    OIDC_CLIENT_ID: oidcClientId,
+    OIDC_CLIENT_SECRET: oidcClientSecret,
+    OIDC_REDIRECT_URI: oidcRedirectUri,
+  })) {
+    if (!value) {
+      throw new Error(`${name} must be set when OIDC_ISSUER_URL is set.`);
+    }
+  }
+  for (const [name, value] of Object.entries({
+    OIDC_ISSUER_URL: oidcIssuerUrl,
+    OIDC_REDIRECT_URI: oidcRedirectUri,
+  })) {
+    if (!URL.canParse(value)) {
+      throw new Error(`${name} must be an absolute URL.`);
+    }
+  }
+
+  return {
+    oidcClient: createOidcClient({
+      issuerUrl: oidcIssuerUrl,
+      clientId: oidcClientId,
+      clientSecret: oidcClientSecret,
+      redirectUri: oidcRedirectUri,
+      scopes: oidcScopes,
+      allowInsecureRequests: oidcAllowInsecureRequests,
+    }),
+    sessionCodec: createSealedCodec(deriveKey(masterKey, "session")),
+    loginCodec: createSealedCodec(deriveKey(masterKey, "login")),
+  };
+};
+
+/**
  * Starts the Image Parser server on the configured port and host.
  */
 const start = async () => {
@@ -727,15 +1164,23 @@ const start = async () => {
   }
 
   rootDirectory = await fs.realpath(configuredRoot);
-  const secretCodec = createAesGcmCodec(await loadSecretKey());
-  const server = http.createServer(createRequestHandler(secretCodec));
+  const masterKey = await loadSecretKey();
+  const server = http.createServer(
+    createRequestHandler({
+      secretCodec: createAesGcmCodec(masterKey),
+      ...createOidcContext(masterKey),
+    }),
+  );
 
   /**
    * Shuts down the server and cleans up progress clients.
    */
   const shutdown = () => {
     server.close();
-    for (const client of [...progressClients, ...debugLogClients]) {
+    for (const client of [
+      ...[...progressClients.values()].flatMap((clients) => [...clients]),
+      ...debugLogClients,
+    ]) {
       client.end();
     }
     void shutdownCore().finally(() => process.exit(0));
@@ -747,9 +1192,18 @@ const start = async () => {
     logger.info(
       `Image Parser listening on http://${host}:${port} (root: ${rootDirectory})`,
     );
-    if (!authPassword) {
+    if (oidcEnabled) {
+      logger.info(
+        `OpenID Connect sign-in is enabled (issuer: ${oidcIssuerUrl}).`,
+      );
+      if (!secureCookies) {
+        logger.warn(
+          "OIDC_REDIRECT_URI does not use HTTPS; session cookies are sent without the Secure flag.",
+        );
+      }
+    } else if (!authPassword) {
       logger.warn(
-        "Authentication is disabled. Set IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD to enable it.",
+        "Authentication is disabled. Set OIDC_ISSUER_URL, or IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD, to enable it.",
       );
     }
     if (debugEnabled) {

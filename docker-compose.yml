@@ -17,8 +17,22 @@ services:
       PUID: ${PUID:-568}
       PGID: ${PGID:-568}
       # Optional HTTP Basic auth. Strongly recommended, because the UI can read the saved Immich API keys.
+      # Leave empty when using OpenID Connect sign-in below; the two cannot be combined.
       IMAGEPARSER_USERNAME: ${IMAGEPARSER_USERNAME:-}
       IMAGEPARSER_PASSWORD: ${IMAGEPARSER_PASSWORD:-}
+      # Optional OpenID Connect sign-in (for example Authentik), with per-user folders and Immich settings.
+      # Setting OIDC_ISSUER_URL enables it; see "Single sign-on with Authentik" in README.md.
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      # The public callback URL registered with the provider, e.g. https://photos.example.com/auth/callback.
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email imageparser}
+      OIDC_ADMIN_GROUP: ${OIDC_ADMIN_GROUP:-imageparser-admin}
+      OIDC_FOLDERS_CLAIM: ${OIDC_FOLDERS_CLAIM:-imageparser_folders}
+      OIDC_SESSION_HOURS: ${OIDC_SESSION_HOURS:-8}
+      # Only for an identity provider reachable over plain HTTP on a trusted network.
+      OIDC_ALLOW_INSECURE_REQUESTS: ${OIDC_ALLOW_INSECURE_REQUESTS:-false}
       # Set to true to stream server-side logs (including immich-go diagnostics) to the browser's
       # developer console. Leave false in normal use; any signed-in user can read the stream.
       IMAGEPARSER_DEBUG: ${IMAGEPARSER_DEBUG:-false}

@@ -102,11 +102,11 @@ const defaultImmichSettings = Object.freeze({
 });
 
 /**
- * Flag indicating whether an Immich upload operation is currently running.
- * Prevents multiple simultaneous uploads to avoid conflicts.
- * @type {boolean}
+ * Lock keys of the Immich uploads currently running.
+ * Prevents simultaneous uploads for the same key (one per user on the web server).
+ * @type {Set<string>}
  */
-let isImmichUploadRunning = false;
+const runningImmichUploads = new Set();
 
 /**
  * Normalizes Immich tags from either an array or comma-separated string.
@@ -339,7 +339,7 @@ const getImmichGoDiagnostics = () =>
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
- * @param {{debug?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}}} [options] - Optional verbose immich-go logging and a logger for diagnostics.
+ * @param {{debug?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
  * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
@@ -347,13 +347,13 @@ const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
-  { debug = false, log } = {},
+  { debug = false, log, lockKey = "default" } = {},
 ) => {
-  if (isImmichUploadRunning) {
+  if (runningImmichUploads.has(lockKey)) {
     throw new Error("An Immich upload is already running.");
   }
 
-  isImmichUploadRunning = true;
+  runningImmichUploads.add(lockKey);
 
   try {
     const normalizedDirectoryPath = String(directoryPath ?? "").trim();
@@ -441,7 +441,7 @@ const runImmichUpload = async (
       });
     });
   } finally {
-    isImmichUploadRunning = false;
+    runningImmichUploads.delete(lockKey);
   }
 };
 

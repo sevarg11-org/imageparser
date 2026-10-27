@@ -33,8 +33,20 @@ const openDirectoryBrowser = (
     );
   });
 
+export type CurrentUser = {
+  username: string;
+  isAdmin: boolean;
+  authMode: "oidc" | "basic" | "none";
+};
+
+let isWebApiInstalled = false;
+
 const requestJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(url, init);
+  // An expired OpenID Connect session answers 401 without a Basic challenge; sign in again.
+  if (response.status === 401 && !response.headers.has("WWW-Authenticate")) {
+    window.location.assign("auth/login");
+  }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error(
@@ -154,9 +166,24 @@ const connectServerDebugLog = async () => {
   }
 };
 
+/**
+ * Returns the signed-in web user, or null in the desktop app or when the server cannot say.
+ */
+export const fetchCurrentUser = async (): Promise<CurrentUser | null> => {
+  if (!isWebApiInstalled) {
+    return null;
+  }
+  try {
+    return await requestJson<CurrentUser>("api/me");
+  } catch {
+    return null;
+  }
+};
+
 export const installWebApi = () => {
   if (!window.electronAPI) {
     window.electronAPI = createWebApi();
+    isWebApiInstalled = true;
     void connectServerDebugLog();
   }
 };

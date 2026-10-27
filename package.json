@@ -19,6 +19,7 @@
     "concurrently": "^10.0.5",
     "electron": "^44.2.0",
     "exiftool-vendored": "^38.1.1",
+    "openid-client": "^6.8.8",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "sharp": "^0.35.4",
