@@ -14,6 +14,7 @@ import {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setFolderDate,
   shutdownCore,
 } from "./core.js";
 import fs from "node:fs/promises";
@@ -363,6 +364,17 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @returns {Promise<Object>} A report of the upload operation results.
  */
+/**
+ * IPC handler for setting the date on all images in a directory that do not
+ * already have an XMP sidecar file.
+ * @param {*} _event - The IPC event object.
+ * @param {{directoryPath: string, date: string}} payload
+ * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, errors: string[]}>}
+ */
+ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
+  setFolderDate(directoryPath, date),
+);
+
 ipcMain.handle("upload-to-immich", async (_event, settings, directoryPath) => {
   const reportProgress = (progress) => {
     if (!_event.sender.isDestroyed()) {
