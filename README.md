@@ -117,6 +117,35 @@ Create a stack from `docker-compose.yml`. Configure these environment variables:
 | `IMAGEPARSER_PORT`       | `8080`                       | Host port for the web UI            |
 | `IMAGEPARSER_USERNAME`   | `admin`                      | Optional HTTP Basic auth user       |
 | `IMAGEPARSER_PASSWORD`   | _(strong password)_          | Enables auth when set (recommended) |
+| `IMAGEPARSER_DEBUG`      | `false`                      | Streams server logs to the browser  |
+
+Open `http://<truenas-ip>:8080`, click the folder button, and browse the mounted photo share.
+
+The image bundles the official `immich-go` Linux release from
+[simulot/immich-go](https://github.com/simulot/immich-go/releases), verified against the release checksums. To
+build with a different release, pass `--build-arg IMMICH_GO_VERSION=x.y.z` to `docker build`.
+
+### Debugging
+
+Set `IMAGEPARSER_DEBUG=true` (in the stack's `.env` file, with `docker run -e`, or at build time with
+`--build-arg IMAGEPARSER_DEBUG=true`) and restart the container. Then open the web UI, open the browser developer
+tools, and watch the **Console** for entries prefixed with `[server]`:
+
+- Startup diagnostics: Node version, user ID, whether `/data` and `/config` are writable, whether the CA
+  certificate bundle exists, and the `immich-go version` output.
+- Each API request with its status and duration.
+- Each Immich upload: the `immich-go` command (API keys shown as `[REDACTED]`), its output at debug level, and the
+  exit code or signal.
+
+Common container-only Immich upload failures:
+
+- `x509: certificate signed by unknown authority`: `immich-go` uses the system certificate store, so the server's
+  HTTPS certificate must be trusted inside the container.
+- `connection refused` / `no such host`: `localhost` inside the container is the container itself; use the Immich
+  server's LAN IP address or hostname.
+- Exit by `SIGKILL`: usually out of memory; lower the concurrent task count.
+
+Turn debugging off again afterwards. Any user who can sign in to the web UI can read the log stream.
 | `IMAGEPARSER_TAG`        | `latest`                     | Image tag to run (default `latest`) |
 
 Open `http://<truenas-ip>:8080`, click the folder button, and browse the mounted photo share.

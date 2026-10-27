@@ -1,49 +1,62 @@
-import { createElement } from 'react'
-import { createRoot } from 'react-dom/client'
-import { DirectoryBrowserDialog, type DirectoryListing } from './DirectoryBrowser'
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import {
+  DirectoryBrowserDialog,
+  type DirectoryListing,
+} from "./DirectoryBrowser";
 
-type ImageParserApi = NonNullable<Window['electronAPI']>
+type ImageParserApi = NonNullable<Window["electronAPI"]>;
 
-const LAST_DIRECTORY_STORAGE_KEY = 'imageparser:last-directory'
+const LAST_DIRECTORY_STORAGE_KEY = "imageparser:last-directory";
 
 const openDirectoryBrowser = (
   initialPath: string | null,
   loadListing: (directoryPath: string | null) => Promise<DirectoryListing>,
 ) =>
   new Promise<string | null>((resolve) => {
-    const container = document.createElement('div')
-    document.body.appendChild(container)
-    const root = createRoot(container)
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
 
     const onClose = (selectedPath: string | null) => {
-      root.unmount()
-      container.remove()
-      resolve(selectedPath)
-    }
+      root.unmount();
+      container.remove();
+      resolve(selectedPath);
+    };
 
-    root.render(createElement(DirectoryBrowserDialog, { initialPath, loadListing, onClose }))
-  })
+    root.render(
+      createElement(DirectoryBrowserDialog, {
+        initialPath,
+        loadListing,
+        onClose,
+      }),
+    );
+  });
 
 const requestJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
-  const response = await fetch(url, init)
-  const payload = await response.json().catch(() => null)
+  const response = await fetch(url, init);
+  const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error ?? `Request failed with status ${response.status}.`)
+    throw new Error(
+      payload?.error ?? `Request failed with status ${response.status}.`,
+    );
   }
-  return payload as T
-}
+  return payload as T;
+};
 
 const postJson = <T>(url: string, body: unknown) =>
   requestJson<T>(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  })
+  });
 
 const loadDirectoryListing = (directoryPath: string | null) => {
-  const query = directoryPath ? `?${new URLSearchParams({ path: directoryPath }).toString()}` : ''
-  return requestJson<DirectoryListing>(`api/browse${query}`)
-}
+  const query = directoryPath
+    ? `?${new URLSearchParams({ path: directoryPath }).toString()}`
+    : "";
+  return requestJson<DirectoryListing>(`api/browse${query}`);
+};
 
 // Mirrors the Electron preload bridge so App.tsx works unchanged when served over HTTP.
 const createWebApi = (): ImageParserApi => ({
@@ -51,36 +64,99 @@ const createWebApi = (): ImageParserApi => ({
     const selectedPath = await openDirectoryBrowser(
       window.localStorage.getItem(LAST_DIRECTORY_STORAGE_KEY),
       loadDirectoryListing,
-    )
+    );
     if (selectedPath) {
-      window.localStorage.setItem(LAST_DIRECTORY_STORAGE_KEY, selectedPath)
+      window.localStorage.setItem(LAST_DIRECTORY_STORAGE_KEY, selectedPath);
     }
-    return selectedPath
+    return selectedPath;
   },
-  readDirectory: (directoryPath, sortBy) => postJson('api/read-directory', { directoryPath, sortBy }),
-  readSidecarMetadata: (filePath) => postJson('api/read-sidecar-metadata', { filePath }),
-  saveMetadata: (metadata) => postJson('api/save-metadata', metadata),
+  readDirectory: (directoryPath, sortBy) =>
+    postJson("api/read-directory", { directoryPath, sortBy }),
+  readSidecarMetadata: (filePath) =>
+    postJson("api/read-sidecar-metadata", { filePath }),
+  saveMetadata: (metadata) => postJson("api/save-metadata", metadata),
   getPreviewDataUrl: async (filePath, rotation) =>
-    (await postJson<{ url: string }>('api/preview-url', { filePath, rotation })).url,
-  applyImageRotations: (request) => postJson('api/apply-image-rotations', request),
-  loadImmichSettings: () => requestJson('api/immich-settings'),
-  saveImmichSettings: (settings) => postJson('api/immich-settings', settings),
-  uploadToImmich: (settings, directoryPath) => postJson('api/upload-to-immich', { settings, directoryPath }),
+    (await postJson<{ url: string }>("api/preview-url", { filePath, rotation }))
+      .url,
+  applyImageRotations: (request) =>
+    postJson("api/apply-image-rotations", request),
+  loadImmichSettings: () => requestJson("api/immich-settings"),
+  saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
+  uploadToImmich: (settings, directoryPath) =>
+    postJson("api/upload-to-immich", { settings, directoryPath }),
   onImmichUploadProgress: (listener) => {
-    const eventSource = new EventSource('api/immich-progress')
+    const eventSource = new EventSource("api/immich-progress");
     eventSource.onmessage = (event) => {
       try {
-        listener(JSON.parse(event.data))
+        listener(JSON.parse(event.data));
       } catch {
         // Ignore malformed progress messages; the final upload result still arrives via the POST response.
       }
-    }
-    return () => eventSource.close()
+    };
+    return () => eventSource.close();
   },
-})
+});
+
+type ServerLogLevel = "debug" | "info" | "warn" | "error";
+
+type ServerLogEntry = {
+  time: string;
+  level: ServerLogLevel;
+  message: string;
+  details?: unknown;
+};
+
+const serverLogLevels: ReadonlySet<string> = new Set<ServerLogLevel>([
+  "debug",
+  "info",
+  "warn",
+  "error",
+]);
+
+const isServerLogEntry = (value: unknown): value is ServerLogEntry =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as ServerLogEntry).message === "string" &&
+  serverLogLevels.has((value as ServerLogEntry).level);
+
+// Mirrors server-side logs into the browser console when the server runs with IMAGEPARSER_DEBUG enabled.
+const connectServerDebugLog = async () => {
+  try {
+    const config = await requestJson<{ rootPath: string; debug?: boolean }>(
+      "api/config",
+    );
+    if (!config.debug) {
+      return;
+    }
+
+    console.info(
+      "[server] Debug logging is enabled; server log entries will appear here.",
+    );
+    const eventSource = new EventSource("api/debug-log");
+    eventSource.addEventListener("log", (event) => {
+      try {
+        const entry: unknown = JSON.parse((event as MessageEvent<string>).data);
+        if (!isServerLogEntry(entry)) {
+          return;
+        }
+        const prefix = `[server] ${entry.time}`;
+        if (entry.details === undefined) {
+          console[entry.level](prefix, entry.message);
+        } else {
+          console[entry.level](prefix, entry.message, entry.details);
+        }
+      } catch {
+        // Ignore malformed log messages; they are diagnostic only.
+      }
+    });
+  } catch {
+    // Debug logging is optional; the app works without it.
+  }
+};
 
 export const installWebApi = () => {
   if (!window.electronAPI) {
-    window.electronAPI = createWebApi()
+    window.electronAPI = createWebApi();
+    void connectServerDebugLog();
   }
-}
+};

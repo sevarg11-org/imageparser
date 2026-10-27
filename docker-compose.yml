@@ -19,6 +19,9 @@ services:
       # Optional HTTP Basic auth. Strongly recommended, because the UI can read the saved Immich API keys.
       IMAGEPARSER_USERNAME: ${IMAGEPARSER_USERNAME:-}
       IMAGEPARSER_PASSWORD: ${IMAGEPARSER_PASSWORD:-}
+      # Set to true to stream server-side logs (including immich-go diagnostics) to the browser's
+      # developer console. Leave false in normal use; any signed-in user can read the stream.
+      IMAGEPARSER_DEBUG: ${IMAGEPARSER_DEBUG:-false}
     volumes:
       # The photo share the browser can browse and edit, for example /mnt/tank/photos/scans.
       # Nothing outside this directory is reachable from the web UI.
