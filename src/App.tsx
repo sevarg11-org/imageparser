@@ -747,6 +747,7 @@ function App() {
       }
 
       setImageNumberInput(String(boundedIndex + 1));
+      setIsHydrated(false);
       setSelectedIndex(boundedIndex);
     },
     [
@@ -1448,7 +1449,6 @@ function App() {
       ) : (
         <main className="workspace">
           <aside className="metadata-panel">
-            <h2>Metadata</h2>
             <div className="metadata-grid">
               <fieldset className="metadata-date">
                 <legend>Date</legend>
