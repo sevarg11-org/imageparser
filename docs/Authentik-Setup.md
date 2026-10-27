@@ -183,7 +183,8 @@ Rules:
 - A user's folders are the combination of their own grants and all their groups' grants.
 - A single folder can be written as a plain string: `imageparser_folders: family`.
 - Invalid entries (`..`, `./x`, empty strings) are ignored, as are folders that don't exist on disk and symlinks
-  that point outside the share.
+  that point outside the share. If you create a granted folder after the user has signed in, it can take up to 30
+  seconds to appear (grants are cached briefly for speed).
 - Up to 50 folders per user. Grant a parent folder rather than many siblings.
 
 What users see in the folder browser:

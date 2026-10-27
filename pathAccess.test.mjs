@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test, { after, before } from "node:test";
 import {
+  createAllowedRootsCache,
   isInsideDirectory,
   isPathAllowed,
   maxFolderGrants,
@@ -123,5 +124,47 @@ test("drops grants that are files or traversal attempts", async () => {
   assert.deepEqual(
     await resolveAllowedRoots(root, ["notes.txt", "../outside"]),
     [],
+  );
+});
+
+test("caches resolved grants until they expire", async () => {
+  let clock = 0;
+  const resolve = createAllowedRootsCache({ ttlMs: 1000, now: () => clock });
+  const first = resolve(root, ["family"]);
+  assert.equal(resolve(root, ["family"]), first, "shares one resolution");
+  assert.deepEqual(await first, [path.join(root, "family")]);
+  assert.notEqual(resolve(root, ["scans"]), first, "keys on the grants");
+
+  clock = 1001;
+  assert.notEqual(resolve(root, ["family"]), first, "re-resolves after expiry");
+});
+
+test("bounds the number of cached grant sets", async () => {
+  const resolve = createAllowedRootsCache({ maxEntries: 2 });
+  const family = resolve(root, ["family"]);
+  resolve(root, ["scans"]);
+  resolve(root, ["scans/2023"]);
+  assert.notEqual(
+    resolve(root, ["family"]),
+    family,
+    "the oldest entry was evicted",
+  );
+});
+
+test("a cached grant replaced by an escaping symlink no longer matches", async () => {
+  const swapRoot = path.join(workspace, "swap");
+  const granted = path.join(swapRoot, "granted");
+  await fs.mkdir(granted, { recursive: true });
+  const resolve = createAllowedRootsCache();
+  const roots = await resolve(swapRoot, ["granted"]);
+  assert.deepEqual(roots, [granted]);
+
+  await fs.rm(granted, { recursive: true });
+  await fs.symlink(path.join(workspace, "outside"), granted, "junction");
+  // The cache still holds the old canonical folder, but the requested path resolves outside it.
+  const requested = await fs.realpath(granted);
+  assert.equal(
+    isPathAllowed(requested, await resolve(swapRoot, ["granted"])),
+    false,
   );
 });
