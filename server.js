@@ -57,13 +57,17 @@ const debugEnabled = /^(1|true|yes|on)$/i.test(
   process.env.IMAGEPARSER_DEBUG ?? "",
 );
 const oidcIssuerUrl = process.env.OIDC_ISSUER_URL || "";
-const oidcEnabled = Boolean(oidcIssuerUrl);
+// Break-glass switch for an unavailable identity provider: skips OIDC sign-in and falls back to
+// HTTP Basic auth when configured, otherwise to open access.
+const oidcDisabled = /^(1|true|yes|on)$/i.test(process.env.OIDC_DISABLED ?? "");
+const oidcEnabled = Boolean(oidcIssuerUrl) && !oidcDisabled;
 const oidcClientId = process.env.OIDC_CLIENT_ID || "";
 const oidcClientSecret = process.env.OIDC_CLIENT_SECRET || "";
 const oidcRedirectUri = process.env.OIDC_REDIRECT_URI || "";
 const oidcScopes =
   process.env.OIDC_SCOPES || "openid profile email imageparser";
 const oidcAdminGroup = process.env.OIDC_ADMIN_GROUP || "imageparser-admin";
+const oidcAdminClaim = process.env.OIDC_ADMIN_CLAIM || "imageparser_admin";
 const oidcFoldersClaim =
   process.env.OIDC_FOLDERS_CLAIM || "imageparser_folders";
 const oidcAllowInsecureRequests = /^(1|true|yes|on)$/i.test(
@@ -884,7 +888,11 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
       try {
         user = buildUserContext(
           await oidcClient.finishLogin(url.searchParams, checks),
-          { foldersClaim: oidcFoldersClaim, adminGroup: oidcAdminGroup },
+          {
+            foldersClaim: oidcFoldersClaim,
+            adminGroup: oidcAdminGroup,
+            adminClaim: oidcAdminClaim,
+          },
         );
       } catch (error) {
         logger.warn("OpenID Connect sign-in failed.", error);
@@ -1109,7 +1117,7 @@ const createRequestHandler = ({
  * Validates the OpenID Connect settings and creates the client and cookie codecs.
  * @param {Buffer} masterKey - The server's master key; session keys are derived from it.
  * @returns {{oidcClient: Object|null, sessionCodec: Object|null, loginCodec: Object|null}} The OIDC context, or nulls when disabled.
- * @throws {Error} If the configuration is incomplete or conflicts with HTTP Basic auth.
+ * @throws {Error} If the configuration is incomplete.
  */
 const createOidcContext = (masterKey) => {
   if (!oidcEnabled) {
@@ -1117,8 +1125,8 @@ const createOidcContext = (masterKey) => {
   }
 
   if (authPassword) {
-    throw new Error(
-      "Set either OIDC_ISSUER_URL or IMAGEPARSER_PASSWORD, not both.",
+    logger.info(
+      "IMAGEPARSER_USERNAME/IMAGEPARSER_PASSWORD are not used while OpenID Connect sign-in is on; they apply only when OIDC_DISABLED is set.",
     );
   }
   for (const [name, value] of Object.entries({
@@ -1201,6 +1209,12 @@ const start = async () => {
           "OIDC_REDIRECT_URI does not use HTTPS; session cookies are sent without the Secure flag.",
         );
       }
+    } else if (oidcDisabled) {
+      logger.warn(
+        authPassword
+          ? "OIDC_DISABLED is set: identity provider sign-in is bypassed and HTTP Basic auth is used instead. Every signed-in user has full access and shares one set of Immich settings."
+          : "OIDC_DISABLED is set and no IMAGEPARSER_PASSWORD is configured: AUTHENTICATION IS OFF and anyone who can reach this server has full access. Remove OIDC_DISABLED as soon as the identity provider is back.",
+      );
     } else if (!authPassword) {
       logger.warn(
         "Authentication is disabled. Set OIDC_ISSUER_URL, or IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD, to enable it.",

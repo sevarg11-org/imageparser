@@ -132,3 +132,29 @@ test("requires a subject claim", () => {
     /subject/,
   );
 });
+
+test("grants administrator access through the admin claim", () => {
+  const withClaim = { ...options, adminClaim: "imageparser_admin" };
+  for (const [value, expected] of [
+    [true, true],
+    ["true", true],
+    [" TRUE ", true],
+    [false, false],
+    ["false", false],
+    ["yes", false],
+    [1, false],
+    [undefined, false],
+  ]) {
+    assert.equal(
+      buildUserContext({ sub: "s", imageparser_admin: value }, withClaim)
+        .isAdmin,
+      expected,
+      JSON.stringify(value),
+    );
+  }
+  assert.equal(
+    buildUserContext({ sub: "s", imageparser_admin: true }, options).isAdmin,
+    false,
+    "the claim is ignored when no admin claim name is configured",
+  );
+});

@@ -141,11 +141,16 @@ const createUserKey = (subject) =>
 /**
  * Builds the session's user context from identity provider claims.
  * @param {Object} claims - Merged ID token and userinfo claims.
- * @param {{foldersClaim: string, adminGroup: string}} options - The folder claim name and admin group name.
+ * A user is an administrator when they belong to the admin group, or when the admin claim is exactly
+ * true (a boolean, or the string "true" for attributes entered as text).
+ * @param {{foldersClaim: string, adminGroup: string, adminClaim?: string}} options - The folder claim, admin group, and admin claim names.
  * @returns {{userKey: string, username: string, isAdmin: boolean, folders: string[]}} The user context.
  * @throws {Error} If the claims have no subject.
  */
-const buildUserContext = (claims, { foldersClaim, adminGroup }) => {
+const buildUserContext = (
+  claims,
+  { foldersClaim, adminGroup, adminClaim = "" },
+) => {
   const subject = typeof claims?.sub === "string" ? claims.sub : "";
   if (!subject) {
     throw new Error("The identity provider did not return a user subject.");
@@ -157,11 +162,16 @@ const buildUserContext = (claims, { foldersClaim, adminGroup }) => {
   const username = [claims.preferred_username, claims.email, subject].find(
     (value) => typeof value === "string" && value.trim(),
   );
+  const adminClaimValue = adminClaim ? claims[adminClaim] : undefined;
 
   return {
     userKey: createUserKey(subject),
     username: username.trim().slice(0, maxUsernameLength),
-    isAdmin: Boolean(adminGroup) && groups.includes(adminGroup),
+    isAdmin:
+      (Boolean(adminGroup) && groups.includes(adminGroup)) ||
+      adminClaimValue === true ||
+      (typeof adminClaimValue === "string" &&
+        adminClaimValue.trim().toLowerCase() === "true"),
     folders: normalizeFolderGrants(claims[foldersClaim]),
   };
 };

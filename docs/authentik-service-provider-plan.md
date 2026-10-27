@@ -7,14 +7,18 @@ provider. When `OIDC_ISSUER_URL` is set:
 
 1. **Recursive folder authorization.** Each user's `imageparser_folders` claim lists folders relative to
    `IMAGEPARSER_ROOT`. A grant covers the folder and all of its children; everything else is hidden and forbidden.
-   Members of `OIDC_ADMIN_GROUP` see the whole root.
+   Admin users (members of `OIDC_ADMIN_GROUP`, or users whose `OIDC_ADMIN_CLAIM` is true) see the whole root.
 2. **Per-user Immich settings.** Each user's Immich settings and API keys are stored encrypted in
    `/config/users/<userKey>/immich-settings.json`, where `userKey` is the SHA-256 hex of the OIDC `sub`. Upload
    progress is streamed only to that user, and uploads are serialized per user.
 
 Without `OIDC_ISSUER_URL`, behavior is unchanged: optional HTTP Basic auth, or open local mode, with full access to
-the root and one shared settings file. The Electron app is unaffected. Setting both `OIDC_ISSUER_URL` and
-`IMAGEPARSER_PASSWORD` is a startup error.
+the root and one shared settings file. The Electron app is unaffected. While OIDC is on, `IMAGEPARSER_USERNAME` and
+`IMAGEPARSER_PASSWORD` are ignored and kept only as backup credentials.
+
+**Emergency bypass.** `OIDC_DISABLED=true` skips OIDC even when it is configured. The server then uses the
+Basic backup credentials if set, otherwise open access, and logs a loud startup warning. Every user is a full admin
+and uses the shared settings file; per-user settings stay on disk and return when the flag is removed.
 
 ## 2. Flow
 
@@ -57,14 +61,22 @@ the request host, because the server runs behind a reverse proxy.
    folders = grants(request.user.attributes)
    for group in request.user.ak_groups.all():
        folders.extend(grants(group.attributes))
-   return {"imageparser_folders": sorted(set(folders))}
+   return {
+       "imageparser_folders": sorted(set(folders)),
+       "imageparser_admin": request.user.attributes.get("imageparser_admin") is True,
+   }
    ```
 
 2. **OAuth2/OpenID provider**: confidential client, strict redirect URI `https://<host>/auth/callback`, and the
    `imageparser` mapping added under _Advanced protocol settings → Scopes_ (scopes requested:
    `openid profile email imageparser`).
-3. **Admin access**: the default `profile` scope already sends `groups`. Members of `OIDC_ADMIN_GROUP` (default
-   `imageparser-admin`) are administrators. There is no `is_admin` claim and no `"*"` grant.
+3. **Admin access** (see every folder and the debug log), granted either way:
+   - membership of `OIDC_ADMIN_GROUP` (default `imageparser-admin`), from the `groups` claim the default `profile`
+     scope already sends;
+   - a per-user `imageparser_admin: true` attribute, sent as the `OIDC_ADMIN_CLAIM` claim (default
+     `imageparser_admin`). Only boolean `true` or the string `"true"` count.
+
+   There is no `"*"` folder grant.
 
 ## 4. Path confinement (`pathAccess.js`)
 
@@ -139,9 +151,11 @@ the request host, because the server runs behind a reverse proxy.
 | `OIDC_REDIRECT_URI`            |                                    | Required; public `…/auth/callback` URL          |
 | `OIDC_SCOPES`                  | `openid profile email imageparser` | Requested scopes                                |
 | `OIDC_ADMIN_GROUP`             | `imageparser-admin`                | Group granting the whole root                   |
+| `OIDC_ADMIN_CLAIM`             | `imageparser_admin`                | Per-user claim granting the whole root          |
 | `OIDC_FOLDERS_CLAIM`           | `imageparser_folders`              | Claim with folder grants                        |
 | `OIDC_SESSION_HOURS`           | `8`                                | Session lifetime                                |
 | `OIDC_ALLOW_INSECURE_REQUESTS` | `false`                            | Permit an HTTP issuer (trusted networks, tests) |
+| `OIDC_DISABLED`                | `false`                            | Emergency bypass of OIDC (see §1)               |
 
 An Authentik instance with a private CA needs `NODE_EXTRA_CA_CERTS` in the container.
 

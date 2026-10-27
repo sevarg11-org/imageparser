@@ -166,10 +166,11 @@ The web server can sign users in with OpenID Connect (authorization code flow wi
 the folders granted to them, including all subfolders, and keeps their own Immich settings and API keys.
 
 **Requirements:** serve Image Parser through a reverse proxy with HTTPS (for example
-`https://photos.example.com`), and do not set `IMAGEPARSER_PASSWORD`; the server refuses to start with both.
+`https://photos.example.com`). While sign-in is on, `IMAGEPARSER_USERNAME`/`IMAGEPARSER_PASSWORD` are ignored;
+keep them set as backup credentials for [emergency access](#emergency-access-when-the-identity-provider-is-down).
 
 1. In Authentik, create a **Scope Mapping** (Customization → Property Mappings) with scope name `imageparser` and
-   this expression. It merges the folder lists of the user and their groups:
+   this expression. It merges the folder lists of the user and their groups, and sends the user's admin flag:
 
    ```python
    def grants(attributes):
@@ -179,7 +180,10 @@ the folders granted to them, including all subfolders, and keeps their own Immic
    folders = grants(request.user.attributes)
    for group in request.user.ak_groups.all():
        folders.extend(grants(group.attributes))
-   return {"imageparser_folders": sorted(set(folders))}
+   return {
+       "imageparser_folders": sorted(set(folders)),
+       "imageparser_admin": request.user.attributes.get("imageparser_admin") is True,
+   }
    ```
 
 2. Create an **OAuth2/OpenID Provider**: client type _Confidential_, redirect URI
@@ -194,8 +198,12 @@ the folders granted to them, including all subfolders, and keeps their own Immic
      - scans/2023
    ```
 
-   Members of the `imageparser-admin` group (sent in the default `groups` claim) see the whole share and the debug
-   log. A folder that does not exist grants nothing; `..` and similar entries are ignored.
+   A folder that does not exist grants nothing; `..` and similar entries are ignored.
+
+   **Admin users** see every folder in the share, including other users' folders, and can read the debug log. Make
+   a user an admin in either way:
+   - add them to the `imageparser-admin` group (sent in the default `groups` claim), or
+   - set the attribute `imageparser_admin: true` on the user (sent by the mapping above).
 
 4. Set these variables in the stack's `.env` and redeploy:
 
@@ -207,9 +215,11 @@ the folders granted to them, including all subfolders, and keeps their own Immic
 | `OIDC_REDIRECT_URI`            | `https://photos.example.com/auth/callback`             | Public callback URL registered above        |
 | `OIDC_SCOPES`                  | `openid profile email imageparser`                     | Scopes to request                           |
 | `OIDC_ADMIN_GROUP`             | `imageparser-admin`                                    | Group with access to the whole share        |
+| `OIDC_ADMIN_CLAIM`             | `imageparser_admin`                                    | Claim that makes a single user an admin     |
 | `OIDC_FOLDERS_CLAIM`           | `imageparser_folders`                                  | Claim listing each user's folders           |
 | `OIDC_SESSION_HOURS`           | `8`                                                    | Sign-in lifetime                            |
 | `OIDC_ALLOW_INSECURE_REQUESTS` | `false`                                                | Allow an HTTP issuer (trusted networks)     |
+| `OIDC_DISABLED`                | `false`                                                | Emergency bypass of sign-in (see below)     |
 
 Notes:
 
@@ -221,6 +231,20 @@ Notes:
   user's Authentik ID. The shared `/config/immich-settings.json` used without sign-on is not migrated.
 - If Authentik uses a certificate from a private CA, mount the CA certificate and set `NODE_EXTRA_CA_CERTS` to its
   path inside the container.
+
+#### Emergency access when the identity provider is down
+
+If Authentik is unavailable or misconfigured, set `OIDC_DISABLED=true` in the stack's `.env` and redeploy. The rest
+of the `OIDC_*` settings can stay in place.
+
+- If `IMAGEPARSER_USERNAME` and `IMAGEPARSER_PASSWORD` are set, the browser asks for those backup credentials (HTTP
+  Basic auth). Set them ahead of time so this path is ready.
+- If they are not set, **authentication is turned off completely**: anyone who can reach the server has full access
+  to every folder and the saved Immich keys. The log warns about this at startup.
+
+While the bypass is on, everyone is an admin, sees the whole share, and uses the shared
+`/config/immich-settings.json` instead of their personal Immich settings. Per-user settings are kept, and they come
+back when you remove `OIDC_DISABLED` (or set it to `false`) and redeploy.
 
 ### Local Server
 

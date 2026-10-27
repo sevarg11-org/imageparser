@@ -164,8 +164,7 @@ let workspace;
 let root;
 let configDirectory;
 let provider;
-let serverProcess;
-let serverOutput = "";
+let serverOutput = () => "";
 let appUrl;
 
 /** Collects name=value pairs from a response's Set-Cookie headers. */
@@ -207,7 +206,7 @@ const signIn = async (claims) => {
   assert.equal(
     callback.status,
     302,
-    `Sign-in failed. Server log:\n${serverOutput}`,
+    `Sign-in failed. Server log:\n${serverOutput()}`,
   );
   assert.equal(callback.headers.get("location"), appUrl);
   const session = readSetCookies(callback).imageparser_session;
@@ -248,6 +247,61 @@ const admin = {
   groups: ["imageparser-admin"],
   imageparser_folders: [],
 };
+const attributeAdmin = {
+  sub: "attribute-admin-subject",
+  preferred_username: "carol",
+  groups: [],
+  imageparser_folders: ["family"],
+  imageparser_admin: true,
+};
+const backupBasicAuth = `Basic ${Buffer.from("backup:backup-password").toString("base64")}`;
+const startedServers = [];
+
+/**
+ * Starts server.js with the shared test folders and waits until it answers health checks.
+ * @param {Object} env - Extra environment variables.
+ * @returns {Promise<{url: string, output: () => string}>} The server's base URL and log.
+ */
+const startServer = async (env) => {
+  const port = await getFreePort();
+  const url = `http://127.0.0.1:${port}/`;
+  let output = "";
+  const child = spawn(process.execPath, ["server.js"], {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      HOST: "127.0.0.1",
+      IMAGEPARSER_ROOT: root,
+      IMAGEPARSER_CONFIG_DIR: configDirectory,
+      IMAGEPARSER_USERNAME: "",
+      IMAGEPARSER_PASSWORD: "",
+      IMAGEPARSER_SECRET_KEY: "",
+      IMAGEPARSER_DEBUG: "true",
+      OIDC_DISABLED: "",
+      ...(typeof env === "function" ? env(url) : env),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  startedServers.push(child);
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) {
+      throw new Error(`The server exited early:\n${output}`);
+    }
+    try {
+      if ((await fetch(new URL("healthz", url))).ok) {
+        return { url, output: () => output };
+      }
+    } catch {
+      // Not listening yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`The server did not start:\n${output}`);
+};
 
 before(async () => {
   workspace = await fs.realpath(
@@ -267,49 +321,24 @@ before(async () => {
   await fs.writeFile(path.join(root, "family-secret", "hidden.jpg"), "x");
 
   provider = await startMockProvider();
-  const port = await getFreePort();
-  appUrl = `http://127.0.0.1:${port}/`;
-  serverProcess = spawn(process.execPath, ["server.js"], {
-    cwd: __dirname,
-    env: {
-      ...process.env,
-      PORT: String(port),
-      HOST: "127.0.0.1",
-      IMAGEPARSER_ROOT: root,
-      IMAGEPARSER_CONFIG_DIR: configDirectory,
-      IMAGEPARSER_USERNAME: "",
-      IMAGEPARSER_PASSWORD: "",
-      IMAGEPARSER_SECRET_KEY: "",
-      IMAGEPARSER_DEBUG: "true",
-      OIDC_ISSUER_URL: provider.issuer,
-      OIDC_CLIENT_ID: clientId,
-      OIDC_CLIENT_SECRET: clientSecret,
-      OIDC_REDIRECT_URI: `${appUrl}auth/callback`,
-      OIDC_ALLOW_INSECURE_REQUESTS: "true",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  serverProcess.stdout.on("data", (chunk) => (serverOutput += chunk));
-  serverProcess.stderr.on("data", (chunk) => (serverOutput += chunk));
-
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (serverProcess.exitCode !== null) {
-      throw new Error(`The server exited early:\n${serverOutput}`);
-    }
-    try {
-      if ((await fetch(new URL("healthz", appUrl))).ok) {
-        return;
-      }
-    } catch {
-      // Not listening yet.
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`The server did not start:\n${serverOutput}`);
+  // Backup Basic credentials are configured but must be ignored while OIDC sign-in is on.
+  const server = await startServer((url) => ({
+    IMAGEPARSER_USERNAME: "backup",
+    IMAGEPARSER_PASSWORD: "backup-password",
+    OIDC_ISSUER_URL: provider.issuer,
+    OIDC_CLIENT_ID: clientId,
+    OIDC_CLIENT_SECRET: clientSecret,
+    OIDC_REDIRECT_URI: `${url}auth/callback`,
+    OIDC_ALLOW_INSECURE_REQUESTS: "true",
+  }));
+  appUrl = server.url;
+  serverOutput = server.output;
 });
 
 after(async () => {
-  serverProcess?.kill();
+  for (const child of startedServers) {
+    child.kill();
+  }
   await new Promise((resolve) => provider?.server.close(resolve));
   await fs.rm(workspace, { recursive: true, force: true });
 });
@@ -486,4 +515,65 @@ test("sign-out clears the session and ends the provider session", async () => {
     `${provider.issuer}/end-session`,
   );
   assert.equal(readSetCookies(logout).imageparser_session, "");
+});
+
+test("a user with the admin attribute sees every folder", async () => {
+  const cookie = await signIn(attributeAdmin);
+  assert.equal((await getJson("api/me", cookie)).body.isAdmin, true);
+  assert.equal((await getJson("api/browse", cookie)).body.path, root);
+  const secret = await getJson(
+    `api/browse?${new URLSearchParams({ path: path.join(root, "family-secret") })}`,
+    cookie,
+  );
+  assert.equal(secret.status, 200);
+});
+
+test("backup Basic credentials are ignored while OIDC sign-in is on", async () => {
+  const response = await request("api/me", {
+    headers: { Authorization: backupBasicAuth },
+  });
+  assert.equal(response.status, 401);
+});
+
+test("OIDC_DISABLED falls back to the backup Basic credentials", async () => {
+  const fallback = await startServer({
+    IMAGEPARSER_USERNAME: "backup",
+    IMAGEPARSER_PASSWORD: "backup-password",
+    OIDC_ISSUER_URL: provider.issuer,
+    OIDC_CLIENT_ID: clientId,
+    OIDC_CLIENT_SECRET: clientSecret,
+    OIDC_REDIRECT_URI: "http://127.0.0.1:1/auth/callback",
+    OIDC_DISABLED: "true",
+  });
+  const fetchFallback = (pathname, init) =>
+    fetch(new URL(pathname, fallback.url), { redirect: "manual", ...init });
+
+  const challenge = await fetchFallback("api/me");
+  assert.equal(challenge.status, 401);
+  assert.match(challenge.headers.get("www-authenticate"), /^Basic /);
+  assert.equal((await fetchFallback("auth/login")).status, 401);
+
+  const me = await fetchFallback("api/me", {
+    headers: { Authorization: backupBasicAuth },
+  });
+  assert.deepEqual(await me.json(), {
+    username: "backup",
+    isAdmin: true,
+    authMode: "basic",
+  });
+  assert.match(
+    fallback.output(),
+    /OIDC_DISABLED is set: identity provider sign-in is bypassed/,
+  );
+});
+
+test("OIDC_DISABLED without backup credentials opens access and warns", async () => {
+  const open = await startServer({
+    OIDC_ISSUER_URL: provider.issuer,
+    OIDC_DISABLED: "true",
+  });
+  const me = await fetch(new URL("api/me", open.url));
+  assert.equal(me.status, 200);
+  assert.equal((await me.json()).authMode, "none");
+  assert.match(open.output(), /AUTHENTICATION IS OFF/);
 });
