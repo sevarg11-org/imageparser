@@ -1,4 +1,4 @@
-import {
+﻿import {
   useCallback,
   useEffect,
   useMemo,
@@ -16,6 +16,7 @@ import {
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import { SetFolderDateModal } from "./SetFolderDateModal";
 import { fetchCurrentUser, type CurrentUser } from "./webApi";
 
 type ImagePair = {
@@ -51,6 +52,13 @@ type ImmichSettings = {
   tags: string;
   pauseImmichJobs: boolean;
   concurrentTasks: number;
+};
+
+type SetFolderDateResult = {
+  ok: boolean;
+  updatedPairs: number;
+  skippedPairs: number;
+  errors: string[];
 };
 
 type ImmichUploadResult = {
@@ -114,6 +122,10 @@ declare global {
         frontRotation: number;
         backRotation: number;
       }) => Promise<ApplyImageRotationsResult>;
+      setFolderDate: (
+        directoryPath: string,
+        date: string,
+      ) => Promise<SetFolderDateResult>;
       loadImmichSettings: () => Promise<ImmichSettings>;
       saveImmichSettings: (settings: ImmichSettings) => Promise<ImmichSettings>;
       uploadToImmich: (
@@ -470,6 +482,8 @@ function App() {
   );
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
+  const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
+  const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] = useState(false);
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0);
   const hasUserChangedRef = useRef(false);
   const dateInputRef = useRef<HTMLInputElement | null>(null);
@@ -925,7 +939,7 @@ function App() {
    * Rotates an image by a given delta value (in 90-degree increments).
    * Does not apply rotation if already persisting, uploading, or not hydrated.
    * @param field - Which image to rotate ("front" or "back").
-   * @param delta - The rotation change in degrees (typically ±90).
+   * @param delta - The rotation change in degrees (typically Â±90).
    */
   const rotateImage = useCallback(
     (field: RotationField, delta: number) => {
@@ -1427,11 +1441,69 @@ function App() {
     }
   };
 
+  /**
+   * Sets the date on all image pairs in the current directory that do not yet
+   * have an XMP sidecar file to the specified target date.
+   * @param date - The target ISO date string chosen from the modal.
+   */
+  const handleConfirmSetFolderDate = async (date: string) => {
+    if (!directoryPath) {
+      setStatus("Select a directory before setting dates.");
+      return;
+    }
+
+    setIsSettingFolderDate(true);
+    setStatus(`Setting date for images without saved metadataâ€¦`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      const result = await electronApi.setFolderDate(directoryPath, date);
+
+      if (result.ok) {
+        const parts: string[] = [];
+        if (result.updatedPairs > 0) {
+          parts.push(
+            `Set date to ${date} for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`,
+          );
+        }
+        if (result.skippedPairs > 0) {
+          parts.push(
+            `Skipped ${result.skippedPairs} group${result.skippedPairs === 1 ? "" : "s"} with existing metadata.`,
+          );
+        }
+        if (parts.length === 0) {
+          parts.push("No images without existing metadata were found.");
+        }
+        setStatus(parts.join(" "));
+      } else {
+        setStatus(
+          `Date set for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"} with ${result.errors.length} error${result.errors.length === 1 ? "" : "s"}: ${result.errors.slice(0, 2).join("; ")}${result.errors.length > 2 ? "â€¦" : ""}`,
+        );
+      }
+
+      setIsSetFolderDateModalOpen(false);
+      // Reload the current pair's metadata to reflect any write that may have
+      // affected the currently displayed image.
+      setIsHydrated(false);
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Unable to set the date for all images.",
+      );
+    } finally {
+      setIsSettingFolderDate(false);
+    }
+  };
   const canUploadToImmich =
     Boolean(directoryPath) &&
     Boolean(immichSettings.serverUrl.trim()) &&
     Boolean(immichSettings.userApiKey.trim());
-  const isTransitionLocked = isBusy || isPersistingRotation || isUploading;
+  const isTransitionLocked = isBusy || isPersistingRotation || isUploading || isSettingFolderDate;
   const isImageControlLocked = isTransitionLocked || !isHydrated;
   const imageStackStyle: ImageStackStyle = {
     "--collapsed-image-height": `${collapsedImageHeight}px`,
@@ -1454,6 +1526,17 @@ function App() {
                 Sign out
               </a>
             </>
+          ) : null}
+          {directoryPath ? (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setIsSetFolderDateModalOpen(true)}
+              disabled={isTransitionLocked}
+              title="Set a date for all images in this folder that don't yet have saved metadata"
+            >
+              {isSettingFolderDate ? "Setting date\u2026" : "Set date for all"}
+            </button>
           ) : null}
           <button
             type="button"
@@ -1995,6 +2078,14 @@ function App() {
           </details>
         </main>
       )}
+
+      <SetFolderDateModal
+        isOpen={isSetFolderDateModalOpen}
+        totalCount={pairs.length}
+        onConfirm={(date) => void handleConfirmSetFolderDate(date)}
+        onClose={() => setIsSetFolderDateModalOpen(false)}
+        isSubmitting={isSettingFolderDate}
+      />
     </div>
   );
 }

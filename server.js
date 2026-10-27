@@ -1,4 +1,4 @@
-import {
+﻿import {
   createCipheriv,
   createDecipheriv,
   randomBytes,
@@ -34,6 +34,7 @@ import {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setFolderDate,
   shutdownCore,
 } from "./core.js";
 import {
@@ -816,6 +817,14 @@ const createApiRoutes = (secretCodec) => ({
       secretCodec,
       body,
     );
+  },
+  "POST /api/set-folder-date": async (request) => {
+    const body = await readJsonBody(request);
+    const directoryPath = await resolvePathForUser(
+      request.user,
+      body.directoryPath,
+    );
+    return setFolderDate(directoryPath, body.date);
   },
   "POST /api/upload-to-immich": async (request) => {
     const body = await readJsonBody(request);

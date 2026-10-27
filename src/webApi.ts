@@ -92,6 +92,8 @@ const createWebApi = (): ImageParserApi => ({
       .url,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
+  setFolderDate: (directoryPath, date) =>
+    postJson("api/set-folder-date", { directoryPath, date }),
   loadImmichSettings: () => requestJson("api/immich-settings"),
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
   uploadToImmich: (settings, directoryPath) =>
