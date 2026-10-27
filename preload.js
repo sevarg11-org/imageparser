@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("get-preview-data-url", filePath, rotation),
   applyImageRotations: (request) =>
     ipcRenderer.invoke("apply-image-rotations", request),
+  setFolderDate: (directoryPath, date) =>
+    ipcRenderer.invoke("set-folder-date", { directoryPath, date }),
   loadImmichSettings: () => ipcRenderer.invoke("load-immich-settings"),
   saveImmichSettings: (settings) =>
     ipcRenderer.invoke("save-immich-settings", settings),

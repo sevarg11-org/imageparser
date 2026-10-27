@@ -1456,6 +1456,47 @@ const applyImageRotationsQueued = (request) =>
   runImageFileOperation(() => applyImageRotations(request));
 
 /**
+ * Sets the date on every image pair in a directory that does not already have
+ * an XMP sidecar file. Pairs with an existing sidecar are skipped so their
+ * previously saved metadata is preserved.
+ * @param {string} directoryPath - The path to the directory.
+ * @param {string} date - The ISO date string to apply (e.g. "1991-12-31").
+ * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, errors: string[]}>}
+ */
+const setFolderDate = async (directoryPath, date) => {
+  const { files: pairs } = await readDirectory(directoryPath);
+
+  const errors = [];
+  let updatedPairs = 0;
+  let skippedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const existingSidecar = await resolveExistingSidecarPath(pair.frontPath);
+      if (existingSidecar) {
+        skippedPairs += 1;
+        continue;
+      }
+
+      await saveMetadata({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description: "",
+        tags: [],
+      });
+      updatedPairs += 1;
+    } catch (error) {
+      errors.push(
+        `${pair.imageLabel}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, skippedPairs, errors };
+};
+
+/**
  * Gracefully shuts down ExifTool to release file handles and system resources.
  * Should be called when the application is closing to ensure clean shutdown.
  */
@@ -1480,5 +1521,6 @@ export {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setFolderDate,
   shutdownCore,
 };
