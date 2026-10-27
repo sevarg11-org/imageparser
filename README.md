@@ -117,8 +117,17 @@ Create a stack from `docker-compose.yml`. Configure these environment variables:
 | `IMAGEPARSER_PORT`       | `8080`                       | Host port for the web UI            |
 | `IMAGEPARSER_USERNAME`   | `admin`                      | Optional HTTP Basic auth user       |
 | `IMAGEPARSER_PASSWORD`   | _(strong password)_          | Enables auth when set (recommended) |
+| `IMAGEPARSER_TAG`        | `latest`                     | Image tag to run (default `latest`) |
 
 Open `http://<truenas-ip>:8080`, click the folder button, and browse the mounted photo share.
+
+#### Validating a pull request image
+
+Every pull request opened from a branch in this repository publishes
+`ghcr.io/sevarg11-org/imageparser:pr-<number>`, updated on each push to the PR. (Pull requests from forks are built
+but not published.) To try one before it merges, set `IMAGEPARSER_TAG=pr-<number>` in the stack's `.env` and
+redeploy, then set it back to `latest` when done. Point `IMAGEPARSER_PHOTOS_DIR` at a test copy of your photos, since
+the PR build will write metadata to them.
 
 ### Local Server
 

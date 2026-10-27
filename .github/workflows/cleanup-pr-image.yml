@@ -1,0 +1,48 @@
+name: Clean up PR image
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  delete-pr-image:
+    name: Delete PR Docker image tags
+    runs-on: ubuntu-latest
+    # Fork PRs never publish an image (see ci.yml), and their token cannot delete packages.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      OWNER_TYPE: ${{ github.event.repository.owner.type }}
+      PACKAGE: imageparser
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Delete image versions tagged only for this PR
+        run: |
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            base="/orgs/$OWNER/packages/container/$PACKAGE/versions"
+          else
+            base="/users/$OWNER/packages/container/$PACKAGE/versions"
+          fi
+
+          # Only versions whose every tag is pr-<number> or pr-<number>-<sha>, so a version that
+          # also carries latest or a main sha tag is never removed.
+          ids=$(gh api --paginate "$base" --jq "
+            .[]
+            | select((.metadata.container.tags | length) > 0)
+            | select(all(.metadata.container.tags[]; test(\"^pr-${PR_NUMBER}(-[0-9a-f]{40})?\$\")))
+            | .id")
+
+          if [ -z "$ids" ]; then
+            echo "No image versions found for PR #$PR_NUMBER."
+            exit 0
+          fi
+
+          for id in $ids; do
+            echo "Deleting package version $id"
+            gh api --method DELETE "$base/$id"
+          done

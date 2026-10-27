@@ -3,7 +3,8 @@ networks:
     name: imageparser
 services:
   imageparser:
-    image: ghcr.io/sevarg11-org/imageparser:latest
+    # IMAGEPARSER_TAG selects the image: `latest` (main) or `pr-<number>` to validate a pull request.
+    image: ghcr.io/sevarg11-org/imageparser:${IMAGEPARSER_TAG:-latest}
     pull_policy: always
     init: true
     ports:
