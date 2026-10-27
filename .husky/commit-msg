@@ -1,1 +1,1 @@
-npx --no -- commitlint --edit \.git/COMMIT_EDITMSG
+npx --no -- commitlint --edit "$1"
