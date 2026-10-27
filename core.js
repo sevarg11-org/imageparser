@@ -183,9 +183,14 @@ const normalizeImmichSettings = (settings) => {
  * Constructs the full upload command with all required and optional flags.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
+ * @param {{debug?: boolean}} [options] - Set debug to request verbose immich-go logging.
  * @returns {string[]} An array of command-line arguments for immich-go.
  */
-const buildImmichUploadArguments = (settings, directoryPath) => {
+const buildImmichUploadArguments = (
+  settings,
+  directoryPath,
+  { debug = false } = {},
+) => {
   const tags = normalizeImmichTags(settings.tags);
   const uploadArguments = [
     "upload",
@@ -211,6 +216,10 @@ const buildImmichUploadArguments = (settings, directoryPath) => {
 
   for (const tag of tags) {
     uploadArguments.push("--tag", String(tag));
+  }
+
+  if (debug) {
+    uploadArguments.push("--log-level", "DEBUG");
   }
 
   uploadArguments.push(directoryPath);
@@ -250,11 +259,87 @@ const redactImmichSecrets = (output, settings) => {
 };
 
 /**
+ * Known immich-go failure signatures paired with a hint explaining the likely cause.
+ * @type {Array<{pattern: RegExp, hint: string}>}
+ */
+const immichFailureHints = [
+  {
+    pattern: /x509|certificate signed by unknown authority|tls: failed/i,
+    hint: "Hint: the Immich server's TLS certificate is not trusted. In Docker, confirm the image includes ca-certificates; for a self-signed certificate, use the server's HTTP URL on a trusted network.",
+  },
+  {
+    pattern:
+      /connection refused|actively refused|no such host|i\/o timeout|network is unreachable/i,
+    hint: "Hint: immich-go could not reach the Immich server URL. Inside a container, localhost refers to the container itself; use the server's LAN IP address or hostname.",
+  },
+  {
+    pattern: /permission denied|read-only file system/i,
+    hint: "Hint: immich-go hit a filesystem permission error. Confirm the PUID/PGID user can read the photo folder and write to its temporary directory.",
+  },
+  {
+    pattern: /unknown flag|unknown command|unknown shorthand flag/i,
+    hint: "Hint: the installed immich-go version does not accept these options. Check that it matches the supported immich-go release.",
+  },
+];
+
+/**
+ * Builds hint lines for recognized immich-go failure messages.
+ * @param {string} output - The combined immich-go output.
+ * @returns {string[]} The hints matching the output.
+ */
+const getImmichFailureHints = (output) =>
+  immichFailureHints
+    .filter(({ pattern }) => pattern.test(output))
+    .map(({ hint }) => hint);
+
+/**
+ * Describes the current process user for diagnostics, where supported.
+ * @returns {string} The uid:gid pair, or "n/a" on platforms without POSIX IDs.
+ */
+const describeProcessUser = () =>
+  typeof process.getuid === "function"
+    ? `${process.getuid()}:${process.getgid()}`
+    : "n/a";
+
+/**
+ * Runs `immich-go version` to confirm the binary is installed and runnable.
+ * @returns {Promise<{ok: boolean, output: string}>} The version output or the failure reason.
+ */
+const getImmichGoDiagnostics = () =>
+  new Promise((resolve) => {
+    let output = "";
+    const versionProcess = spawn("immich-go", ["version"], {
+      shell: false,
+      timeout: 10_000,
+      windowsHide: true,
+    });
+    versionProcess.stdout.on("data", (chunk) => {
+      output = appendBoundedOutput(output, chunk);
+    });
+    versionProcess.stderr.on("data", (chunk) => {
+      output = appendBoundedOutput(output, chunk);
+    });
+    versionProcess.on("error", (error) => {
+      resolve({
+        ok: false,
+        output: `${error.code ?? ""} ${error.message}`.trim(),
+      });
+    });
+    versionProcess.on("close", (exitCode, signal) => {
+      resolve({
+        ok: exitCode === 0,
+        output: output.trim() || `exit code ${exitCode}, signal ${signal}`,
+      });
+    });
+  });
+
+/**
  * Runs immich-go to upload images from a folder to the Immich server.
  * Executes asynchronously and prevents concurrent uploads.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
+ * @param {{debug?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}}} [options] - Optional verbose immich-go logging and a logger for diagnostics.
  * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
@@ -262,6 +347,7 @@ const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
+  { debug = false, log } = {},
 ) => {
   if (isImmichUploadRunning) {
     throw new Error("An Immich upload is already running.");
@@ -284,7 +370,15 @@ const runImmichUpload = async (
     const uploadArguments = buildImmichUploadArguments(
       normalizedSettings,
       normalizedDirectoryPath,
+      { debug },
     );
+    const redact = (text) => redactImmichSecrets(text, normalizedSettings);
+
+    log?.info("Starting immich-go upload.", {
+      command: redact(["immich-go", ...uploadArguments].join(" ")),
+      cwd: normalizedDirectoryPath,
+      user: describeProcessUser(),
+    });
 
     return await new Promise((resolve, reject) => {
       let stdout = "";
@@ -299,19 +393,22 @@ const runImmichUpload = async (
 
       uploadProcess.stdout.on("data", (chunk) => {
         stdout = appendBoundedOutput(stdout, chunk);
+        log?.debug(`immich-go stdout: ${redact(chunk.toString()).trimEnd()}`);
         reportProgress({
           phase: "uploading",
-          output: redactImmichSecrets(chunk.toString(), normalizedSettings),
+          output: redact(chunk.toString()),
         });
       });
       uploadProcess.stderr.on("data", (chunk) => {
         stderr = appendBoundedOutput(stderr, chunk);
+        log?.debug(`immich-go stderr: ${redact(chunk.toString()).trimEnd()}`);
         reportProgress({
           phase: "uploading",
-          output: redactImmichSecrets(chunk.toString(), normalizedSettings),
+          output: redact(chunk.toString()),
         });
       });
       uploadProcess.on("error", (error) => {
+        log?.error("immich-go could not be started.", error);
         reject(
           error?.code === "ENOENT"
             ? new Error(
@@ -320,14 +417,26 @@ const runImmichUpload = async (
             : error,
         );
       });
-      uploadProcess.on("close", (exitCode) => {
+      uploadProcess.on("close", (exitCode, signal) => {
+        const ok = exitCode === 0;
         const combinedOutput = [stdout.trim(), stderr.trim()]
           .filter(Boolean)
           .join("\n");
+        const hints = ok ? [] : getImmichFailureHints(combinedOutput);
+        if (!ok && signal) {
+          hints.push(
+            `Hint: immich-go was stopped by ${signal}. In a container this often means it ran out of memory; try fewer concurrent tasks.`,
+          );
+        }
+        if (ok) {
+          log?.info("immich-go finished.", { exitCode, signal });
+        } else {
+          log?.error("immich-go failed.", { exitCode, signal, hints });
+        }
         resolve({
-          ok: exitCode === 0,
+          ok,
           exitCode: exitCode ?? -1,
-          output: redactImmichSecrets(combinedOutput, normalizedSettings),
+          output: redact([combinedOutput, ...hints].filter(Boolean).join("\n")),
         });
       });
     });
@@ -1355,8 +1464,11 @@ const shutdownCore = () => exiftool.end();
 export {
   allowedExtensions,
   applyImageRotationsQueued as applyImageRotations,
+  buildImmichUploadArguments,
   defaultSortBy,
   getImageRevision,
+  getImmichFailureHints,
+  getImmichGoDiagnostics,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,
