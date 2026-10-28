@@ -7,8 +7,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   readSidecarMetadata: (filePath) =>
     ipcRenderer.invoke("read-sidecar-metadata", filePath),
   saveMetadata: (metadata) => ipcRenderer.invoke("save-metadata", metadata),
-  getPreviewDataUrl: (filePath, rotation) =>
-    ipcRenderer.invoke("get-preview-data-url", filePath, rotation),
+  getPreviewDataUrl: (filePath, version) =>
+    ipcRenderer.invoke("get-preview-data-url", filePath, version),
   // Served by the read-only "imageparser-thumb" protocol registered in main.js.
   getThumbnailUrl: (filePath, size, version) =>
     `imageparser-thumb://thumbnail/?${new URLSearchParams({

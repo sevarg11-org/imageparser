@@ -143,7 +143,7 @@ test("readDirectory returns sidecarDate from both sidecar namings, or an empty s
       "five_a.jpg": { sidecarDate: "", hasSidecar: false },
     });
     for (const pair of pairs) {
-      assert.equal(typeof pair.modifiedAt, "number");
+      assert.equal(typeof pair.frontVersion, "string");
     }
   } finally {
     await cleanup();

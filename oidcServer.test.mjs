@@ -463,7 +463,10 @@ test("file routes enforce the user's folders", async () => {
   assert.equal(image.status, 403);
   for (const [route, body] of [
     ["api/read-sidecar-metadata", { filePath: hidden }],
-    ["api/preview-url", { filePath: hidden, rotation: 0 }],
+    [
+      "api/apply-image-rotations",
+      { frontPath: hidden, backPath: null, frontRotation: 90 },
+    ],
     ["api/read-directory", { directoryPath: path.join(root, "family-secret") }],
     ["api/save-metadata", { frontPath: hidden, backPath: null }],
     [
@@ -473,6 +476,12 @@ test("file routes enforce the user's folders", async () => {
   ]) {
     assert.equal((await postJson(route, cookie, body)).status, 403, route);
   }
+
+  // Image URLs are built in the browser, so the old URL-building round trip is gone.
+  assert.equal(
+    (await postJson("api/preview-url", cookie, { filePath: hidden })).status,
+    404,
+  );
 });
 
 test("a user with one shared folder starts inside it", async () => {
