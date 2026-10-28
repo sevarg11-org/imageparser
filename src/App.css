@@ -677,6 +677,48 @@
   font-weight: 400;
 }
 
+.do-not-upload {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.do-not-upload p {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.do-not-upload-toggle--active {
+  background: #7f1d1d;
+  border-color: #f87171;
+  color: #fee2e2;
+}
+
+.do-not-upload-warning {
+  color: #fcd34d;
+}
+
+.do-not-upload-error {
+  color: #fca5a5;
+}
+
+.do-not-upload-badge {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #7f1d1d;
+  color: #fee2e2;
+  letter-spacing: 0.04em;
+}
+
+.immich-skipped {
+  color: #fcd34d;
+  font-size: 0.9rem;
+  text-align: left;
+}
+
 .checkbox-field {
   display: flex;
   align-items: center;
