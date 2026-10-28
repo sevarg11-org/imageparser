@@ -93,9 +93,14 @@ There is no `"*"` folder grant.
 
 - **Claim validation** (`normalizeFolderGrant`): entries must be non-empty strings without `.`/`..`/empty segments
   or NUL; backslashes and surrounding slashes are normalized. Up to 50 unique grants are kept.
-- **Resolution** (`resolveAllowedRoots`): each grant is `realpath`-resolved on **every request** and kept only if it
-  is an existing directory inside the root. Symlink escapes are dropped, and grants nested in another grant are
-  collapsed.
+- **Resolution** (`resolveAllowedRoots`): each grant is `realpath`-resolved (in parallel) and kept only if it is an
+  existing directory inside the root. Symlink escapes are dropped, and grants nested in another grant are collapsed.
+- **Caching** (`createAllowedRootsCache`): resolved grants are cached for 30 seconds per set of grants (up to 1000
+  sets), and concurrent requests share one resolution. Without the cache, each request cost two filesystem calls
+  per grant, about 7–14 ms per request with 50 grants. The cache cannot widen access, because the **requested**
+  path is still `realpath`-resolved on every request: a cached grant later replaced by a symlink resolves elsewhere
+  and fails the check. Staleness only delays availability, for example a newly created granted folder appearing
+  within 30 seconds.
 - **Check** (`isPathAllowed`): `realPath === allowed || realPath.startsWith(allowed + path.sep)`, so
   `/data/family-secret` does not match `/data/family`.
 - **`resolvePathForUser(user, path)`** replaces `resolvePathInRoot` at every call site: `browse`, `image`,
@@ -174,7 +179,7 @@ An Authentik instance with a private CA needs `NODE_EXTRA_CA_CERTS` in the conta
 
 | Threat                                         | Defense                                                                                                                          |
 | :--------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
-| Traversal (`../other`) in request paths        | `path.resolve` + `realpath`, then a prefix check against the user's re-resolved grants                                           |
+| Traversal (`../other`) in request paths        | `path.resolve` + `realpath`, then a prefix check against the user's canonical grants                                             |
 | Traversal or absolute paths in claims          | `normalizeFolderGrant` rejects them; resolved grants must be inside the root                                                     |
 | Symlink escape                                 | Both the requested path and the grants are `realpath`-resolved before the check                                                  |
 | Prefix collision (`family-secret` vs `family`) | The `path.sep` boundary in the check                                                                                             |

@@ -86,29 +86,30 @@ const normalizeFolderGrants = (claimValue) => {
  * @returns {Promise<string[]>} Canonical allowed folders, shortest first.
  */
 const resolveAllowedRoots = async (rootDirectory, folders) => {
-  const resolvedRoots = [];
-  for (const folder of folders) {
-    const grant = normalizeFolderGrant(folder);
-    if (!grant) {
-      continue;
-    }
-
-    try {
-      const realPath = await fs.realpath(
-        path.join(rootDirectory, ...grant.split("/")),
-      );
-      if (
-        isInsideDirectory(realPath, rootDirectory) &&
-        (await fs.stat(realPath)).isDirectory()
-      ) {
-        resolvedRoots.push(realPath);
+  // Grants are resolved in parallel; results keep the input order.
+  const resolvedRoots = await Promise.all(
+    folders.map(async (folder) => {
+      const grant = normalizeFolderGrant(folder);
+      if (!grant) {
+        return null;
       }
-    } catch {
-      // A granted folder that does not exist (yet) simply grants nothing.
-    }
-  }
 
-  const uniqueRoots = [...new Set(resolvedRoots)].sort(
+      try {
+        const realPath = await fs.realpath(
+          path.join(rootDirectory, ...grant.split("/")),
+        );
+        return isInsideDirectory(realPath, rootDirectory) &&
+          (await fs.stat(realPath)).isDirectory()
+          ? realPath
+          : null;
+      } catch {
+        // A granted folder that does not exist (yet) simply grants nothing.
+        return null;
+      }
+    }),
+  );
+
+  const uniqueRoots = [...new Set(resolvedRoots.filter(Boolean))].sort(
     (left, right) => left.length - right.length,
   );
   return uniqueRoots.filter(
@@ -119,7 +120,42 @@ const resolveAllowedRoots = async (rootDirectory, folders) => {
   );
 };
 
+/**
+ * Creates a short-lived cache in front of resolveAllowedRoots.
+ * Every API request needs the user's allowed folders, and resolving them costs two filesystem calls
+ * per grant. Caching the canonical folders is safe because each requested path is still resolved
+ * with realpath on every request: a granted folder later replaced by a symlink resolves elsewhere
+ * and no longer matches. The cache stores promises, so concurrent requests share one resolution.
+ * @param {{ttlMs?: number, maxEntries?: number, now?: () => number}} [options] - Entry lifetime, size bound, and clock.
+ * @returns {(rootDirectory: string, folders: string[]) => Promise<string[]>} A cached resolver.
+ */
+const createAllowedRootsCache = ({
+  ttlMs = 30_000,
+  maxEntries = 1000,
+  now = Date.now,
+} = {}) => {
+  const entries = new Map();
+
+  return (rootDirectory, folders) => {
+    const key = JSON.stringify([rootDirectory, folders]);
+    const cached = entries.get(key);
+    if (cached && cached.expiresAt > now()) {
+      return cached.roots;
+    }
+
+    const roots = resolveAllowedRoots(rootDirectory, folders);
+    entries.delete(key);
+    entries.set(key, { roots, expiresAt: now() + ttlMs });
+    // Maps iterate in insertion order, so the first key is the least recently resolved entry.
+    while (entries.size > maxEntries) {
+      entries.delete(entries.keys().next().value);
+    }
+    return roots;
+  };
+};
+
 export {
+  createAllowedRootsCache,
   isInsideDirectory,
   isPathAllowed,
   maxFolderGrants,
