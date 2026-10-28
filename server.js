@@ -38,9 +38,9 @@ import {
   shutdownCore,
 } from "./core.js";
 import {
+  createAllowedRootsCache,
   isInsideDirectory,
   isPathAllowed,
-  resolveAllowedRoots,
 } from "./pathAccess.js";
 import { createServerLogger } from "./serverLogger.js";
 
@@ -126,15 +126,20 @@ const localUser = Object.freeze({
 });
 
 /**
+ * Resolves folder grants, caching the canonical folders for 30 seconds per set of grants.
+ * Requested paths are still resolved on every request, so the cache cannot widen access.
+ */
+const resolveAllowedRootsCached = createAllowedRootsCache();
+
+/**
  * Returns the canonical folders a user may access, including their children.
- * Folder grants are re-resolved on every request so a grant later replaced by a symlink cannot escape.
  * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @returns {Promise<string[]>} The canonical allowed folders.
  */
 const getAllowedRoots = async (user) =>
   user.isAdmin
     ? [rootDirectory]
-    : resolveAllowedRoots(rootDirectory, user.folders);
+    : resolveAllowedRootsCached(rootDirectory, user.folders);
 
 // Resolves symlinks so a link inside the share cannot be used to escape it.
 /**
