@@ -21,6 +21,8 @@ export type ThumbnailGridCell = {
   doNotUpload: boolean;
   isUnprocessed: boolean;
   thumbnailUrl: string;
+  /** A rotation, in degrees, chosen in the grid but not yet applied to the file. */
+  rotation: number;
 };
 
 /**

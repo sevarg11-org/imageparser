@@ -888,6 +888,14 @@ function App() {
     pairId: string;
     operation: Promise<boolean>;
   } | null>(null);
+  // A-image rotations chosen in the grid that are not on disk yet, by group ID. The grid and
+  // Review show them until the file is rotated.
+  const [gridRotations, setGridRotations] = useState<
+    ReadonlyMap<string, number>
+  >(new Map());
+  const gridRotationsRef = useRef(new Map<string, number>());
+  // Groups whose grid rotation is queued behind another save and has not started yet.
+  const queuedGridRotationsRef = useRef(new Set<string>());
   const dateInputRef = useRef<HTMLInputElement | null>(null);
   const dayInputRef = useRef<HTMLInputElement | null>(null);
   const yearInputRef = useRef<HTMLInputElement | null>(null);
@@ -972,8 +980,9 @@ function App() {
         GRID_THUMBNAIL_SIZE,
         imageVersions[pair.frontPath] ?? pair.frontVersion,
       ),
+      rotation: gridRotations.get(pair.id) ?? 0,
     }));
-  }, [displayPairs, imageVersions, savedDates, savedPairIds]);
+  }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -1112,6 +1121,26 @@ function App() {
   }, [selectedPair?.id]);
 
   /**
+   * Records a write to a group's files as its latest pending save, so the next save of the group
+   * runs after it, Review waits for it before showing the group, and quitting waits for it.
+   * @param pairId - The ID of the image group being written.
+   * @param operation - The write, which resolves to whether it succeeded.
+   */
+  const trackPairOperation = useCallback(
+    (pairId: string, operation: Promise<boolean>) => {
+      pendingSavesRef.current.set(pairId, operation);
+      setPendingSaveCount(pendingSavesRef.current.size);
+      void operation.then(() => {
+        if (pendingSavesRef.current.get(pairId) === operation) {
+          pendingSavesRef.current.delete(pairId);
+        }
+        setPendingSaveCount(pendingSavesRef.current.size);
+      });
+    },
+    [],
+  );
+
+  /**
    * Saves a pair's metadata and applies its pending rotations without blocking the UI.
    * Saves of the same pair run in order. The returned promise never rejects; it resolves to whether the save succeeded.
    * A failed save names the image in the status line and keeps its values (and any rotation not yet applied),
@@ -1215,17 +1244,98 @@ function App() {
         }
       });
 
-      pendingSavesRef.current.set(pair.id, operation);
-      setPendingSaveCount(pendingSavesRef.current.size);
-      void operation.then(() => {
-        if (pendingSavesRef.current.get(pair.id) === operation) {
-          pendingSavesRef.current.delete(pair.id);
-        }
-        setPendingSaveCount(pendingSavesRef.current.size);
-      });
+      trackPairOperation(pair.id, operation);
       return operation;
     },
-    [markPairsSaved],
+    [markPairsSaved, trackPairOperation],
+  );
+
+  /**
+   * Rotates a group's A image from the grid. The thumbnail turns at once; the file is rotated in
+   * the background, after any save of the same group, and clicks made before it starts are
+   * combined into one rotation. Only the image is rewritten: the grid never writes a sidecar,
+   * so rotating does not record a date the user never chose.
+   * @param pairId - The ID of the image group to rotate.
+   * @param delta - The rotation change in degrees (±90).
+   */
+  const rotateFromGrid = useCallback(
+    (pairId: string, delta: number) => {
+      const electronApi = window.electronAPI;
+      const pair = pairs.find((candidate) => candidate.id === pairId);
+      if (!electronApi || !pair || isUploading) {
+        return;
+      }
+
+      const pendingRotations = gridRotationsRef.current;
+      const setPendingRotation = (rotation: number) => {
+        if (rotation) {
+          pendingRotations.set(pairId, rotation);
+        } else {
+          pendingRotations.delete(pairId);
+        }
+        setGridRotations(new Map(pendingRotations));
+      };
+      setPendingRotation(
+        normalizeRotation((pendingRotations.get(pairId) ?? 0) + delta),
+      );
+
+      // A rotation that has not started yet applies the latest angle when it runs.
+      if (queuedGridRotationsRef.current.has(pairId)) {
+        return;
+      }
+      queuedGridRotationsRef.current.add(pairId);
+
+      const previousSave =
+        pendingSavesRef.current.get(pairId) ?? Promise.resolve(true);
+      const operation = previousSave.then(async () => {
+        queuedGridRotationsRef.current.delete(pairId);
+        const rotation = pendingRotations.get(pairId) ?? 0;
+        if (!rotation) {
+          return true;
+        }
+
+        let error: string | undefined;
+        try {
+          const result = await electronApi.applyImageRotations({
+            frontPath: pair.frontPath,
+            backPath: null,
+            frontRotation: rotation,
+            backRotation: 0,
+          });
+          const frontResult = result.results.find(
+            (imageResult) => imageResult.field === "front",
+          );
+          if (frontResult?.ok) {
+            const { version } = frontResult;
+            if (version) {
+              setImageVersions((current) => ({
+                ...current,
+                [pair.frontPath]: version,
+              }));
+            }
+          } else {
+            error = frontResult?.error ?? "The image was not rotated.";
+          }
+        } catch (rotationError) {
+          error =
+            rotationError instanceof Error
+              ? rotationError.message
+              : "The image was not rotated.";
+        }
+
+        // Clicks made while this rotation ran stay pending for the next one.
+        setPendingRotation(
+          normalizeRotation((pendingRotations.get(pairId) ?? 0) - rotation),
+        );
+        if (error) {
+          setStatus(`Could not rotate ${pair.imageLabel}: ${error}`);
+        }
+        // A failure is reported here, so later saves of this group still go ahead.
+        return true;
+      });
+      trackPairOperation(pairId, operation);
+    },
+    [isUploading, pairs, trackPairOperation],
   );
 
   /**
@@ -1319,9 +1429,10 @@ function App() {
   );
 
   /**
-   * Saves the reviewed pair before the image list changes. Nothing is saved from the grid:
-   * it makes no edits, and Review's edits are saved on the way back to the grid. Saving
-   * there would write a default date for an image the user never opened.
+   * Saves the reviewed pair before the image list changes. No metadata is saved from the grid:
+   * its only edits are rotations, which are written as they are made, and Review's edits are
+   * saved on the way back to the grid. Saving there would write a default date for an image
+   * the user never opened.
    * @returns True when it is safe to continue.
    */
   const persistReviewedPair = useCallback(
@@ -2232,8 +2343,8 @@ function App() {
   );
 
   /**
-   * Opens an image from the grid in Review. The grid makes no edits, so there is
-   * nothing to save first.
+   * Opens an image from the grid in Review. The grid saves no metadata, so there is nothing to
+   * save first; a grid rotation still being written is shown, and Review loads after it.
    * @param pairId - The ID of the image group to review.
    */
   const openPairInReview = useCallback(
@@ -2698,6 +2809,8 @@ function App() {
                 focusCellId={gridFocusPairId}
                 emptyMessage={getEmptyFilterMessage(imageFilter, pairs.length)}
                 onOpen={openPairInReview}
+                onRotate={rotateFromGrid}
+                canRotate={!isUploading}
               />
             </section>
           ) : (
@@ -3048,7 +3161,10 @@ function App() {
                             selectedPair?.frontVersion ?? null,
                           )}
                           altText={`${selectedPair?.imageLabel ?? ""}`}
-                          rotation={rotations.front}
+                          rotation={normalizeRotation(
+                            rotations.front +
+                              (gridRotations.get(selectedPair?.id ?? "") ?? 0),
+                          )}
                           isExpanded={isExpanded}
                           collapsedHeight={collapsedImageHeight}
                         />
