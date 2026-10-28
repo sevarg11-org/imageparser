@@ -915,7 +915,7 @@ const describePair = (frontPath, backPath) => {
  * Supports date-taken sorting when available, falling back to file creation time.
  * @param {string[]} filePaths - The array of image file paths in the directory.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, createdAt: number, dateTaken: number|null}>>}
+ * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean}>>}
  */
 const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
@@ -953,6 +953,8 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
               backCandidate?.filePath,
             )
           : null,
+        hasSidecar:
+          (await resolveExistingSidecarPath(frontCandidate.filePath)) !== null,
       };
     }),
   );

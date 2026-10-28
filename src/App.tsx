@@ -16,6 +16,14 @@ import {
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import {
+  countImageFilterMatches,
+  filterImagePairs,
+  getEmptyFilterMessage,
+  imageFilterOptions,
+  isImageFilter,
+  type ImageFilter,
+} from "./imageFilters";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { fetchCurrentUser, type CurrentUser } from "./webApi";
 
@@ -27,6 +35,7 @@ type ImagePair = {
   createdAt: number;
   doNotUpload: boolean;
   excludeMismatch: boolean;
+  hasSidecar: boolean;
 };
 
 type SetDoNotUploadResult = Pick<
@@ -452,7 +461,14 @@ function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
   const [pairs, setPairs] = useState<ImagePair[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
+  const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  // Saved IDs as they were when the filter was chosen or the folder loaded.
+  const [filterSnapshotPairIds, setFilterSnapshotPairIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -471,7 +487,7 @@ function App() {
   });
   const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
-  const [filterOnlyPairs, setFilterOnlyPairs] = useState(false);
+  const [imageFilter, setImageFilter] = useState<ImageFilter>("all");
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
   );
@@ -524,16 +540,59 @@ function App() {
   const saveTimeoutRef = useRef<number | null>(null);
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
+  // Mirrors savedPairIds synchronously, so a filter change can snapshot a save
+  // that finished in the same callback before React re-renders.
+  const savedPairIdsRef = useRef<ReadonlySet<string>>(new Set());
+
+  /**
+   * Records that the given groups now have a sidecar. The filtered list keeps
+   * its snapshot; only the option counts update.
+   * @param ids - IDs of the groups that were saved.
+   */
+  const markPairsSaved = useCallback((ids: readonly string[]) => {
+    const current = savedPairIdsRef.current;
+    if (ids.every((id) => current.has(id))) {
+      return;
+    }
+    const next = new Set(current);
+    for (const id of ids) {
+      next.add(id);
+    }
+    savedPairIdsRef.current = next;
+    setSavedPairIds(next);
+  }, []);
+
+  /**
+   * Clears the saved IDs and the filter snapshot when a folder is (re)loaded.
+   */
+  const resetSavedPairs = useCallback(() => {
+    const empty = new Set<string>();
+    savedPairIdsRef.current = empty;
+    setSavedPairIds(empty);
+    setFilterSnapshotPairIds(empty);
+  }, []);
+
   const displayPairs = useMemo(
-    () => (filterOnlyPairs ? pairs.filter((p) => !!p.backPath) : pairs),
-    [pairs, filterOnlyPairs],
+    () => filterImagePairs(pairs, imageFilter, filterSnapshotPairIds),
+    [pairs, imageFilter, filterSnapshotPairIds],
+  );
+
+  const filterCounts = useMemo(
+    () => countImageFilterMatches(pairs, savedPairIds),
+    [pairs, savedPairIds],
+  );
+
+  const selectedIndex = useMemo(
+    () =>
+      Math.max(
+        displayPairs.findIndex((pair) => pair.id === selectedPairId),
+        0,
+      ),
+    [displayPairs, selectedPairId],
   );
 
   const selectedPair = useMemo(
-    () =>
-      displayPairs.length > 0 && selectedIndex < displayPairs.length
-        ? displayPairs[selectedIndex]
-        : null,
+    () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
 
@@ -683,8 +742,11 @@ function App() {
       });
 
       hasUserChangedRef.current = false;
+      if (!pair.hasSidecar) {
+        markPairsSaved([pair.id]);
+      }
     },
-    [rotations],
+    [markPairsSaved, rotations],
   );
 
   /**
@@ -800,21 +862,16 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair(formValues))) {
+      const nextPair = displayPairs[boundedIndex];
+      if (!nextPair || !(await persistCurrentPair(formValues))) {
         return;
       }
 
       setImageNumberInput(String(boundedIndex + 1));
       setIsHydrated(false);
-      setSelectedIndex(boundedIndex);
+      setSelectedPairId(nextPair.id);
     },
-    [
-      displayPairs.length,
-      isHydrated,
-      isUploading,
-      persistCurrentPair,
-      selectedIndex,
-    ],
+    [displayPairs, isHydrated, isUploading, persistCurrentPair, selectedIndex],
   );
 
   /**
@@ -830,7 +887,7 @@ function App() {
     let isMounted = true;
     const imageStatus = formatImageStatus(
       selectedIndex,
-      pairs.length,
+      displayPairs.length,
       selectedPair.imageLabel,
     );
 
@@ -902,7 +959,7 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [pairs.length, selectedIndex, selectedPair]);
+  }, [displayPairs.length, selectedIndex, selectedPair]);
 
   /**
    * Debounces metadata saves and clears pending changes when conditions change.
@@ -1281,9 +1338,9 @@ function App() {
     if (
       !Number.isInteger(imageNumber) ||
       imageNumber < 1 ||
-      imageNumber > pairs.length
+      imageNumber > displayPairs.length
     ) {
-      setStatus(`Enter an image number from 1 to ${pairs.length}.`);
+      setStatus(`Enter an image number from 1 to ${displayPairs.length}.`);
       return;
     }
 
@@ -1320,7 +1377,7 @@ function App() {
     }
 
     event.preventDefault();
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         try {
           if (await persistCurrentPair()) {
@@ -1371,7 +1428,7 @@ function App() {
     const formValues =
       nextDate === metadata.date ? metadata : { ...metadata, date: nextDate };
 
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         try {
           await savePairMetadata(selectedPair, formValues);
@@ -1426,9 +1483,11 @@ function App() {
       setDirectoryPath(result.directoryPath);
       setIsHydrated(false);
       setPairs(result.files);
+      resetSavedPairs();
+      setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
-      setSelectedIndex(0);
+      setSelectedPairId(result.files[0]?.id ?? null);
 
       if (!result.files.length) {
         setStatus("No supported images were found in that directory.");
@@ -1476,9 +1535,13 @@ function App() {
         setSortBy(nextSortBy);
         setIsHydrated(false);
         setPairs(result.files);
+        resetSavedPairs();
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
-        setSelectedIndex(0);
+        setSelectedPairId(
+          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ??
+            null,
+        );
         setStatus(
           `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
         );
@@ -1492,7 +1555,38 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, persistCurrentPair],
+    [directoryPath, imageFilter, persistCurrentPair, resetSavedPairs],
+  );
+
+  /**
+   * Switches the image filter after persisting pending changes to the current
+   * pair, then selects the first image in the newly filtered list.
+   * @param nextFilter - The filter to apply.
+   */
+  const changeImageFilter = useCallback(
+    async (nextFilter: ImageFilter) => {
+      if (nextFilter === imageFilter) {
+        return;
+      }
+
+      if (!(await persistCurrentPair())) {
+        return;
+      }
+
+      // Take the snapshot now: images saved later stay in this list until the
+      // filter is changed again or the folder is reloaded.
+      const snapshot = savedPairIdsRef.current;
+      const firstPairId =
+        filterImagePairs(pairs, nextFilter, snapshot)[0]?.id ?? null;
+      if (firstPairId !== selectedPairId) {
+        setIsHydrated(false);
+      }
+      setFilterSnapshotPairIds(snapshot);
+      setImageFilter(nextFilter);
+      setSelectedPairId(firstPairId);
+      setImageNumberInput("1");
+    },
+    [imageFilter, pairs, persistCurrentPair, selectedPairId],
   );
 
   /**
@@ -1581,6 +1675,12 @@ function App() {
       }
 
       const result = await electronApi.setFolderDate(directoryPath, date);
+      const failedLabels = result.errors.map((error) => error.split(": ")[0]);
+      markPairsSaved(
+        pairs
+          .filter((pair) => !failedLabels.includes(pair.imageLabel))
+          .map((pair) => pair.id),
+      );
 
       if (result.ok) {
         const parts: string[] = [];
@@ -1931,13 +2031,25 @@ function App() {
                   <option value="fileName-desc">File name (Z-A)</option>
                 </select>
               </label>
-              <label className="filter-control">
-                <input
-                  type="checkbox"
-                  checked={filterOnlyPairs}
-                  onChange={(event) => setFilterOnlyPairs(event.target.checked)}
-                />
-                <span>Only pairs</span>
+              <label className="sort-control filter-control">
+                <span>Show</span>
+                <select
+                  value={imageFilter}
+                  onChange={(event) => {
+                    if (isImageFilter(event.target.value)) {
+                      void changeImageFilter(event.target.value);
+                    }
+                  }}
+                  disabled={
+                    isTransitionLocked || (!isHydrated && selectedPair !== null)
+                  }
+                >
+                  {imageFilterOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} ({filterCounts[option.value]})
+                    </option>
+                  ))}
+                </select>
               </label>
               <label
                 className="size-control"
@@ -1977,20 +2089,21 @@ function App() {
                 <input
                   type="number"
                   min={1}
-                  max={pairs.length}
+                  max={displayPairs.length}
                   value={imageNumberInput}
                   onChange={(event) => setImageNumberInput(event.target.value)}
                   onKeyDown={handleImageNumberKeyDown}
                   disabled={isImageControlLocked}
-                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${pairs.length}`}
+                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
                 />
-                <span aria-hidden="true">/ {pairs.length}</span>
+                <span aria-hidden="true">/ {displayPairs.length}</span>
               </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex + 1)}
                 disabled={
-                  selectedIndex === pairs.length - 1 || isImageControlLocked
+                  selectedIndex >= displayPairs.length - 1 ||
+                  isImageControlLocked
                 }
               >
                 Next
@@ -2085,7 +2198,9 @@ function App() {
                   ) : null}
                 </>
               ) : (
-                <p>No Pairs Available</p>
+                <p role="status">
+                  {getEmptyFilterMessage(imageFilter, pairs.length)}
+                </p>
               )}
             </div>
           </section>
