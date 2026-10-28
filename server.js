@@ -1222,6 +1222,15 @@ const start = async () => {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 
+  // Without this, a port that cannot be opened (in use, or reserved by the OS) ends the process silently.
+  server.on("error", (error) => {
+    logger.error(
+      `Image Parser could not listen on ${host}:${port} (${error?.code ?? "unknown error"}). Choose another port with PORT.`,
+      error,
+    );
+    void shutdownCore().finally(() => process.exit(1));
+  });
+
   server.listen(port, host, () => {
     logger.info(
       `Image Parser listening on http://${host}:${port} (root: ${rootDirectory})`,
