@@ -106,3 +106,31 @@
   display: flex;
   gap: 0.5rem;
 }
+
+.directory-browser {
+  --processed: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  .directory-browser {
+    --processed: #4ade80;
+  }
+}
+
+.directory-browser-processed {
+  margin-left: 0.35rem;
+  color: var(--processed);
+  font-weight: 700;
+}
+
+.directory-browser-processed-badge {
+  display: inline-block;
+  margin-left: 0.6rem;
+  padding: 0 0.45rem;
+  border: 1px solid var(--processed);
+  border-radius: 999px;
+  color: var(--processed);
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}

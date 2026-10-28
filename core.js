@@ -1582,16 +1582,279 @@ const saveImmichSettings = async (settingsDirectory, secretCodec, settings) => {
 };
 
 /**
+ * Compares folder names the way the folder browser displays them, with numbers in natural order.
+ * @param {{name: string}} left - The first folder.
+ * @param {{name: string}} right - The second folder.
+ * @returns {number} The sort order.
+ */
+const compareFolderNames = (left, right) =>
+  left.name.localeCompare(right.name, undefined, { numeric: true });
+
+/**
+ * The hidden marker file that holds folder-level state, such as whether a reviewer finished the folder.
+ * The leading dot keeps it out of the folder browser and the image scan; immich-go skips non-media files.
+ * @type {string}
+ */
+const folderStateFileName = ".imageparser.json";
+
+/**
+ * The marker file format version written by this build.
+ * @type {number}
+ */
+const folderStateVersion = 1;
+
+const maxProcessedByLength = 128;
+
+/**
+ * The state of a folder without a marker file, or with one that cannot be read.
+ * @type {Readonly<{processed: false, processedAt: null, processedBy: null}>}
+ */
+const unprocessedFolderState = Object.freeze({
+  processed: false,
+  processedAt: null,
+  processedBy: null,
+});
+
+/**
+ * Reads the raw contents of a folder's marker file.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<Object>} The parsed marker, or an empty object when it is missing, unreadable, or not a JSON object.
+ */
+const readFolderMarker = async (directoryPath) => {
+  try {
+    const marker = JSON.parse(
+      await fs.readFile(path.join(directoryPath, folderStateFileName), "utf8"),
+    );
+    return marker && typeof marker === "object" && !Array.isArray(marker)
+      ? marker
+      : {};
+  } catch {
+    return {};
+  }
+};
+
+/**
+ * Reads whether a folder is marked processed, and who marked it when.
+ * A missing, unreadable, or corrupt marker file means the folder is not processed.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<{processed: boolean, processedAt: string|null, processedBy: string|null}>} The folder state.
+ */
+const readFolderState = async (directoryPath) => {
+  const marker = await readFolderMarker(directoryPath);
+  if (marker.processed !== true) {
+    return unprocessedFolderState;
+  }
+  return {
+    processed: true,
+    processedAt:
+      typeof marker.processedAt === "string" ? marker.processedAt : null,
+    processedBy:
+      typeof marker.processedBy === "string" ? marker.processedBy : null,
+  };
+};
+
+/**
+ * Normalizes the name recorded as the person who marked a folder processed.
+ * @param {*} actor - The signed-in or local user name.
+ * @returns {string|null} The trimmed name, or null when there is none.
+ */
+const normalizeProcessedBy = (actor) =>
+  typeof actor === "string" && actor.trim()
+    ? actor.trim().slice(0, maxProcessedByLength)
+    : null;
+
+/**
+ * Writes the processed flag into one folder's marker file, keeping any other fields it holds.
+ * Unmarking keeps the file and sets `processed` to false. The file is replaced atomically, so a
+ * concurrent listing never reads a partial file. Serialized with other operations on the marker.
+ * @param {string} directoryPath - The folder to mark.
+ * @param {boolean} value - Whether the folder is processed.
+ * @param {string|null} processedBy - Who marked the folder.
+ * @returns {Promise<{processed: boolean, processedAt: string|null, processedBy: string|null}>} The new folder state.
+ */
+const writeFolderProcessed = (directoryPath, value, processedBy) => {
+  const markerPath = path.join(directoryPath, folderStateFileName);
+  return runImageFileOperation([markerPath], async () => {
+    const marker = {
+      ...(await readFolderMarker(directoryPath)),
+      version: folderStateVersion,
+      processed: value,
+      processedAt: value ? new Date().toISOString() : null,
+      processedBy: value ? processedBy : null,
+    };
+    const temporaryPath = path.join(
+      directoryPath,
+      `${folderStateFileName}.${process.pid}.${Date.now()}.tmp`,
+    );
+    try {
+      await fs.writeFile(
+        temporaryPath,
+        `${JSON.stringify(marker, null, 2)}\n`,
+        "utf8",
+      );
+      await fs.rename(temporaryPath, markerPath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { force: true });
+      throw error;
+    }
+    return readFolderState(directoryPath);
+  });
+};
+
+/**
+ * Lists a folder and every visible folder below it. Hidden folders and symbolic links are skipped,
+ * so the walk never leaves the starting folder.
+ * @param {string} directoryPath - The folder to start from.
+ * @returns {Promise<string[]>} The folder followed by its descendants.
+ */
+const listFolderTree = async (directoryPath) => {
+  const folders = [directoryPath];
+  for (let index = 0; index < folders.length; index += 1) {
+    const entries = await fs.readdir(folders[index], { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        folders.push(path.join(folders[index], entry.name));
+      }
+    }
+  }
+  return folders;
+};
+
+/**
+ * Marks a folder, and optionally every visible subfolder, as processed or not processed.
+ * Callers are responsible for confining the path; the web server resolves it for the user first.
+ * @param {string} directoryPath - The folder to mark.
+ * @param {boolean} value - Whether the folder is processed.
+ * @param {{actor?: string|null, includeSubfolders?: boolean}} [options] - Who is marking the folder,
+ *   and whether to mark its subfolders too.
+ * @returns {Promise<{ok: boolean, state: {processed: boolean, processedAt: string|null, processedBy: string|null}, updatedFolders: number, errors: string[]}>}
+ *   The selected folder's new state, the number of folders written, and any per-subfolder failures.
+ * @throws {Error} If the value is not a boolean, the path is not a directory, or the selected folder cannot be written.
+ */
+const setFolderProcessed = async (
+  directoryPath,
+  value,
+  { actor = null, includeSubfolders = false } = {},
+) => {
+  if (typeof value !== "boolean") {
+    throw new Error("The processed value must be true or false.");
+  }
+  const stats = await fs.stat(directoryPath);
+  if (!stats.isDirectory()) {
+    throw new Error("The requested path is not a directory.");
+  }
+
+  const processedBy = normalizeProcessedBy(actor);
+  const state = await writeFolderProcessed(directoryPath, value, processedBy);
+  const errors = [];
+  let updatedFolders = 1;
+  if (includeSubfolders === true) {
+    const [, ...subfolders] = await listFolderTree(directoryPath);
+    for (const subfolder of subfolders) {
+      try {
+        await writeFolderProcessed(subfolder, value, processedBy);
+        updatedFolders += 1;
+      } catch (error) {
+        errors.push(
+          `${path.relative(directoryPath, subfolder)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, state, updatedFolders, errors };
+};
+
+/**
+ * Lists the visible subfolders of a directory, with their processed state, and counts its supported images.
+ * Reads one small marker file per subfolder.
+ * Callers are responsible for confining the path; the web server resolves it for the user first.
+ * @param {string} directoryPath - The directory to list.
+ * @returns {Promise<{directories: {name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null}[], imageCount: number, processed: boolean, processedAt: string|null, processedBy: string|null}>}
+ *   The sorted subfolders, skipping hidden ones, the number of supported images directly inside the
+ *   directory, and the directory's own processed state.
+ * @throws {Error} If the path does not exist or is not a directory.
+ */
+const listDirectory = async (directoryPath) => {
+  const stats = await fs.stat(directoryPath);
+  if (!stats.isDirectory()) {
+    throw new Error("The requested path is not a directory.");
+  }
+
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+  const directories = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map(async (entry) => {
+        const subfolderPath = path.join(directoryPath, entry.name);
+        return {
+          name: entry.name,
+          path: subfolderPath,
+          ...(await readFolderState(subfolderPath)),
+        };
+      }),
+  );
+  directories.sort(compareFolderNames);
+  const imageCount = entries.filter(
+    (entry) =>
+      entry.isFile() &&
+      allowedExtensions.has(path.extname(entry.name).toLowerCase()),
+  ).length;
+
+  return {
+    directories,
+    imageCount,
+    ...(await readFolderState(directoryPath)),
+  };
+};
+
+/**
+ * Lists the drive roots that are currently readable, such as C:\ and mapped network drives.
+ * Only meaningful on Windows; other platforms have a single filesystem root.
+ * @returns {Promise<{name: string, path: string, processed: false, processedAt: null, processedBy: null}[]>}
+ *   The available drives in letter order. Drive roots are never marked processed.
+ */
+const listDrives = async () => {
+  const letters = Array.from({ length: 26 }, (_, index) =>
+    String.fromCharCode(65 + index),
+  );
+  const drives = await Promise.all(
+    letters.map(async (letter) => {
+      const drivePath = `${letter}:\\`;
+      try {
+        await fs.access(drivePath);
+        return {
+          name: `${letter}:`,
+          path: drivePath,
+          ...unprocessedFolderState,
+        };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return drives.filter(Boolean);
+};
+
+/**
  * Reads all image files from a directory and groups them into pairs.
  * Returns file listings with pairing information, creation dates, and date-taken if sorting by date.
  * Also collects tag suggestions from existing sidecar metadata files.
  * @param {string} directoryPath - The path to the directory containing image files.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction for ordering results (default: createdAt-asc).
- * @returns {Promise<{directoryPath: string, files: Array, recentTags: string[]}>} An object with directory path, array of paired images, and tag suggestions.
+ * @returns {Promise<{directoryPath: string, files: Array, recentTags: string[], folderState: {processed: boolean, processedAt: string|null, processedBy: string|null}, hasSubfolders: boolean}>}
+ *   An object with directory path, array of paired images, tag suggestions, the folder's processed state,
+ *   and whether it has visible subfolders.
  */
 const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
   if (!directoryPath) {
-    return { directoryPath, files: [], recentTags: [] };
+    return {
+      directoryPath,
+      files: [],
+      recentTags: [],
+      folderState: unprocessedFolderState,
+      hasSubfolders: false,
+    };
   }
 
   const directoryEntries = await fs.readdir(directoryPath, {
@@ -1608,6 +1871,10 @@ const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
     directoryPath,
     files: await pairFiles(imageFiles, sortBy),
     recentTags: await readRecentTags(directoryPath),
+    folderState: await readFolderState(directoryPath),
+    hasSubfolders: directoryEntries.some(
+      (entry) => entry.isDirectory() && !entry.name.startsWith("."),
+    ),
   };
 };
 
@@ -2234,18 +2501,22 @@ export {
   configurePreviewCache,
   defaultSortBy,
   defaultThumbnailSize,
+  folderStateFileName,
   getGroupKey,
   getImagePreview,
   getImageVersion,
   getImmichFailureHints,
   getImmichGoDiagnostics,
   getThumbnail,
+  listDirectory,
+  listDrives,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,
   normalizeSortBy,
   normalizeThumbnailSize,
   readDirectory,
+  readFolderState,
   readSidecarMetadataForFile as readSidecarMetadata,
   renderThumbnail,
   runImmichUpload,
@@ -2253,6 +2524,7 @@ export {
   saveMetadata,
   setDoNotUploadQueued as setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
   toExcludedName,
   toIncludedName,

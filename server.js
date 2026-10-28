@@ -27,17 +27,20 @@ import {
   getImageVersion,
   getImmichGoDiagnostics,
   getThumbnail,
+  listDirectory,
   loadImmichSettings,
   normalizeRotationValue,
   normalizeSortBy,
   normalizeThumbnailSize,
   readDirectory,
+  readFolderState,
   readSidecarMetadata,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
 } from "./core.js";
@@ -616,7 +619,8 @@ const toRootRelativeName = (folderPath) =>
  * Non-administrators with several shared folders start at a virtual root listing only those folders.
  * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {URL} url - The parsed URL object containing query parameters.
- * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, and imageCount.
+ * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, imageCount, and
+ *   the folder's processed state; each directory also carries its processed state.
  *   A parent of "" means the virtual root; null means there is nothing above.
  * @throws {HttpError} 400 if the path is not a directory.
  */
@@ -630,15 +634,21 @@ const handleBrowse = async (user, url) => {
         rootPath: rootDirectory,
         parent: null,
         selectable: false,
-        directories: allowedRoots
-          .map((allowedRoot) => ({
-            name: toRootRelativeName(allowedRoot),
-            path: allowedRoot,
-          }))
-          .sort((left, right) =>
-            left.name.localeCompare(right.name, undefined, { numeric: true }),
-          ),
+        directories: (
+          await Promise.all(
+            allowedRoots.map(async (allowedRoot) => ({
+              name: toRootRelativeName(allowedRoot),
+              path: allowedRoot,
+              ...(await readFolderState(allowedRoot)),
+            })),
+          )
+        ).sort((left, right) =>
+          left.name.localeCompare(right.name, undefined, { numeric: true }),
+        ),
         imageCount: 0,
+        processed: false,
+        processedAt: null,
+        processedBy: null,
       };
     }
     requestedPath = allowedRoots[0];
@@ -653,21 +663,7 @@ const handleBrowse = async (user, url) => {
     throw new HttpError(400, "The requested path is not a directory.");
   }
 
-  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const directories = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => ({
-      name: entry.name,
-      path: path.join(directoryPath, entry.name),
-    }))
-    .sort((left, right) =>
-      left.name.localeCompare(right.name, undefined, { numeric: true }),
-    );
-  const imageCount = entries.filter(
-    (entry) =>
-      entry.isFile() &&
-      allowedExtensions.has(path.extname(entry.name).toLowerCase()),
-  ).length;
+  const listing = await listDirectory(directoryPath);
 
   let parent = path.dirname(directoryPath);
   if (allowedRoots.includes(directoryPath)) {
@@ -679,8 +675,7 @@ const handleBrowse = async (user, url) => {
     rootPath: rootDirectory,
     parent,
     selectable: true,
-    directories,
-    imageCount,
+    ...listing,
   };
 };
 
@@ -871,6 +866,15 @@ const createApiRoutes = (secretCodec) => ({
       frontPath: body.frontPath,
       backPath: body.backPath,
       value: body.value,
+    });
+  },
+  "POST /api/folder-processed": async (request) => {
+    const body = await readJsonBody(request);
+    // Subfolders are walked without following symbolic links, so they stay inside the confined folder.
+    const directoryPath = await resolvePathForUser(request.user, body.path);
+    return setFolderProcessed(directoryPath, body.value, {
+      actor: request.user.username || null,
+      includeSubfolders: body.includeSubfolders === true,
     });
   },
   "POST /api/set-folder-date": async (request) => {

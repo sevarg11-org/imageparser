@@ -1,37 +1,6 @@
-import { createElement } from "react";
-import { createRoot } from "react-dom/client";
-import {
-  DirectoryBrowserDialog,
-  type DirectoryListing,
-} from "./DirectoryBrowser";
+import type { DirectoryListing } from "./DirectoryBrowser";
 
 type ImageParserApi = NonNullable<Window["electronAPI"]>;
-
-const LAST_DIRECTORY_STORAGE_KEY = "imageparser:last-directory";
-
-const openDirectoryBrowser = (
-  initialPath: string | null,
-  loadListing: (directoryPath: string | null) => Promise<DirectoryListing>,
-) =>
-  new Promise<string | null>((resolve) => {
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const root = createRoot(container);
-
-    const onClose = (selectedPath: string | null) => {
-      root.unmount();
-      container.remove();
-      resolve(selectedPath);
-    };
-
-    root.render(
-      createElement(DirectoryBrowserDialog, {
-        initialPath,
-        loadListing,
-        onClose,
-      }),
-    );
-  });
 
 export type CurrentUser = {
   username: string;
@@ -63,6 +32,7 @@ const postJson = <T>(url: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
+// Null and "" both list the share root, or the virtual root of a user's shared folders.
 const loadDirectoryListing = (directoryPath: string | null) => {
   const query = directoryPath
     ? `?${new URLSearchParams({ path: directoryPath }).toString()}`
@@ -72,16 +42,7 @@ const loadDirectoryListing = (directoryPath: string | null) => {
 
 // Mirrors the Electron preload bridge so App.tsx works unchanged when served over HTTP.
 const createWebApi = (): ImageParserApi => ({
-  chooseDirectory: async () => {
-    const selectedPath = await openDirectoryBrowser(
-      window.localStorage.getItem(LAST_DIRECTORY_STORAGE_KEY),
-      loadDirectoryListing,
-    );
-    if (selectedPath) {
-      window.localStorage.setItem(LAST_DIRECTORY_STORAGE_KEY, selectedPath);
-    }
-    return selectedPath;
-  },
+  browseDirectory: loadDirectoryListing,
   readDirectory: (directoryPath, sortBy) =>
     postJson("api/read-directory", { directoryPath, sortBy }),
   readSidecarMetadata: (filePath) =>
@@ -101,6 +62,12 @@ const createWebApi = (): ImageParserApi => ({
   setFolderDate: (directoryPath, date) =>
     postJson("api/set-folder-date", { directoryPath, date }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
+  setFolderProcessed: (directoryPath, value, includeSubfolders) =>
+    postJson("api/folder-processed", {
+      path: directoryPath,
+      value,
+      includeSubfolders,
+    }),
   loadImmichSettings: () => requestJson("api/immich-settings"),
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
   uploadToImmich: (settings, directoryPath) =>

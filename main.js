@@ -1,11 +1,5 @@
-import {
-  app,
-  BrowserWindow,
-  dialog,
-  ipcMain,
-  protocol,
-  safeStorage,
-} from "electron";
+import { app, BrowserWindow, ipcMain, protocol, safeStorage } from "electron";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -15,6 +9,8 @@ import {
   defaultSortBy,
   getImagePreview,
   getThumbnail,
+  listDirectory,
+  listDrives,
   loadImmichSettings,
   needsRenderedPreview,
   readDirectory,
@@ -24,6 +20,7 @@ import {
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
 } from "./core.js";
@@ -333,22 +330,49 @@ app.on("will-quit", (event) => {
 });
 
 /**
- * IPC handler for selecting the image directory.
- * Opens a file dialog that allows the user to choose a directory
- * containing images to process.
- * @returns {Promise<string|null>} The selected directory path, or null if cancelled.
+ * IPC handler that lists a folder for the in-app folder browser.
+ * Browsing starts in the home folder and can climb to the filesystem root; on Windows the level
+ * above a drive root is a virtual list of the available drives.
+ * @param {*} _event - The IPC event object.
+ * @param {string|null} directoryPath - The folder to list, null for the home folder, or "" for the drive list.
+ * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, and imageCount.
+ *   A parent of "" means the drive list; null means there is nothing above.
  */
-ipcMain.handle("choose-directory", async () => {
-  const result = await dialog.showOpenDialog({
-    properties: ["openDirectory"],
-    title: "Select the image directory",
-  });
-
-  if (result.canceled || !result.filePaths.length) {
-    return null;
+ipcMain.handle("browse-directory", async (_event, directoryPath) => {
+  const isWindows = process.platform === "win32";
+  if (directoryPath === "" && isWindows) {
+    return {
+      path: "",
+      rootPath: null,
+      parent: null,
+      selectable: false,
+      directories: await listDrives(),
+      imageCount: 0,
+      processed: false,
+      processedAt: null,
+      processedBy: null,
+    };
   }
 
-  return result.filePaths[0];
+  if (directoryPath != null && typeof directoryPath !== "string") {
+    throw new Error("The folder path must be a string.");
+  }
+
+  const resolvedPath = path.resolve(directoryPath || os.homedir());
+  const listing = await listDirectory(resolvedPath);
+  const parentPath = path.dirname(resolvedPath);
+  let parent = parentPath;
+  if (parentPath === resolvedPath) {
+    parent = isWindows ? "" : null;
+  }
+
+  return {
+    path: resolvedPath,
+    rootPath: null,
+    parent,
+    selectable: true,
+    ...listing,
+  };
 });
 
 /**
@@ -448,6 +472,38 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
 ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
   setFolderDate(directoryPath, date),
 );
+
+/**
+ * Returns the local account name recorded as the person who marked a folder processed.
+ * @returns {string|null} The operating system user name, or null when it cannot be read.
+ */
+const getLocalUserName = () => {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * IPC handler for marking a folder, and optionally its subfolders, as processed or not processed.
+ * @param {*} _event - The IPC event object.
+ * @param {{directoryPath: string, value: boolean, includeSubfolders?: boolean}} request - The folder and the new state.
+ * @returns {Promise<Object>} The folder's new state, the number of folders written, and any errors.
+ */
+ipcMain.handle("set-folder-processed", (_event, request) => {
+  if (typeof request?.directoryPath !== "string" || !request.directoryPath) {
+    throw new Error("The folder path must be a non-empty string.");
+  }
+  return setFolderProcessed(
+    path.resolve(request.directoryPath),
+    request.value,
+    {
+      actor: getLocalUserName(),
+      includeSubfolders: request.includeSubfolders === true,
+    },
+  );
+});
 
 /**
  * IPC handler for flagging an image group "Do not upload" or clearing the flag.
