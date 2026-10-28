@@ -1858,39 +1858,49 @@ function App() {
                   </fieldset>
                 </div>
               </details>
+
+              <div className="do-not-upload">
+                <button
+                  type="button"
+                  className={`secondary-button do-not-upload-toggle${
+                    selectedPair?.doNotUpload
+                      ? " do-not-upload-toggle--active"
+                      : ""
+                  }`}
+                  aria-label="Do not upload"
+                  aria-pressed={selectedPair?.doNotUpload ?? false}
+                  aria-describedby="do-not-upload-help"
+                  title="Do not upload (Space)"
+                  onClick={() => void toggleDoNotUpload()}
+                  disabled={!selectedPair || isImageControlLocked}
+                >
+                  <svg
+                    className="do-not-upload-icon"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
+                  </svg>
+                </button>
+                <span id="do-not-upload-help" className="visually-hidden">
+                  Press Space to toggle. Flagged files are renamed with
+                  &ldquo;_exclude&rdquo; and skipped by Immich uploads.
+                </span>
+              </div>
             </div>
 
-            <div className="do-not-upload">
-              <button
-                type="button"
-                className={`secondary-button do-not-upload-toggle${
-                  selectedPair?.doNotUpload
-                    ? " do-not-upload-toggle--active"
-                    : ""
-                }`}
-                aria-pressed={selectedPair?.doNotUpload ?? false}
-                aria-describedby="do-not-upload-help"
-                onClick={() => void toggleDoNotUpload()}
-                disabled={!selectedPair || isImageControlLocked}
-              >
-                Do not upload
-              </button>
-              <span id="do-not-upload-help" className="field-help">
-                Press Space to toggle. Flagged files are renamed with
-                &ldquo;_exclude&rdquo; and skipped by Immich uploads.
-              </span>
-              {selectedPair?.excludeMismatch ? (
-                <p className="do-not-upload-warning" role="status">
-                  Only one side of this group is flagged Do not upload. Toggle
-                  the flag to rename both sides to match.
-                </p>
-              ) : null}
-              {selectedDoNotUploadError ? (
-                <p className="do-not-upload-error" role="alert">
-                  {selectedDoNotUploadError}
-                </p>
-              ) : null}
-            </div>
+            {selectedPair?.excludeMismatch ? (
+              <p className="do-not-upload-warning" role="status">
+                Only one side of this group is flagged Do not upload. Toggle the
+                flag to rename both sides to match.
+              </p>
+            ) : null}
+            {selectedDoNotUploadError ? (
+              <p className="do-not-upload-error" role="alert">
+                {selectedDoNotUploadError}
+              </p>
+            ) : null}
           </aside>
 
           <section className="viewer-panel">
