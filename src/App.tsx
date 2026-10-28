@@ -230,6 +230,21 @@ const selectAllOnFocusProps = {
 };
 
 /**
+ * Loads and decodes an image so it can be shown without a blank frame.
+ * Load failures are ignored; the displayed image element reports them instead.
+ * @param src - The image source URL to preload.
+ */
+const preloadImage = async (src: string) => {
+  const image = new Image();
+  image.src = src;
+  try {
+    await image.decode();
+  } catch {
+    // The <img> element surfaces broken images itself.
+  }
+};
+
+/**
  * Resolves the preview source URL for an image, accounting for rotation.
  * When running in Electron, attempts to use a preview data URL; otherwise falls back to a file URL.
  * @param filePath - The path to the image file.
@@ -253,18 +268,22 @@ const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
         return;
       }
 
+      let nextSrc: string;
       try {
         const previewUrl = await window.electronAPI.getPreviewDataUrl(
           filePath,
           rotation,
         );
-        if (isActive) {
-          setSrc(previewUrl || toFileUrl(filePath));
-        }
+        nextSrc = previewUrl || toFileUrl(filePath);
       } catch {
-        if (isActive) {
-          setSrc(toFileUrl(filePath));
-        }
+        nextSrc = toFileUrl(filePath);
+      }
+
+      // Keep the current image on screen until the new one is decoded, so a path change
+      // such as the "Do not upload" rename does not blank the preview while it loads.
+      await preloadImage(nextSrc);
+      if (isActive) {
+        setSrc(nextSrc);
       }
     };
 
