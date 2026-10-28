@@ -3,20 +3,20 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   applyImageRotations,
+  configurePreviewCache,
   defaultSortBy,
-  getImageRevision,
+  getImagePreview,
   loadImmichSettings,
   needsRenderedPreview,
   readDirectory,
   readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
   shutdownCore,
+  whenImageFileOperationsIdle,
 } from "./core.js";
 import fs from "node:fs/promises";
 
@@ -93,31 +93,28 @@ const safeStorageCodec = Object.freeze({
 const getSettingsDirectory = () => app.getPath("userData");
 
 /**
- * Retrieves a preview data URL for an image file with optional rotation.
- * If the file needs a rendered preview, generates one; otherwise uses the
- * original file URL with revision tracking. Falls back gracefully to file
- * URLs or empty strings on errors.
+ * Retrieves a preview URL for an image file.
+ * Files the browser can display are loaded directly, with the file's version in the URL so a
+ * rewritten file is reloaded. TIFF files are rendered (and cached) as WebP data URLs.
+ * Rotation is shown by the renderer, so previews are never rendered just to rotate them.
  * @param {string} filePath - The path to the image file.
- * @param {number} [rotation=0] - The rotation angle in degrees.
+ * @param {string} [version=""] - The file's version, from the directory listing or the last save.
  * @returns {Promise<string>} A data URL for the preview, a file URL, or an empty string.
  */
-const getPreviewDataUrl = async (filePath, rotation = 0) => {
+const getPreviewDataUrl = async (filePath, version = "") => {
   if (!filePath) {
     return "";
   }
 
-  if (!needsRenderedPreview(filePath, rotation)) {
+  if (!needsRenderedPreview(filePath)) {
     const fileUrl = pathToFileURL(filePath);
-    fileUrl.searchParams.set(
-      "imageParserRevision",
-      String(getImageRevision(filePath)),
-    );
+    fileUrl.searchParams.set("v", String(version ?? ""));
     return fileUrl.href;
   }
 
   try {
-    const pngBuffer = await renderPreviewPng(filePath, rotation);
-    return `data:image/webp;base64,${pngBuffer.toString("base64")}`;
+    const preview = await getImagePreview(filePath);
+    return `data:${preview.contentType};base64,${preview.buffer.toString("base64")}`;
   } catch {
     try {
       return pathToFileURL(filePath).href;
@@ -232,6 +229,9 @@ const createMainWindow = () => {
  * the app is ready, and recreates it if all windows are closed.
  */
 app.whenReady().then(() => {
+  configurePreviewCache({
+    directory: path.join(getSettingsDirectory(), "preview-cache"),
+  });
   createMainWindow();
 
   app.on("activate", () => {
@@ -255,8 +255,20 @@ app.on("window-all-closed", () => {
  * Main application lifecycle hook that shuts down core operations
  * when the app is being quit.
  */
-app.on("will-quit", () => {
-  void shutdownCore();
+let isShutdownComplete = false;
+app.on("will-quit", (event) => {
+  if (isShutdownComplete) {
+    return;
+  }
+
+  // Saves started just before closing run in the background; let them finish before stopping ExifTool.
+  event.preventDefault();
+  void whenImageFileOperationsIdle()
+    .then(() => shutdownCore())
+    .finally(() => {
+      isShutdownComplete = true;
+      app.quit();
+    });
 });
 
 /**
@@ -313,16 +325,16 @@ ipcMain.handle("read-sidecar-metadata", (_event, filePath) =>
 );
 
 /**
- * IPC handler for getting a preview data URL of an image with optional rotation.
+ * IPC handler for getting a preview URL of an image.
  * Returns a data URL that can be displayed in the UI for the specified file
  * and rotation angle.
  * @param {*} _event - The IPC event object.
  * @param {string} filePath - The path to the image file.
- * @param {number} rotation - The rotation angle in degrees.
+ * @param {string} version - The file's version, so a rewritten file is reloaded.
  * @returns {Promise<string>} A data URL or file URL for the preview.
  */
-ipcMain.handle("get-preview-data-url", (_event, filePath, rotation) =>
-  runImageFileOperation(() => getPreviewDataUrl(filePath, rotation)),
+ipcMain.handle("get-preview-data-url", (_event, filePath, version) =>
+  getPreviewDataUrl(filePath, version),
 );
 
 /**
