@@ -62,6 +62,12 @@ const createWebApi = (): ImageParserApi => ({
   setFolderDate: (directoryPath, date) =>
     postJson("api/set-folder-date", { directoryPath, date }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
+  setFolderProcessed: (directoryPath, value, includeSubfolders) =>
+    postJson("api/folder-processed", {
+      path: directoryPath,
+      value,
+      includeSubfolders,
+    }),
   loadImmichSettings: () => requestJson("api/immich-settings"),
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
   uploadToImmich: (settings, directoryPath) =>

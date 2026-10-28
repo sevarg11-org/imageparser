@@ -20,6 +20,7 @@ import {
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
 } from "./core.js";
@@ -347,6 +348,9 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
       selectable: false,
       directories: await listDrives(),
       imageCount: 0,
+      processed: false,
+      processedAt: null,
+      processedBy: null,
     };
   }
 
@@ -355,7 +359,7 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
   }
 
   const resolvedPath = path.resolve(directoryPath || os.homedir());
-  const { directories, imageCount } = await listDirectory(resolvedPath);
+  const listing = await listDirectory(resolvedPath);
   const parentPath = path.dirname(resolvedPath);
   let parent = parentPath;
   if (parentPath === resolvedPath) {
@@ -367,8 +371,7 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
     rootPath: null,
     parent,
     selectable: true,
-    directories,
-    imageCount,
+    ...listing,
   };
 });
 
@@ -469,6 +472,38 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
 ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
   setFolderDate(directoryPath, date),
 );
+
+/**
+ * Returns the local account name recorded as the person who marked a folder processed.
+ * @returns {string|null} The operating system user name, or null when it cannot be read.
+ */
+const getLocalUserName = () => {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * IPC handler for marking a folder, and optionally its subfolders, as processed or not processed.
+ * @param {*} _event - The IPC event object.
+ * @param {{directoryPath: string, value: boolean, includeSubfolders?: boolean}} request - The folder and the new state.
+ * @returns {Promise<Object>} The folder's new state, the number of folders written, and any errors.
+ */
+ipcMain.handle("set-folder-processed", (_event, request) => {
+  if (typeof request?.directoryPath !== "string" || !request.directoryPath) {
+    throw new Error("The folder path must be a non-empty string.");
+  }
+  return setFolderProcessed(
+    path.resolve(request.directoryPath),
+    request.value,
+    {
+      actor: getLocalUserName(),
+      includeSubfolders: request.includeSubfolders === true,
+    },
+  );
+});
 
 /**
  * IPC handler for flagging an image group "Do not upload" or clearing the flag.

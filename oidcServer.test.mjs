@@ -484,6 +484,55 @@ test("file routes enforce the user's folders", async () => {
   );
 });
 
+test("folder processed marks are confined and shared between users", async () => {
+  const aliceCookie = await signIn(alice);
+  for (const forbidden of [
+    path.join(root, "family-secret"),
+    path.join(root, "vacations"),
+    root,
+  ]) {
+    const response = await postJson("api/folder-processed", aliceCookie, {
+      path: forbidden,
+      value: true,
+    });
+    assert.equal(response.status, 403, forbidden);
+  }
+  await assert.rejects(
+    fs.access(path.join(root, "family-secret", ".imageparser.json")),
+  );
+
+  const family2020 = path.join(root, "family", "2020");
+  const marked = await postJson("api/folder-processed", aliceCookie, {
+    path: family2020,
+    value: true,
+  });
+  assert.equal(marked.status, 200);
+  assert.equal(marked.body.state.processed, true);
+  assert.equal(marked.body.state.processedBy, "alice");
+
+  // Another user who can see the folder sees the same mark.
+  const adminCookie = await signIn(admin);
+  const listing = await getJson(
+    `api/browse?${new URLSearchParams({ path: path.join(root, "family") })}`,
+    adminCookie,
+  );
+  const entry = listing.body.directories.find((d) => d.name === "2020");
+  assert.equal(entry.processed, true);
+  assert.equal(entry.processedBy, "alice");
+
+  const opened = await getJson(
+    `api/browse?${new URLSearchParams({ path: family2020 })}`,
+    adminCookie,
+  );
+  assert.equal(opened.body.processed, true);
+
+  const cleared = await postJson("api/folder-processed", adminCookie, {
+    path: family2020,
+    value: false,
+  });
+  assert.equal(cleared.body.state.processed, false);
+});
+
 test("a user with one shared folder starts inside it", async () => {
   const cookie = await signIn(bob);
   const listing = await getJson("api/browse", cookie);
