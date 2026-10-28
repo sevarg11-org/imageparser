@@ -444,6 +444,10 @@ function App() {
   const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  // Saved IDs as they were when the filter was chosen or the folder loaded.
+  const [filterSnapshotPairIds, setFilterSnapshotPairIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -509,11 +513,41 @@ function App() {
   const saveTimeoutRef = useRef<number | null>(null);
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
-  // The selected group is retained in the filtered list until the selection
-  // moves, so an image saved under "Unprocessed" stays on screen.
+  // Mirrors savedPairIds synchronously, so a filter change can snapshot a save
+  // that finished in the same callback before React re-renders.
+  const savedPairIdsRef = useRef<ReadonlySet<string>>(new Set());
+
+  /**
+   * Records that the given groups now have a sidecar. The filtered list keeps
+   * its snapshot; only the option counts update.
+   * @param ids - IDs of the groups that were saved.
+   */
+  const markPairsSaved = useCallback((ids: readonly string[]) => {
+    const current = savedPairIdsRef.current;
+    if (ids.every((id) => current.has(id))) {
+      return;
+    }
+    const next = new Set(current);
+    for (const id of ids) {
+      next.add(id);
+    }
+    savedPairIdsRef.current = next;
+    setSavedPairIds(next);
+  }, []);
+
+  /**
+   * Clears the saved IDs and the filter snapshot when a folder is (re)loaded.
+   */
+  const resetSavedPairs = useCallback(() => {
+    const empty = new Set<string>();
+    savedPairIdsRef.current = empty;
+    setSavedPairIds(empty);
+    setFilterSnapshotPairIds(empty);
+  }, []);
+
   const displayPairs = useMemo(
-    () => filterImagePairs(pairs, imageFilter, savedPairIds, selectedPairId),
-    [pairs, imageFilter, savedPairIds, selectedPairId],
+    () => filterImagePairs(pairs, imageFilter, filterSnapshotPairIds),
+    [pairs, imageFilter, filterSnapshotPairIds],
   );
 
   const filterCounts = useMemo(
@@ -682,12 +716,10 @@ function App() {
 
       hasUserChangedRef.current = false;
       if (!pair.hasSidecar) {
-        setSavedPairIds((current) =>
-          current.has(pair.id) ? current : new Set(current).add(pair.id),
-        );
+        markPairsSaved([pair.id]);
       }
     },
-    [rotations],
+    [markPairsSaved, rotations],
   );
 
   /**
@@ -808,32 +840,11 @@ function App() {
         return;
       }
 
-      // The previous group may drop out of the filtered list once it is no
-      // longer selected, so the next group's index is recalculated from its ID.
-      const nextDisplayPairs = filterImagePairs(
-        pairs,
-        imageFilter,
-        savedPairIds,
-        nextPair.id,
-      );
-      setImageNumberInput(
-        String(
-          nextDisplayPairs.findIndex((pair) => pair.id === nextPair.id) + 1,
-        ),
-      );
+      setImageNumberInput(String(boundedIndex + 1));
       setIsHydrated(false);
       setSelectedPairId(nextPair.id);
     },
-    [
-      displayPairs,
-      imageFilter,
-      isHydrated,
-      isUploading,
-      pairs,
-      persistCurrentPair,
-      savedPairIds,
-      selectedIndex,
-    ],
+    [displayPairs, isHydrated, isUploading, persistCurrentPair, selectedIndex],
   );
 
   /**
@@ -1353,7 +1364,7 @@ function App() {
       setDirectoryPath(result.directoryPath);
       setIsHydrated(false);
       setPairs(result.files);
-      setSavedPairIds(new Set());
+      resetSavedPairs();
       setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
@@ -1405,7 +1416,7 @@ function App() {
         setSortBy(nextSortBy);
         setIsHydrated(false);
         setPairs(result.files);
-        setSavedPairIds(new Set());
+        resetSavedPairs();
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
         setSelectedPairId(
@@ -1425,7 +1436,7 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, imageFilter, persistCurrentPair],
+    [directoryPath, imageFilter, persistCurrentPair, resetSavedPairs],
   );
 
   /**
@@ -1443,16 +1454,20 @@ function App() {
         return;
       }
 
+      // Take the snapshot now: images saved later stay in this list until the
+      // filter is changed again or the folder is reloaded.
+      const snapshot = savedPairIdsRef.current;
       const firstPairId =
-        filterImagePairs(pairs, nextFilter, savedPairIds)[0]?.id ?? null;
+        filterImagePairs(pairs, nextFilter, snapshot)[0]?.id ?? null;
       if (firstPairId !== selectedPairId) {
         setIsHydrated(false);
       }
+      setFilterSnapshotPairIds(snapshot);
       setImageFilter(nextFilter);
       setSelectedPairId(firstPairId);
       setImageNumberInput("1");
     },
-    [imageFilter, pairs, persistCurrentPair, savedPairIds, selectedPairId],
+    [imageFilter, pairs, persistCurrentPair, selectedPairId],
   );
 
   /**
@@ -1542,15 +1557,11 @@ function App() {
 
       const result = await electronApi.setFolderDate(directoryPath, date);
       const failedLabels = result.errors.map((error) => error.split(": ")[0]);
-      setSavedPairIds((current) => {
-        const next = new Set(current);
-        for (const pair of pairs) {
-          if (!failedLabels.includes(pair.imageLabel)) {
-            next.add(pair.id);
-          }
-        }
-        return next;
-      });
+      markPairsSaved(
+        pairs
+          .filter((pair) => !failedLabels.includes(pair.imageLabel))
+          .map((pair) => pair.id),
+      );
 
       if (result.ok) {
         const parts: string[] = [];

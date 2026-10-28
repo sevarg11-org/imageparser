@@ -64,26 +64,19 @@ export const matchesImageFilter = (
 };
 
 /**
- * Filters image groups for display. The retained group stays in the list even
- * when it no longer matches, so the image on screen does not disappear while
- * it is being edited; it drops out once the selection moves elsewhere.
+ * Filters image groups for display. Pass the saved IDs as they were when the
+ * filter was chosen, so groups saved afterwards stay in the list and can still
+ * be reached with Previous.
  * @param pairs - All image groups in the folder, in display order.
  * @param filter - The selected image filter.
  * @param savedPairIds - IDs of groups whose metadata was saved this session.
- * @param retainedPairId - The ID of the group to keep visible, usually the selected one.
  * @returns The filtered image groups, in their original order.
  */
 export const filterImagePairs = <Pair extends FilterablePair>(
   pairs: readonly Pair[],
   filter: ImageFilter,
   savedPairIds: ReadonlySet<string>,
-  retainedPairId: string | null = null,
-) =>
-  pairs.filter(
-    (pair) =>
-      pair.id === retainedPairId ||
-      matchesImageFilter(pair, filter, savedPairIds),
-  );
+) => pairs.filter((pair) => matchesImageFilter(pair, filter, savedPairIds));
 
 /**
  * Counts how many image groups match each filter, for the option labels.

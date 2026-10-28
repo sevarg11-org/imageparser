@@ -41,14 +41,14 @@ test('a group saved this session counts as processed', () => {
   assert.deepEqual(ids(filterImagePairs(pairs, 'unprocessed', new Set(['p2']))), ['p1', 'p3'])
 })
 
-test('the retained group stays visible after it is saved, then drops out when selection moves', () => {
+test('a snapshot taken when the filter was chosen keeps later saves in the list', () => {
   const pairs = makePairs(6)
-  const saved = new Set(['p1'])
-  assert.deepEqual(ids(filterImagePairs(pairs, 'unprocessed', saved, 'p1')), ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'])
-
-  const afterNext = filterImagePairs(pairs, 'unprocessed', saved, 'p2')
-  assert.equal(afterNext.length, 5)
-  assert.equal(afterNext.findIndex((pair) => pair.id === 'p2'), 0)
+  const snapshot = new Set()
+  // p1 and p2 are saved after Unprocessed was chosen; the snapshot is unchanged,
+  // so Previous can still return to them.
+  const visible = filterImagePairs(pairs, 'unprocessed', snapshot)
+  assert.equal(visible.length, 6)
+  assert.equal(visible.findIndex((pair) => pair.id === 'p2'), 1)
 })
 
 test('counts reflect every option', () => {
