@@ -130,6 +130,37 @@ const maxConcurrentPreviewRenders = 2;
 let previewCache = null;
 
 /**
+ * The default long-edge size, in pixels, of grid thumbnails.
+ * @type {number}
+ */
+const defaultThumbnailSize = 320;
+
+/**
+ * The smallest and largest thumbnail sizes a request may ask for.
+ * @type {number}
+ */
+const minThumbnailSize = 64;
+const maxThumbnailSize = 640;
+
+/**
+ * The memory limit for cached thumbnails (about 2,000 thumbnails at 320 px).
+ * @type {number}
+ */
+const maxThumbnailCacheBytes = 64 * 1024 * 1024;
+
+/**
+ * Rendered thumbnails by cache key, in least- to most-recently-used order.
+ * @type {Map<string, Buffer>}
+ */
+const thumbnailCache = new Map();
+
+/**
+ * The total size of the buffers in the thumbnail cache.
+ * @type {number}
+ */
+let thumbnailCacheBytes = 0;
+
+/**
  * The default Immich settings object with empty or default values.
  * @type {{serverUrl: string, userApiKey: string, adminApiKey: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}}
  */
@@ -873,12 +904,12 @@ const sortPairs = (pairs, sortBy) => {
   });
 };
 
-const readSidecarRawDate = async (filePath) => {
-  const sidecarPath = await resolveExistingSidecarPath(filePath);
-  if (!sidecarPath) {
-    return "";
-  }
-
+/**
+ * Reads the raw date value from a sidecar file.
+ * @param {string} sidecarPath - The path to the XMP sidecar file.
+ * @returns {Promise<string>} The raw date, or an empty string when the sidecar has none.
+ */
+const readRawDateFromSidecar = async (sidecarPath) => {
   try {
     const rawXml = String(await fs.readFile(sidecarPath, "utf8"));
     for (const pattern of sidecarDatePatterns) {
@@ -895,26 +926,43 @@ const readSidecarRawDate = async (filePath) => {
 };
 
 /**
- * Reads and compares date taken timestamps from front/back image pairs.
- * Returns the most valid timestamp found across both files in the pair.
- * @param {string|null} frontPath - The path to the front image file.
- * @param {string|null} backPath - The path to the back image file.
- * @returns {Promise<number|null>} A timestamp if a valid date is found, null otherwise.
+ * Reads an image's sidecar once, reporting whether it exists and its raw date.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<{hasSidecar: boolean, rawDate: string}>} The sidecar summary.
  */
-const readDateTakenTimestamp = async (frontPath, backPath) => {
-  for (const filePath of [frontPath, backPath]) {
-    if (!filePath) {
-      continue;
-    }
+const readSidecarSummary = async (filePath) => {
+  const sidecarPath = await resolveExistingSidecarPath(filePath);
+  return {
+    hasSidecar: sidecarPath !== null,
+    rawDate: sidecarPath ? await readRawDateFromSidecar(sidecarPath) : "",
+  };
+};
 
-    const normalizedDate = normalizeXmpDate(await readSidecarRawDate(filePath));
-    const timestamp = normalizedDate ? Date.parse(normalizedDate) : Number.NaN;
-    if (!Number.isNaN(timestamp)) {
-      return timestamp;
-    }
-  }
+const readSidecarRawDate = async (filePath) =>
+  (await readSidecarSummary(filePath)).rawDate;
 
-  return null;
+/**
+ * Converts a raw sidecar date to a timestamp for sorting by date taken.
+ * @param {string} rawDate - The raw date read from a sidecar file.
+ * @returns {number|null} The timestamp, or null when the date is missing or invalid.
+ */
+const toDateTakenTimestamp = (rawDate) => {
+  const normalizedDate = normalizeXmpDate(rawDate);
+  const timestamp = normalizedDate ? Date.parse(normalizedDate) : Number.NaN;
+  return Number.isNaN(timestamp) ? null : timestamp;
+};
+
+/**
+ * Converts a raw sidecar date to the calendar day shown in the thumbnail grid.
+ * Accepts ISO dates and the EXIF-style "YYYY:MM:DD" form some tools write into XMP.
+ * @param {string} rawDate - The raw date read from a sidecar file.
+ * @returns {string} The date as YYYY-MM-DD, or an empty string when there is no valid date.
+ */
+const toSidecarDay = (rawDate) => {
+  const match = normalizeXmpDate(rawDate).match(
+    /^(\d{4})[-:](\d{2})[-:](\d{2})/,
+  );
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : "";
 };
 
 /**
@@ -944,7 +992,7 @@ const describePair = (frontPath, backPath) => {
  * Supports date-taken sorting when available, falling back to file creation time.
  * @param {string[]} filePaths - The array of image file paths in the directory.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean}>>}
+ * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
  */
 const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
@@ -967,10 +1015,19 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
       const frontCandidate =
         items.find((item) => item.side === "a") ?? items[0];
       const backCandidate = items.find((item) => item.side === "b") ?? null;
-      const [frontStats, backStats] = await Promise.all([
+      // The A sidecar is read once: it is the source of truth for the grid date and filters.
+      const [frontStats, backStats, frontSidecar] = await Promise.all([
         fs.stat(frontCandidate.filePath),
         backCandidate ? fs.stat(backCandidate.filePath) : null,
+        readSidecarSummary(frontCandidate.filePath),
       ]);
+      const frontDateTaken = toDateTakenTimestamp(frontSidecar.rawDate);
+      const dateTaken =
+        shouldReadDateTaken && frontDateTaken === null && backCandidate
+          ? toDateTakenTimestamp(
+              await readSidecarRawDate(backCandidate.filePath),
+            )
+          : frontDateTaken;
 
       return {
         ...describePair(
@@ -981,14 +1038,9 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
         backVersion: backStats ? buildImageVersion(backStats) : null,
         createdAt:
           frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
-        dateTaken: shouldReadDateTaken
-          ? await readDateTakenTimestamp(
-              frontCandidate.filePath,
-              backCandidate?.filePath,
-            )
-          : null,
-        hasSidecar:
-          (await resolveExistingSidecarPath(frontCandidate.filePath)) !== null,
+        dateTaken: shouldReadDateTaken ? dateTaken : null,
+        hasSidecar: frontSidecar.hasSidecar,
+        sidecarDate: toSidecarDay(frontSidecar.rawDate),
       };
     }),
   );
@@ -1774,6 +1826,145 @@ const configurePreviewCache = (options) => {
 };
 
 /**
+ * Renders a small WebP thumbnail that fits within a square of the given size.
+ * Applies EXIF auto-orientation first, so saved rotations show in the thumbnail.
+ * @param {string} filePath - The path to the source image file.
+ * @param {{size?: number, rotation?: number}} [options] - The long-edge size in pixels and an extra rotation.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ */
+const renderThumbnail = async (
+  filePath,
+  { size = defaultThumbnailSize, rotation = 0 } = {},
+) => {
+  const normalizedRotation = normalizeRotationValue(rotation);
+  let image = sharp(filePath).autoOrient();
+  if (normalizedRotation) {
+    image = image.rotate(normalizedRotation);
+  }
+  return image
+    .resize(size, size, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 60 })
+    .toBuffer();
+};
+
+/**
+ * Clamps a requested thumbnail size to the supported range.
+ * @param {*} value - The requested long-edge size in pixels.
+ * @returns {number} A whole number of pixels, or the default size when the value is invalid.
+ */
+const normalizeThumbnailSize = (value) => {
+  const size = Math.round(Number(value));
+  if (!Number.isFinite(size) || size <= 0) {
+    return defaultThumbnailSize;
+  }
+  return Math.min(Math.max(size, minThumbnailSize), maxThumbnailSize);
+};
+
+/**
+ * Builds the cache key for a thumbnail. Any rewrite of the file (rotation, metadata write)
+ * changes its version, and a rename changes its path, so stale thumbnails are never served.
+ * @param {string} filePath - The path to the source image file.
+ * @param {import("node:fs").Stats} stats - The file's current stats.
+ * @param {number} size - The thumbnail size in pixels.
+ * @param {number} rotation - The normalized extra rotation.
+ * @returns {string} The cache key.
+ */
+const getThumbnailCacheKey = (filePath, stats, size, rotation) =>
+  [path.resolve(filePath), buildImageVersion(stats), rotation, size].join("|");
+
+/**
+ * Returns a cached thumbnail and marks it as recently used.
+ * @param {string} key - The thumbnail cache key.
+ * @returns {Buffer|null} The cached thumbnail, or null when it is not cached.
+ */
+const readCachedThumbnail = (key) => {
+  const buffer = thumbnailCache.get(key);
+  if (!buffer) {
+    return null;
+  }
+  thumbnailCache.delete(key);
+  thumbnailCache.set(key, buffer);
+  return buffer;
+};
+
+/**
+ * Stores a thumbnail, evicting the least recently used ones beyond the cache size limit.
+ * @param {string} key - The thumbnail cache key.
+ * @param {Buffer} buffer - The rendered thumbnail.
+ */
+const cacheThumbnail = (key, buffer) => {
+  if (buffer.length > maxThumbnailCacheBytes) {
+    return;
+  }
+  const previous = thumbnailCache.get(key);
+  if (previous) {
+    thumbnailCacheBytes -= previous.length;
+    thumbnailCache.delete(key);
+  }
+  thumbnailCache.set(key, buffer);
+  thumbnailCacheBytes += buffer.length;
+
+  for (const [oldestKey, oldestBuffer] of thumbnailCache) {
+    if (thumbnailCacheBytes <= maxThumbnailCacheBytes) {
+      break;
+    }
+    thumbnailCache.delete(oldestKey);
+    thumbnailCacheBytes -= oldestBuffer.length;
+  }
+};
+
+/**
+ * Returns a thumbnail from the memory cache, or renders it while holding the file's lock and
+ * one of the limited render slots shared with previews. A request whose signal is aborted
+ * before rendering starts is dropped, so thumbnails for a grid the user has left do not
+ * delay previews or metadata writes.
+ * @param {string} filePath - The path to the source image file.
+ * @param {{size?: number, rotation?: number, signal?: AbortSignal}} [options] - The thumbnail size, extra rotation, and cancellation signal.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ * @throws {DOMException} An AbortError when the signal is aborted before rendering starts.
+ */
+const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
+  const thumbnailSize = normalizeThumbnailSize(size);
+  const normalizedRotation = normalizeRotationValue(rotation);
+  const cached = readCachedThumbnail(
+    getThumbnailCacheKey(
+      filePath,
+      await fs.stat(filePath),
+      thumbnailSize,
+      normalizedRotation,
+    ),
+  );
+  if (cached) {
+    return cached;
+  }
+
+  signal?.throwIfAborted();
+  return runImageFileOperation([filePath], async () => {
+    signal?.throwIfAborted();
+    // A write queued ahead of this request may have changed the file.
+    const key = getThumbnailCacheKey(
+      filePath,
+      await fs.stat(filePath),
+      thumbnailSize,
+      normalizedRotation,
+    );
+    const current = readCachedThumbnail(key);
+    if (current) {
+      return current;
+    }
+    const buffer = await withPreviewRenderSlot(() => {
+      signal?.throwIfAborted();
+      return renderThumbnail(filePath, {
+        size: thumbnailSize,
+        rotation: normalizedRotation,
+      });
+    });
+    cacheThumbnail(key, buffer);
+    return buffer;
+  });
+};
+
+/**
  * Queues an image rotation request while holding the lock for both images.
  * @param {{frontPath: string|null, frontRotation: number|null, backPath: string|null, backRotation: number|null}} request - The rotation request with file paths and angles.
  * @returns {Promise<{ok: boolean, updatedFiles: number, results: Array}>>} The result of applying rotations to both images (if present).
@@ -2042,17 +2233,21 @@ export {
   buildImmichUploadArguments,
   configurePreviewCache,
   defaultSortBy,
+  defaultThumbnailSize,
   getGroupKey,
   getImagePreview,
   getImageVersion,
   getImmichFailureHints,
   getImmichGoDiagnostics,
+  getThumbnail,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,
   normalizeSortBy,
+  normalizeThumbnailSize,
   readDirectory,
   readSidecarMetadataForFile as readSidecarMetadata,
+  renderThumbnail,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,

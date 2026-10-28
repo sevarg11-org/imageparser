@@ -90,6 +90,12 @@ const createWebApi = (): ImageParserApi => ({
   // Built locally: the version changes whenever the file is rewritten, so the browser can cache each URL.
   getPreviewDataUrl: async (filePath, version) =>
     `api/image?${new URLSearchParams({ path: filePath, v: version }).toString()}`,
+  getThumbnailUrl: (filePath, size, version) =>
+    `api/image?${new URLSearchParams({
+      path: filePath,
+      thumb: String(size),
+      v: version,
+    }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>
