@@ -104,7 +104,17 @@
 
 .directory-browser-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
+  align-items: center;
+}
+
+.directory-browser-nested {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-right: 0.5rem;
+  cursor: pointer;
 }
 
 .directory-browser {

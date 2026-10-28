@@ -123,6 +123,11 @@
   gap: 10px 14px;
 }
 
+.folder-nested {
+  margin-left: -8px;
+  opacity: 0.85;
+}
+
 .processed-toggle {
   appearance: none;
   border: 1px solid #334155;

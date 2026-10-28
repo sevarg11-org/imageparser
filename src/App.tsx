@@ -57,7 +57,10 @@ import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
 
 type ImagePair = {
   id: string;
+  /** The A-file name, prefixed with its folder relative to the loaded folder in nested mode. */
   imageLabel: string;
+  /** The pair's folder relative to the loaded folder, with forward slashes; "" for the loaded folder itself. */
+  relativeDirectory: string;
   frontPath: string;
   backPath: string | null;
   frontVersion: string;
@@ -171,8 +174,13 @@ declare global {
       readDirectory: (
         directoryPath: string,
         sortBy: SortOption,
+        recursive: boolean,
       ) => Promise<{
         directoryPath: string;
+        /** Whether nested folders were included. */
+        recursive: boolean;
+        /** The number of folders scanned, including the loaded folder. */
+        folderCount: number;
         files: ImagePair[];
         recentTags: string[];
         folderState: FolderState;
@@ -203,11 +211,13 @@ declare global {
       setFolderDate: (
         directoryPath: string,
         date: string,
+        recursive: boolean,
       ) => Promise<SetFolderDateResult>;
       setDoNotUpload: (request: {
         frontPath: string;
         backPath: string | null;
         value: boolean;
+        relativeDirectory: string;
       }) => Promise<SetDoNotUploadResult>;
       setFolderProcessed: (
         directoryPath: string,
@@ -219,6 +229,7 @@ declare global {
       uploadToImmich: (
         settings: ImmichSettings,
         directoryPath: string,
+        recursive: boolean,
       ) => Promise<ImmichUploadResult>;
       onImmichUploadProgress: (
         listener: (progress: ImmichUploadProgress) => void,
@@ -264,6 +275,26 @@ const formatImageStatus = (index: number, total: number, label: string) =>
  * @returns A formatted status string.
  */
 const formatSavedStatus = (label: string) => `Saved changes to ${label}.`;
+
+/**
+ * Formats the status shown after a folder loads, naming the folder count in nested mode.
+ * @param result - The number of groups found, whether nested folders were included, and how many folders were scanned.
+ * @returns A formatted status string.
+ */
+const describeLoadedGroups = ({
+  files,
+  recursive,
+  folderCount,
+}: {
+  files: readonly unknown[];
+  recursive: boolean;
+  folderCount: number;
+}) =>
+  `Loaded ${files.length} photo group${files.length === 1 ? "" : "s"}${
+    recursive
+      ? ` from ${folderCount} folder${folderCount === 1 ? "" : "s"}`
+      : ""
+  }.`;
 
 /**
  * Moves a map entry to a new key, for example after a "Do not upload" rename changes a group's ID.
@@ -746,6 +777,9 @@ const readPairSidecars = (
 function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
+  // Set from the folder browser on each load; sorting, set-date, and upload keep using it.
+  const [includeNested, setIncludeNested] = useState(false);
+  const [folderCount, setFolderCount] = useState(0);
   const [folderState, setFolderState] = useState<FolderState>(
     unprocessedFolderState,
   );
@@ -1626,6 +1660,7 @@ function App() {
         frontPath: pair.frontPath,
         backPath: pair.backPath,
         value: !pair.doNotUpload,
+        relativeDirectory: pair.relativeDirectory,
       });
       setPairs((current) =>
         current.map((candidate) =>
@@ -2019,10 +2054,10 @@ function App() {
     setStatus("Scanning directory for photos...");
 
     try {
-      const selectedDirectory = await chooseDirectory(
+      const selection = await chooseDirectory(
         window.electronAPI.browseDirectory,
       );
-      if (!selectedDirectory) {
+      if (!selection) {
         setStatus("No directory selected.");
         return;
       }
@@ -2045,15 +2080,22 @@ function App() {
         return;
       }
 
-      setStatus("Scanning directory for photos...");
+      setStatus(
+        selection.recursive
+          ? "Scanning directory and nested folders for photos..."
+          : "Scanning directory for photos...",
+      );
       const result = await window.electronAPI.readDirectory(
-        selectedDirectory,
+        selection.path,
         sortBy,
+        selection.recursive,
       );
       unsavedEditsRef.current.clear();
       sidecarPrefetchRef.current.clear();
       setImageVersions({});
       setDirectoryPath(result.directoryPath);
+      setIncludeNested(result.recursive);
+      setFolderCount(result.folderCount);
       setFolderState(result.folderState);
       setHasSubfolders(result.hasSubfolders);
       setIncludeSubfoldersInProcessed(false);
@@ -2070,13 +2112,15 @@ function App() {
       setSelectedPairId(result.files[0]?.id ?? null);
 
       if (!result.files.length) {
-        setStatus("No supported images were found in that directory.");
+        setStatus(
+          result.recursive
+            ? "No supported images were found in that directory or its nested folders."
+            : "No supported images were found in that directory.",
+        );
         return;
       }
 
-      setStatus(
-        `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
-      );
+      setStatus(describeLoadedGroups(result));
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -2112,10 +2156,12 @@ function App() {
         const result = await window.electronAPI.readDirectory(
           directoryPath,
           nextSortBy,
+          includeNested,
         );
         sidecarPrefetchRef.current.clear();
         setImageVersions({});
         setSortBy(nextSortBy);
+        setFolderCount(result.folderCount);
         setFolderState(result.folderState);
         setHasSubfolders(result.hasSubfolders);
         setIsHydrated(false);
@@ -2126,9 +2172,7 @@ function App() {
         setSelectedPairId(
           filterImagePairs(result.files, imageFilter, new Set())[0]?.id ?? null,
         );
-        setStatus(
-          `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
-        );
+        setStatus(describeLoadedGroups(result));
       } catch (error) {
         setStatus(
           error instanceof Error
@@ -2142,6 +2186,7 @@ function App() {
     [
       directoryPath,
       imageFilter,
+      includeNested,
       persistReviewedPair,
       resetSavedPairs,
       waitForPendingSaves,
@@ -2277,13 +2322,18 @@ function App() {
       setImmichOutput("");
       setHasUploadedFolder(false);
       isImmichOutputFollowingRef.current = true;
-      setImmichStatus("Uploading the selected directory to Immich...");
+      setImmichStatus(
+        includeNested
+          ? "Uploading the selected directory and its nested folders to Immich..."
+          : "Uploading the selected directory to Immich...",
+      );
       const savedSettings =
         await electronApi.saveImmichSettings(immichSettings);
       setImmichSettings(savedSettings);
       const result = await electronApi.uploadToImmich(
         savedSettings,
         directoryPath,
+        includeNested,
       );
       setImmichOutput(result.output);
       setHasUploadedFolder(result.ok);
@@ -2322,7 +2372,11 @@ function App() {
       }
 
       await waitForPendingSaves();
-      const result = await electronApi.setFolderDate(directoryPath, date);
+      const result = await electronApi.setFolderDate(
+        directoryPath,
+        date,
+        includeNested,
+      );
       const failedLabels = result.errors.map((error) => error.split(": ")[0]);
       // The bulk write skips flagged groups and groups that already have a sidecar.
       const datedPairIds = pairs
@@ -2444,6 +2498,7 @@ function App() {
     isSettingFolderProcessed ||
     isTogglingDoNotUpload;
   const flaggedPairCount = pairs.filter((pair) => pair.doNotUpload).length;
+  const folderNestedDescription = `(including nested folders, ${folderCount} folder${folderCount === 1 ? "" : "s"})`;
   const selectedDoNotUploadError =
     doNotUploadError && doNotUploadError.pairId === selectedPair?.id
       ? doNotUploadError.message
@@ -2481,7 +2536,11 @@ function App() {
               className="secondary-button"
               onClick={() => setIsSetFolderDateModalOpen(true)}
               disabled={isTransitionLocked}
-              title="Set a date for all images in this folder that don't yet have saved metadata"
+              title={
+                includeNested
+                  ? "Set a date for all images in this folder and its nested folders that don't yet have saved metadata"
+                  : "Set a date for all images in this folder that don't yet have saved metadata"
+              }
             >
               {isSettingFolderDate ? "Setting date\u2026" : "Set date for all"}
             </button>
@@ -2507,6 +2566,11 @@ function App() {
         {directoryPath ? (
           <div className="folder-processed">
             <strong>{directoryPath}</strong>
+            {includeNested ? (
+              <span className="folder-nested">
+                {folderNestedDescription}
+              </span>
+            ) : null}
             <button
               type="button"
               className="processed-toggle"
@@ -3058,7 +3122,10 @@ function App() {
             </summary>
 
             <div className="immich-content">
-              <span className="immich-directory">Uploads: {directoryPath}</span>
+              <span className="immich-directory">
+                Uploads: {directoryPath}
+                {includeNested ? ` ${folderNestedDescription}` : ""}
+              </span>
               {flaggedPairCount > 0 ? (
                 <span className="immich-skipped">
                   {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
@@ -3255,6 +3322,7 @@ function App() {
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}
         totalCount={pairs.length}
+        nestedFolderCount={includeNested ? folderCount : null}
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}

@@ -43,8 +43,8 @@ const loadDirectoryListing = (directoryPath: string | null) => {
 // Mirrors the Electron preload bridge so App.tsx works unchanged when served over HTTP.
 const createWebApi = (): ImageParserApi => ({
   browseDirectory: loadDirectoryListing,
-  readDirectory: (directoryPath, sortBy) =>
-    postJson("api/read-directory", { directoryPath, sortBy }),
+  readDirectory: (directoryPath, sortBy, recursive) =>
+    postJson("api/read-directory", { directoryPath, sortBy, recursive }),
   readSidecarMetadata: (filePath) =>
     postJson("api/read-sidecar-metadata", { filePath }),
   saveMetadata: (metadata) => postJson("api/save-metadata", metadata),
@@ -59,8 +59,8 @@ const createWebApi = (): ImageParserApi => ({
     }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
-  setFolderDate: (directoryPath, date) =>
-    postJson("api/set-folder-date", { directoryPath, date }),
+  setFolderDate: (directoryPath, date, recursive) =>
+    postJson("api/set-folder-date", { directoryPath, date, recursive }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
   setFolderProcessed: (directoryPath, value, includeSubfolders) =>
     postJson("api/folder-processed", {
@@ -70,8 +70,8 @@ const createWebApi = (): ImageParserApi => ({
     }),
   loadImmichSettings: () => requestJson("api/immich-settings"),
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
-  uploadToImmich: (settings, directoryPath) =>
-    postJson("api/upload-to-immich", { settings, directoryPath }),
+  uploadToImmich: (settings, directoryPath, recursive) =>
+    postJson("api/upload-to-immich", { settings, directoryPath, recursive }),
   onImmichUploadProgress: (listener) => {
     const eventSource = new EventSource("api/immich-progress");
     eventSource.onmessage = (event) => {
