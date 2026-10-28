@@ -90,3 +90,48 @@ test("the preview cache evicts the least recently used previews over its size ca
     assert.notEqual(await cache.get(keys[2]), null);
   });
 });
+
+test("pruning removes temporary files left by interrupted writes but keeps newer ones", async () => {
+  await withCacheDirectory(async (directory) => {
+    const key = buildPreviewCacheKey("/photos/a.jpg", stats, 0);
+    const orphanName = `.${key}.00000000-0000-4000-8000-000000000000.tmp`;
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, orphanName), Buffer.alloc(10));
+    const past = new Date(Date.now() - 60_000);
+    await fs.utimes(path.join(directory, orphanName), past, past);
+
+    const cache = createPreviewCache({ directory });
+    // A write in progress after the cache was created must survive the prune.
+    const inProgressName = `.${key}.11111111-1111-4111-8111-111111111111.tmp`;
+    await fs.writeFile(path.join(directory, inProgressName), Buffer.alloc(10));
+    const future = new Date(Date.now() + 60_000);
+    await fs.utimes(path.join(directory, inProgressName), future, future);
+
+    await cache.prune();
+
+    assert.deepEqual(await fs.readdir(directory), [inProgressName]);
+  });
+});
+
+test("pruning trims a cache left over its size cap without a new write", async () => {
+  await withCacheDirectory(async (directory) => {
+    const keys = ["a", "b", "c"].map((name) =>
+      buildPreviewCacheKey(`/photos/${name}.jpg`, stats, 0),
+    );
+    await fs.mkdir(directory, { recursive: true });
+    for (const [index, key] of keys.entries()) {
+      const filePath = path.join(directory, `${key}.webp`);
+      await fs.writeFile(filePath, Buffer.alloc(100));
+      const usedAt = new Date(Date.now() - (keys.length - index) * 60_000);
+      await fs.utimes(filePath, usedAt, usedAt);
+    }
+
+    await createPreviewCache({ directory, maxBytes: 250 }).prune();
+
+    // 300 bytes over a 250-byte cap is trimmed to 80% of the cap by dropping the oldest entry.
+    assert.deepEqual(
+      (await fs.readdir(directory)).sort(),
+      [`${keys[1]}.webp`, `${keys[2]}.webp`].sort(),
+    );
+  });
+});

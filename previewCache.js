@@ -56,6 +56,7 @@ export const createPreviewCache = ({
   maxBytes = defaultPreviewCacheMaxBytes,
 }) => {
   const cacheDirectory = path.resolve(directory);
+  const createdAt = Date.now();
   let knownBytes = null;
   let pruning = null;
 
@@ -66,17 +67,40 @@ export const createPreviewCache = ({
     return path.join(cacheDirectory, `${key}.webp`);
   };
 
-  const listEntries = async () => {
-    let names;
+  const readNames = async () => {
     try {
-      names = await fs.readdir(cacheDirectory);
+      return await fs.readdir(cacheDirectory);
     } catch (error) {
       if (error?.code === "ENOENT") {
         return [];
       }
       throw error;
     }
+  };
 
+  /**
+   * Removes temporary files left by writes that were interrupted before this cache was created.
+   * Newer temporary files may belong to writes still in progress, so they are kept.
+   * @param {string[]} names - The file names in the cache directory.
+   */
+  const removeOrphanedTemporaryFiles = (names) =>
+    Promise.all(
+      names
+        .filter((name) => /^\.[0-9a-f]{64}\.[0-9a-f-]{36}\.tmp$/.test(name))
+        .map(async (name) => {
+          const filePath = path.join(cacheDirectory, name);
+          try {
+            const stats = await fs.stat(filePath);
+            if (stats.mtimeMs < createdAt) {
+              await fs.rm(filePath, { force: true });
+            }
+          } catch {
+            // A missing or locked file is left for the next prune.
+          }
+        }),
+    );
+
+  const listEntries = async (names) => {
     const entries = await Promise.all(
       names
         .filter((name) => /^[0-9a-f]{64}\.webp$/.test(name))
@@ -94,12 +118,15 @@ export const createPreviewCache = ({
   };
 
   /**
-   * Removes the least recently used entries until the cache is at most 80% of its cap.
+   * Removes orphaned temporary files and the least recently used entries until the cache is at
+   * most 80% of its cap.
    */
   const prune = () => {
     pruning ??= (async () => {
       try {
-        const entries = await listEntries();
+        const names = await readNames();
+        await removeOrphanedTemporaryFiles(names);
+        const entries = await listEntries(names);
         let totalBytes = entries.reduce((sum, entry) => sum + entry.size, 0);
         if (totalBytes > maxBytes) {
           const targetBytes = maxBytes * 0.8;

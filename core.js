@@ -1768,6 +1768,8 @@ const getImagePreview = (filePath, rotation = 0) =>
  */
 const configurePreviewCache = (options) => {
   previewCache = createPreviewCache(options);
+  // Trim the cache left by earlier runs without delaying startup.
+  void previewCache.prune().catch(() => {});
   return previewCache;
 };
 
