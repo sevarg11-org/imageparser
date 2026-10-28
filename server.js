@@ -33,7 +33,7 @@ import {
   normalizeSortBy,
   normalizeThumbnailSize,
   readDirectory,
-  readFolderState,
+  readFolderEntry,
   readSidecarMetadata,
   runImmichUpload,
   saveImmichSettings,
@@ -620,7 +620,7 @@ const toRootRelativeName = (folderPath) =>
  * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {URL} url - The parsed URL object containing query parameters.
  * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, imageCount, and
- *   the folder's processed state; each directory also carries its processed state.
+ *   the folder's processed state; each directory also carries its processed state and filesystem date.
  *   A parent of "" means the virtual root; null means there is nothing above.
  * @throws {HttpError} 400 if the path is not a directory.
  */
@@ -636,11 +636,9 @@ const handleBrowse = async (user, url) => {
         selectable: false,
         directories: (
           await Promise.all(
-            allowedRoots.map(async (allowedRoot) => ({
-              name: toRootRelativeName(allowedRoot),
-              path: allowedRoot,
-              ...(await readFolderState(allowedRoot)),
-            })),
+            allowedRoots.map((allowedRoot) =>
+              readFolderEntry(toRootRelativeName(allowedRoot), allowedRoot),
+            ),
           )
         ).sort((left, right) =>
           left.name.localeCompare(right.name, undefined, { numeric: true }),

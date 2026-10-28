@@ -1,8 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './DirectoryBrowser.css'
+import {
+  describeFolderDate,
+  FOLDER_SORT_STORAGE_KEY,
+  folderSortFieldLabels,
+  parseFolderSort,
+  sortFolders,
+  type FolderDate,
+  type FolderSort,
+  type FolderSortField,
+} from './folderSort'
 import { describeFolderState, type FolderState } from './folderState'
 
-export type DirectoryEntry = FolderState & { name: string; path: string }
+export type DirectoryEntry = FolderState & FolderDate & { name: string; path: string }
 
 // The listed folder's own processed state is always false for a virtual root.
 export type DirectoryListing = FolderState & {
@@ -33,6 +43,22 @@ const ProcessedMark = ({ state }: { state: FolderState }) =>
     </span>
   ) : null
 
+const readFolderSort = () => {
+  try {
+    return parseFolderSort(window.localStorage.getItem(FOLDER_SORT_STORAGE_KEY))
+  } catch {
+    return parseFolderSort(null)
+  }
+}
+
+const rememberFolderSort = (sort: FolderSort) => {
+  try {
+    window.localStorage.setItem(FOLDER_SORT_STORAGE_KEY, JSON.stringify(sort))
+  } catch {
+    // Remembering the sort is a convenience; sorting still works without storage.
+  }
+}
+
 const isSelectable = (listing: DirectoryListing) => listing.selectable !== false
 
 const isDesktopListing = (listing: DirectoryListing) => listing.rootPath === null
@@ -58,6 +84,18 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
   const [listing, setListing] = useState<DirectoryListing | null>(null)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(true)
+  const [sort, setSort] = useState(readFolderSort)
+
+  const updateSort = (nextSort: FolderSort) => {
+    setSort(nextSort)
+    rememberFolderSort(nextSort)
+  }
+
+  const sortedDirectories = useMemo(
+    () => (listing ? sortFolders(listing.directories, sort) : []),
+    [listing, sort],
+  )
+  const isAscending = sort.direction === 'ascending'
 
   const navigate = useCallback(async (directoryPath: string | null) => {
     setIsLoading(true)
@@ -113,6 +151,29 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             </span>
           ) : null}
         </p>
+        <div className="directory-browser-sort">
+          <label htmlFor="directory-browser-sort-field">Sort by</label>
+          <select
+            id="directory-browser-sort-field"
+            value={sort.field}
+            onChange={(event) => updateSort({ ...sort, field: event.target.value as FolderSortField })}
+          >
+            {Object.entries(folderSortFieldLabels).map(([field, label]) => (
+              <option key={field} value={field}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="secondary-button directory-browser-sort-direction"
+            aria-label={`Sort direction: ${isAscending ? 'Ascending' : 'Descending'}`}
+            title={`Sorted ${sort.direction}; switch to ${isAscending ? 'descending' : 'ascending'}`}
+            onClick={() => updateSort({ ...sort, direction: isAscending ? 'descending' : 'ascending' })}
+          >
+            <span aria-hidden="true">{isAscending ? '↑' : '↓'}</span> {isAscending ? 'Ascending' : 'Descending'}
+          </button>
+        </div>
       </header>
 
       <div className="directory-browser-body" aria-busy={isLoading}>
@@ -125,13 +186,17 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
               </button>
             </li>
           ) : null}
-          {listing?.directories.map((directory) => (
-            <li key={directory.path}>
-              <button type="button" disabled={isLoading} onClick={() => void navigate(directory.path)}>
-                <span aria-hidden="true">📁</span> {directory.name} <ProcessedMark state={directory} />
-              </button>
-            </li>
-          ))}
+          {sortedDirectories.map((directory) => {
+            const folderDate = sort.field === 'created' ? describeFolderDate(directory) : null
+            return (
+              <li key={directory.path}>
+                <button type="button" disabled={isLoading} onClick={() => void navigate(directory.path)}>
+                  <span aria-hidden="true">📁</span> {directory.name} <ProcessedMark state={directory} />
+                  {folderDate ? <span className="directory-browser-sort-value">{folderDate}</span> : null}
+                </button>
+              </li>
+            )
+          })}
           {listing && !listing.directories.length ? (
             <li className="directory-browser-empty">
               {isSelectable(listing)

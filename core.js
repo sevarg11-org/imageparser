@@ -1654,6 +1654,69 @@ const readFolderState = async (directoryPath) => {
 };
 
 /**
+ * How many subfolders a listing reads at once, so large folders do not open hundreds of files together.
+ * @type {number}
+ */
+const folderListingConcurrency = 16;
+
+/**
+ * Maps items through an async function, running at most `limit` calls at a time.
+ * @template T, R
+ * @param {T[]} items - The items to map.
+ * @param {number} limit - The maximum number of calls in flight.
+ * @param {(item: T) => Promise<R>} mapper - The async mapping function.
+ * @returns {Promise<R[]>} The results, in the same order as the items.
+ */
+const mapWithConcurrency = async (items, limit, mapper) => {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index]);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+};
+
+/**
+ * Reads when a folder was created on disk, for sorting the folder browser.
+ * Filesystems that do not report a creation time (birthtime 0, as on some NFS and SMB mounts) fall
+ * back to the modification time, and say so through `createdAtSource`.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<{createdAt: number|null, createdAtSource: "created"|"modified"|null}>}
+ *   The time in milliseconds and where it came from, or nulls when the folder cannot be read.
+ */
+const readFolderCreatedAt = async (directoryPath) => {
+  try {
+    const stats = await fs.stat(directoryPath);
+    return stats.birthtimeMs > 0
+      ? { createdAt: Math.floor(stats.birthtimeMs), createdAtSource: "created" }
+      : { createdAt: Math.floor(stats.mtimeMs), createdAtSource: "modified" };
+  } catch {
+    return { createdAt: null, createdAtSource: null };
+  }
+};
+
+/**
+ * Reads one folder browser entry: the folder's processed state and its filesystem date.
+ * @param {string} name - The name to show.
+ * @param {string} directoryPath - The folder's path.
+ * @returns {Promise<{name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null, createdAt: number|null, createdAtSource: "created"|"modified"|null}>}
+ *   The entry.
+ */
+const readFolderEntry = async (name, directoryPath) => {
+  const [state, created] = await Promise.all([
+    readFolderState(directoryPath),
+    readFolderCreatedAt(directoryPath),
+  ]);
+  return { name, path: directoryPath, ...state, ...created };
+};
+
+/**
  * Normalizes the name recorded as the person who marked a folder processed.
  * @param {*} actor - The signed-in or local user name.
  * @returns {string|null} The trimmed name, or null when there is none.
@@ -1766,11 +1829,11 @@ const setFolderProcessed = async (
 };
 
 /**
- * Lists the visible subfolders of a directory, with their processed state, and counts its supported images.
- * Reads one small marker file per subfolder.
+ * Lists the visible subfolders of a directory, with their processed state and filesystem date, and counts
+ * its supported images. Reads one small marker file and runs one stat per subfolder, a limited number at a time.
  * Callers are responsible for confining the path; the web server resolves it for the user first.
  * @param {string} directoryPath - The directory to list.
- * @returns {Promise<{directories: {name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null}[], imageCount: number, processed: boolean, processedAt: string|null, processedBy: string|null}>}
+ * @returns {Promise<{directories: {name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null, createdAt: number|null, createdAtSource: "created"|"modified"|null}[], imageCount: number, processed: boolean, processedAt: string|null, processedBy: string|null}>}
  *   The sorted subfolders, skipping hidden ones, the number of supported images directly inside the
  *   directory, and the directory's own processed state.
  * @throws {Error} If the path does not exist or is not a directory.
@@ -1782,17 +1845,13 @@ const listDirectory = async (directoryPath) => {
   }
 
   const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const directories = await Promise.all(
-    entries
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-      .map(async (entry) => {
-        const subfolderPath = path.join(directoryPath, entry.name);
-        return {
-          name: entry.name,
-          path: subfolderPath,
-          ...(await readFolderState(subfolderPath)),
-        };
-      }),
+  const directories = await mapWithConcurrency(
+    entries.filter(
+      (entry) => entry.isDirectory() && !entry.name.startsWith("."),
+    ),
+    folderListingConcurrency,
+    (entry) =>
+      readFolderEntry(entry.name, path.join(directoryPath, entry.name)),
   );
   directories.sort(compareFolderNames);
   const imageCount = entries.filter(
@@ -1811,8 +1870,8 @@ const listDirectory = async (directoryPath) => {
 /**
  * Lists the drive roots that are currently readable, such as C:\ and mapped network drives.
  * Only meaningful on Windows; other platforms have a single filesystem root.
- * @returns {Promise<{name: string, path: string, processed: false, processedAt: null, processedBy: null}[]>}
- *   The available drives in letter order. Drive roots are never marked processed.
+ * @returns {Promise<{name: string, path: string, processed: false, processedAt: null, processedBy: null, createdAt: null, createdAtSource: null}[]>}
+ *   The available drives in letter order. Drive roots are never marked processed and have no date.
  */
 const listDrives = async () => {
   const letters = Array.from({ length: 26 }, (_, index) =>
@@ -1827,6 +1886,8 @@ const listDrives = async () => {
           name: `${letter}:`,
           path: drivePath,
           ...unprocessedFolderState,
+          createdAt: null,
+          createdAtSource: null,
         };
       } catch {
         return null;
@@ -2516,6 +2577,7 @@ export {
   normalizeSortBy,
   normalizeThumbnailSize,
   readDirectory,
+  readFolderEntry,
   readFolderState,
   readSidecarMetadataForFile as readSidecarMetadata,
   renderThumbnail,

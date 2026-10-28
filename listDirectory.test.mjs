@@ -30,6 +30,20 @@ test("listDirectory lists visible subfolders in natural order", async () => {
   assert.equal(directories[0].path, path.join(dir, "folder 1"));
 });
 
+test("listDirectory reports each subfolder's filesystem date", async () => {
+  const { directories } = await listDirectory(dir);
+  const stats = await fs.stat(path.join(dir, "folder 1"));
+  const entry = directories.find((directory) => directory.name === "folder 1");
+  if (stats.birthtimeMs > 0) {
+    assert.equal(entry.createdAtSource, "created");
+    assert.equal(entry.createdAt, Math.floor(stats.birthtimeMs));
+  } else {
+    assert.equal(entry.createdAtSource, "modified");
+    assert.equal(entry.createdAt, Math.floor(stats.mtimeMs));
+  }
+  assert.equal(entry.processed, false);
+});
+
 test("listDirectory counts only supported images", async () => {
   const { imageCount } = await listDirectory(dir);
   assert.equal(imageCount, 3);
