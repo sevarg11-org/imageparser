@@ -255,6 +255,22 @@ const selectAllOnFocusProps = {
   },
 };
 
+/**
+ * Reports whether two paths name the same image, treating a "Do not upload" rename as the same file.
+ * Flagging inserts the _exclude marker before the side suffix or extension (img001_exclude_a.jpg).
+ * @param previousPath - The path of the shown image.
+ * @param nextPath - The path of the image to show.
+ * @returns True when the paths differ at most by the _exclude marker.
+ */
+const isSameImageFile = (previousPath: string, nextPath: string) => {
+  const withoutExcludeMarker = (filePath: string) =>
+    filePath.replace(/_exclude(?=[_.][^\\/]*$)/, "");
+  return (
+    previousPath === nextPath ||
+    withoutExcludeMarker(previousPath) === withoutExcludeMarker(nextPath)
+  );
+};
+
 type DisplayedPreview = {
   filePath: string;
   version: string;
@@ -267,9 +283,10 @@ type DisplayedPreview = {
 /**
  * Resolves the preview shown for one version of an image.
  * The web app builds the URL locally; Electron renders TIFF files in the main process.
- * When a save rewrites the shown file (a new date or an applied rotation gives it a new version), the new
- * preview is downloaded and decoded before it replaces the old one, together with its size. Until then the
- * old image stays, with the rotation it was shown with, so the picture never shrinks, blanks, or flips.
+ * When a save rewrites the shown file (a new date or an applied rotation gives it a new version), or a
+ * "Do not upload" toggle renames it, the new preview is downloaded and decoded before it replaces the old
+ * one, together with its size. Until then the old image stays, with the rotation it was shown with, so the
+ * picture never shrinks, blanks, or flips.
  * @param filePath - The path to the image file.
  * @param version - The file's version; it changes whenever the file is rewritten.
  * @param rotation - The CSS rotation for the current version, in degrees.
@@ -327,7 +344,7 @@ const useDisplayedPreview = (
       const previous = shownRef.current;
       if (
         src &&
-        previous.filePath === filePath &&
+        isSameImageFile(previous.filePath, filePath) &&
         previous.src &&
         previous.src !== src
       ) {
