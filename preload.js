@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>
     ipcRenderer.invoke("set-folder-date", { directoryPath, date }),
+  setDoNotUpload: (request) => ipcRenderer.invoke("set-do-not-upload", request),
   loadImmichSettings: () => ipcRenderer.invoke("load-immich-settings"),
   saveImmichSettings: (settings) =>
     ipcRenderer.invoke("save-immich-settings", settings),

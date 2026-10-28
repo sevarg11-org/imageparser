@@ -34,6 +34,7 @@ import {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setDoNotUpload,
   setFolderDate,
   shutdownCore,
 } from "./core.js";
@@ -817,6 +818,18 @@ const createApiRoutes = (secretCodec) => ({
       secretCodec,
       body,
     );
+  },
+  "POST /api/do-not-upload": async (request) => {
+    // Both images are confined to the user's folders; core renames only within their folder.
+    const body = await validateMetadataPaths(
+      request.user,
+      await readJsonBody(request),
+    );
+    return setDoNotUpload({
+      frontPath: body.frontPath,
+      backPath: body.backPath,
+      value: body.value,
+    });
   },
   "POST /api/set-folder-date": async (request) => {
     const body = await readJsonBody(request);

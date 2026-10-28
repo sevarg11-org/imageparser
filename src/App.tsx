@@ -33,7 +33,22 @@ type ImagePair = {
   frontPath: string;
   backPath: string | null;
   createdAt: number;
+  doNotUpload: boolean;
+  excludeMismatch: boolean;
   hasSidecar: boolean;
+};
+
+type SetDoNotUploadResult = Pick<
+  ImagePair,
+  | "id"
+  | "imageLabel"
+  | "frontPath"
+  | "backPath"
+  | "doNotUpload"
+  | "excludeMismatch"
+> & {
+  ok: boolean;
+  renamed: Array<{ from: string; to: string }>;
 };
 
 type SortField = "createdAt" | "dateTaken" | "fileName";
@@ -67,6 +82,7 @@ type SetFolderDateResult = {
   ok: boolean;
   updatedPairs: number;
   skippedPairs: number;
+  excludedPairs: number;
   errors: string[];
 };
 
@@ -135,6 +151,11 @@ declare global {
         directoryPath: string,
         date: string,
       ) => Promise<SetFolderDateResult>;
+      setDoNotUpload: (request: {
+        frontPath: string;
+        backPath: string | null;
+        value: boolean;
+      }) => Promise<SetDoNotUploadResult>;
       loadImmichSettings: () => Promise<ImmichSettings>;
       saveImmichSettings: (settings: ImmichSettings) => Promise<ImmichSettings>;
       uploadToImmich: (
@@ -499,7 +520,13 @@ function App() {
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
-  const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] = useState(false);
+  const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] =
+    useState(false);
+  const [isTogglingDoNotUpload, setIsTogglingDoNotUpload] = useState(false);
+  const [doNotUploadError, setDoNotUploadError] = useState<{
+    pairId: string;
+    message: string;
+  } | null>(null);
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0);
   const hasUserChangedRef = useRef(false);
   const dateInputRef = useRef<HTMLInputElement | null>(null);
@@ -1014,6 +1041,78 @@ function App() {
   );
 
   /**
+   * Flags the selected group "Do not upload", or clears the flag, by renaming its files.
+   * Unsaved metadata edits and rotations are saved first, so they land on the old file names
+   * before the rename. The pair is then replaced in place with its new paths, keeping it selected.
+   */
+  const toggleDoNotUpload = useCallback(async () => {
+    const electronApi = window.electronAPI;
+    if (
+      !electronApi ||
+      !selectedPair ||
+      isTogglingDoNotUpload ||
+      isPersistingRotation ||
+      isUploading ||
+      !isHydrated
+    ) {
+      return;
+    }
+
+    const pair = selectedPair;
+    setIsTogglingDoNotUpload(true);
+    setDoNotUploadError(null);
+
+    try {
+      if (hasUserChangedRef.current && !(await persistCurrentPair())) {
+        setDoNotUploadError({
+          pairId: pair.id,
+          message:
+            "The flag was not changed because unsaved changes could not be saved.",
+        });
+        return;
+      }
+
+      const result = await electronApi.setDoNotUpload({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        value: !pair.doNotUpload,
+      });
+      setPairs((current) =>
+        current.map((candidate) =>
+          candidate.id === pair.id
+            ? {
+                ...candidate,
+                id: result.id,
+                imageLabel: result.imageLabel,
+                frontPath: result.frontPath,
+                backPath: result.backPath,
+                doNotUpload: result.doNotUpload,
+                excludeMismatch: result.excludeMismatch,
+              }
+            : candidate,
+        ),
+      );
+    } catch (error) {
+      setDoNotUploadError({
+        pairId: pair.id,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to change the Do not upload flag.",
+      });
+    } finally {
+      setIsTogglingDoNotUpload(false);
+    }
+  }, [
+    isHydrated,
+    isPersistingRotation,
+    isTogglingDoNotUpload,
+    isUploading,
+    persistCurrentPair,
+    selectedPair,
+  ]);
+
+  /**
    * Handles keyboard events for navigation and image rotation hotkeys (q, w, e, r, arrow keys).
    * Rotates images on Q/W/E/R or navigates with arrow keys when inputs are not focused.
    */
@@ -1032,6 +1131,25 @@ function App() {
         Boolean(target?.closest(".immich-content input"));
 
       if (isPersistingRotation || isUploading || !isHydrated) {
+        return;
+      }
+
+      // Space toggles "Do not upload" except where it types text or activates a control.
+      const isDoNotUploadHotkeyBlocked =
+        isRotationHotkeyBlocked ||
+        event.repeat ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey ||
+        ["BUTTON", "SELECT", "TEXTAREA", "SUMMARY", "A"].includes(tagName) ||
+        (tagName === "INPUT" &&
+          ["checkbox", "radio", "range"].includes(
+            (target as HTMLInputElement).type,
+          )) ||
+        Boolean(target?.closest("dialog"));
+      if (key === " " && !isDoNotUploadHotkeyBlocked) {
+        event.preventDefault();
+        void toggleDoNotUpload();
         return;
       }
 
@@ -1088,6 +1206,7 @@ function App() {
     rotateImage,
     selectedIndex,
     selectedPair?.backPath,
+    toggleDoNotUpload,
   ]);
 
   /**
@@ -1575,6 +1694,11 @@ function App() {
             `Skipped ${result.skippedPairs} group${result.skippedPairs === 1 ? "" : "s"} with existing metadata.`,
           );
         }
+        if (result.excludedPairs > 0) {
+          parts.push(
+            `Skipped ${result.excludedPairs} group${result.excludedPairs === 1 ? "" : "s"} flagged Do not upload.`,
+          );
+        }
         if (parts.length === 0) {
           parts.push("No images without existing metadata were found.");
         }
@@ -1603,7 +1727,17 @@ function App() {
     Boolean(directoryPath) &&
     Boolean(immichSettings.serverUrl.trim()) &&
     Boolean(immichSettings.userApiKey.trim());
-  const isTransitionLocked = isBusy || isPersistingRotation || isUploading || isSettingFolderDate;
+  const isTransitionLocked =
+    isBusy ||
+    isPersistingRotation ||
+    isUploading ||
+    isSettingFolderDate ||
+    isTogglingDoNotUpload;
+  const flaggedPairCount = pairs.filter((pair) => pair.doNotUpload).length;
+  const selectedDoNotUploadError =
+    doNotUploadError && doNotUploadError.pairId === selectedPair?.id
+      ? doNotUploadError.message
+      : "";
   const isImageControlLocked = isTransitionLocked || !isHydrated;
   const imageStackStyle: ImageStackStyle = {
     "--collapsed-image-height": `${collapsedImageHeight}px`,
@@ -1824,7 +1958,49 @@ function App() {
                   </fieldset>
                 </div>
               </details>
+
+              <div className="do-not-upload">
+                <button
+                  type="button"
+                  className={`secondary-button do-not-upload-toggle${
+                    selectedPair?.doNotUpload
+                      ? " do-not-upload-toggle--active"
+                      : ""
+                  }`}
+                  aria-label="Do not upload"
+                  aria-pressed={selectedPair?.doNotUpload ?? false}
+                  aria-describedby="do-not-upload-help"
+                  title="Do not upload (Space)"
+                  onClick={() => void toggleDoNotUpload()}
+                  disabled={!selectedPair || isImageControlLocked}
+                >
+                  <svg
+                    className="do-not-upload-icon"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
+                  </svg>
+                </button>
+                <span id="do-not-upload-help" className="visually-hidden">
+                  Press Space to toggle. Flagged files are renamed with
+                  &ldquo;_exclude&rdquo; and skipped by Immich uploads.
+                </span>
+              </div>
             </div>
+
+            {selectedPair?.excludeMismatch ? (
+              <p className="do-not-upload-warning" role="status">
+                Only one side of this group is flagged Do not upload. Toggle the
+                flag to rename both sides to match.
+              </p>
+            ) : null}
+            {selectedDoNotUploadError ? (
+              <p className="do-not-upload-error" role="alert">
+                {selectedDoNotUploadError}
+              </p>
+            ) : null}
           </aside>
 
           <section className="viewer-panel">
@@ -1946,7 +2122,14 @@ function App() {
                 <>
                   <div className="image-card">
                     <div className="image-card-header">
-                      <div className="image-label">Front image</div>
+                      <div className="image-label">
+                        Front image
+                        {selectedPair?.doNotUpload ? (
+                          <span className="do-not-upload-badge">
+                            Do not upload
+                          </span>
+                        ) : null}
+                      </div>
                       <div className="image-actions">
                         <button
                           type="button"
@@ -2035,6 +2218,12 @@ function App() {
 
             <div className="immich-content">
               <span className="immich-directory">Uploads: {directoryPath}</span>
+              {flaggedPairCount > 0 ? (
+                <span className="immich-skipped">
+                  {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
+                  flagged Do not upload will be skipped.
+                </span>
+              ) : null}
 
               <div className="immich-grid">
                 <label>
