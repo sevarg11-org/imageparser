@@ -8,6 +8,7 @@ import { createKeyedQueue } from "./imageFileQueue.js";
 import {
   buildImageVersion,
   buildPreviewCacheKey,
+  buildThumbnailCacheKey,
   createPreviewCache,
 } from "./previewCache.js";
 
@@ -122,6 +123,13 @@ const previewMaxDimension = 2560;
  * @type {number}
  */
 const maxConcurrentPreviewRenders = 2;
+
+/**
+ * The number of thumbnails rendered at the same time. Thumbnails have their own slots, so a
+ * filling grid never delays the Review image.
+ * @type {number}
+ */
+const maxConcurrentThumbnailRenders = 2;
 
 /**
  * The preview cache, or null until configurePreviewCache is called.
@@ -2294,33 +2302,47 @@ const renderPreview = (filePath, rotation = 0) => {
     .toBuffer();
 };
 
-let activePreviewRenders = 0;
-const waitingPreviewRenders = [];
+/**
+ * Creates a limiter that runs at most the given number of renders at the same time.
+ * @param {number} maxConcurrent - The number of renders that may run at once.
+ * @returns {(operation: () => Promise<Buffer>) => Promise<Buffer>} Runs a render once a slot is free.
+ */
+const createRenderLimiter = (maxConcurrent) => {
+  let active = 0;
+  const waiting = [];
+
+  return async (operation) => {
+    if (active >= maxConcurrent) {
+      // The finishing render hands its slot straight to the next waiting render.
+      await new Promise((resolve) => waiting.push(resolve));
+    } else {
+      active += 1;
+    }
+
+    try {
+      return await operation();
+    } finally {
+      const next = waiting.shift();
+      if (next) {
+        next();
+      } else {
+        active -= 1;
+      }
+    }
+  };
+};
 
 /**
- * Runs a preview render once one of the limited render slots is free.
- * @param {() => Promise<Buffer>} operation - The render to run.
- * @returns {Promise<Buffer>} The render's result.
+ * Runs a preview render once one of the limited preview render slots is free.
  */
-const withPreviewRenderSlot = async (operation) => {
-  if (activePreviewRenders >= maxConcurrentPreviewRenders) {
-    // The finishing render hands its slot straight to the next waiting render.
-    await new Promise((resolve) => waitingPreviewRenders.push(resolve));
-  } else {
-    activePreviewRenders += 1;
-  }
+const withPreviewRenderSlot = createRenderLimiter(maxConcurrentPreviewRenders);
 
-  try {
-    return await operation();
-  } finally {
-    const next = waitingPreviewRenders.shift();
-    if (next) {
-      next();
-    } else {
-      activePreviewRenders -= 1;
-    }
-  }
-};
+/**
+ * Runs a thumbnail render once one of the limited thumbnail render slots is free.
+ */
+const withThumbnailRenderSlot = createRenderLimiter(
+  maxConcurrentThumbnailRenders,
+);
 
 /**
  * Returns a resized WebP preview of an image, from the preview cache when possible.
@@ -2389,6 +2411,19 @@ const renderThumbnail = async (
 };
 
 /**
+ * Renders a thumbnail from a cached preview, which is already oriented and rotated.
+ * Decoding the small preview is much cheaper than decoding a large original.
+ * @param {Buffer} preview - The cached WebP preview.
+ * @param {number} size - The long-edge size in pixels.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ */
+const renderThumbnailFromPreview = (preview, size) =>
+  sharp(preview)
+    .resize(size, size, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 60 })
+    .toBuffer();
+
+/**
  * Clamps a requested thumbnail size to the supported range.
  * @param {*} value - The requested long-edge size in pixels.
  * @returns {number} A whole number of pixels, or the default size when the value is invalid.
@@ -2455,10 +2490,44 @@ const cacheThumbnail = (key, buffer) => {
 };
 
 /**
- * Returns a thumbnail from the memory cache, or renders it while holding the file's lock and
- * one of the limited render slots shared with previews. A request whose signal is aborted
- * before rendering starts is dropped, so thumbnails for a grid the user has left do not
- * delay previews or metadata writes.
+ * Clears the in-memory thumbnail cache, as an app or container restart would.
+ * The on-disk preview cache keeps its thumbnails.
+ */
+const clearThumbnailMemoryCache = () => {
+  thumbnailCache.clear();
+  thumbnailCacheBytes = 0;
+};
+
+/**
+ * Returns a thumbnail from the memory cache or the on-disk preview cache.
+ * @param {string} filePath - The path to the source image file.
+ * @param {import("node:fs").Stats} stats - The file's current stats.
+ * @param {number} size - The thumbnail size in pixels.
+ * @param {number} rotation - The normalized extra rotation.
+ * @returns {Promise<Buffer|null>} The cached thumbnail, or null when it is not cached.
+ */
+const readStoredThumbnail = async (filePath, stats, size, rotation) => {
+  const memoryKey = getThumbnailCacheKey(filePath, stats, size, rotation);
+  const cached = readCachedThumbnail(memoryKey);
+  if (cached) {
+    return cached;
+  }
+  const cache = previewCache;
+  const stored = cache
+    ? await cache.get(buildThumbnailCacheKey(filePath, stats, rotation, size))
+    : null;
+  if (stored) {
+    cacheThumbnail(memoryKey, stored);
+  }
+  return stored;
+};
+
+/**
+ * Returns a thumbnail from the memory or on-disk cache without taking a render slot, or
+ * renders it while holding the file's lock and one of the thumbnail render slots. A thumbnail
+ * is built from the file's cached preview when one exists, and from the original otherwise.
+ * A request whose signal is aborted before rendering starts is dropped, so thumbnails for a
+ * grid the user has left do not delay previews or metadata writes.
  * @param {string} filePath - The path to the source image file.
  * @param {{size?: number, rotation?: number, signal?: AbortSignal}} [options] - The thumbnail size, extra rotation, and cancellation signal.
  * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
@@ -2467,13 +2536,11 @@ const cacheThumbnail = (key, buffer) => {
 const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
   const thumbnailSize = normalizeThumbnailSize(size);
   const normalizedRotation = normalizeRotationValue(rotation);
-  const cached = readCachedThumbnail(
-    getThumbnailCacheKey(
-      filePath,
-      await fs.stat(filePath),
-      thumbnailSize,
-      normalizedRotation,
-    ),
+  const cached = await readStoredThumbnail(
+    filePath,
+    await fs.stat(filePath),
+    thumbnailSize,
+    normalizedRotation,
   );
   if (cached) {
     return cached;
@@ -2483,24 +2550,47 @@ const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
   return runImageFileOperation([filePath], async () => {
     signal?.throwIfAborted();
     // A write queued ahead of this request may have changed the file.
-    const key = getThumbnailCacheKey(
+    const stats = await fs.stat(filePath);
+    const current = await readStoredThumbnail(
       filePath,
-      await fs.stat(filePath),
+      stats,
       thumbnailSize,
       normalizedRotation,
     );
-    const current = readCachedThumbnail(key);
     if (current) {
       return current;
     }
-    const buffer = await withPreviewRenderSlot(() => {
+    const cache = previewCache;
+    const preview = cache
+      ? await cache.get(
+          buildPreviewCacheKey(filePath, stats, normalizedRotation),
+        )
+      : null;
+    const buffer = await withThumbnailRenderSlot(() => {
       signal?.throwIfAborted();
-      return renderThumbnail(filePath, {
-        size: thumbnailSize,
-        rotation: normalizedRotation,
-      });
+      return preview
+        ? renderThumbnailFromPreview(preview, thumbnailSize)
+        : renderThumbnail(filePath, {
+            size: thumbnailSize,
+            rotation: normalizedRotation,
+          });
     });
-    cacheThumbnail(key, buffer);
+    cacheThumbnail(
+      getThumbnailCacheKey(filePath, stats, thumbnailSize, normalizedRotation),
+      buffer,
+    );
+    if (cache) {
+      // Storing the thumbnail does not touch the source file, so it does not need to hold the lock.
+      void cache.put(
+        buildThumbnailCacheKey(
+          filePath,
+          stats,
+          normalizedRotation,
+          thumbnailSize,
+        ),
+        buffer,
+      );
+    }
     return buffer;
   });
 };
@@ -2787,6 +2877,7 @@ export {
   allowedExtensions,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
+  clearThumbnailMemoryCache,
   configurePreviewCache,
   defaultSortBy,
   defaultThumbnailSize,

@@ -45,6 +45,29 @@ export const buildPreviewCacheKey = (filePath, stats, rotation) =>
     .digest("hex");
 
 /**
+ * Builds the cache key for a grid thumbnail of one version of an image.
+ * Thumbnails share the preview cache, so the key is tagged to never match a preview key.
+ * @param {string} filePath - The resolved path of the source image.
+ * @param {{size: number, mtimeMs: number, ctimeMs: number}} stats - The source image's stats.
+ * @param {number} rotation - The normalized rotation applied to the thumbnail.
+ * @param {number} size - The thumbnail's long-edge size in pixels.
+ * @returns {string} A hex SHA-256 key that is safe to use as a file name.
+ */
+export const buildThumbnailCacheKey = (filePath, stats, rotation, size) =>
+  createHash("sha256")
+    .update(
+      JSON.stringify([
+        previewFormatVersion,
+        "thumbnail",
+        path.resolve(filePath),
+        buildImageVersion(stats),
+        Number(rotation) || 0,
+        Number(size) || 0,
+      ]),
+    )
+    .digest("hex");
+
+/**
  * Creates a size-capped preview cache stored as files in one directory.
  * Entries are evicted least recently used first; a cache hit refreshes the entry's modification time.
  * Cache failures never break previews: reads that fail are misses and writes that fail are skipped.

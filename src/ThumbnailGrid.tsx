@@ -46,6 +46,9 @@ const LazyThumbnail = ({
 }: LazyThumbnailProps) => {
   const frameRef = useRef<HTMLSpanElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  // Once the load has started, the image has its source and the cell never needs a slot again.
+  // Queueing it again would take a slot that no load event ever releases.
+  const hasStartedRef = useRef(false);
   const [src, setSrc] = useState("");
   const [status, setStatus] = useState<"waiting" | "loaded" | "error">(
     "waiting",
@@ -59,8 +62,14 @@ const LazyThumbnail = ({
     }
 
     const stopObserving = observeVisibility(frame, (isVisible) => {
+      if (hasStartedRef.current) {
+        return;
+      }
       if (isVisible) {
-        loadQueue.enqueue(url, () => setSrc(url));
+        loadQueue.enqueue(url, () => {
+          hasStartedRef.current = true;
+          setSrc(url);
+        });
       } else {
         loadQueue.withdraw(url);
       }
