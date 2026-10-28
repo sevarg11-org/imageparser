@@ -90,6 +90,12 @@ const createWebApi = (): ImageParserApi => ({
   getPreviewDataUrl: async (filePath, rotation) =>
     (await postJson<{ url: string }>("api/preview-url", { filePath, rotation }))
       .url,
+  getThumbnailUrl: (filePath, size, version) =>
+    `api/image?${new URLSearchParams({
+      path: filePath,
+      thumb: String(size),
+      v: version,
+    }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>

@@ -9,6 +9,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
   saveMetadata: (metadata) => ipcRenderer.invoke("save-metadata", metadata),
   getPreviewDataUrl: (filePath, rotation) =>
     ipcRenderer.invoke("get-preview-data-url", filePath, rotation),
+  // Served by the read-only "imageparser-thumb" protocol registered in main.js.
+  getThumbnailUrl: (filePath, size, version) =>
+    `imageparser-thumb://thumbnail/?${new URLSearchParams({
+      path: filePath,
+      size: String(size),
+      v: version,
+    }).toString()}`,
   applyImageRotations: (request) =>
     ipcRenderer.invoke("apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>

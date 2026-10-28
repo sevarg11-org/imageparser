@@ -22,9 +22,15 @@ import {
   getEmptyFilterMessage,
   imageFilterOptions,
   isImageFilter,
+  isPairProcessed,
   type ImageFilter,
 } from "./imageFilters";
 import { SetFolderDateModal } from "./SetFolderDateModal";
+import { ThumbnailGrid } from "./ThumbnailGrid";
+import {
+  GRID_THUMBNAIL_SIZE,
+  type ThumbnailGridCell,
+} from "./thumbnailGridModel";
 import { fetchCurrentUser, type CurrentUser } from "./webApi";
 
 type ImagePair = {
@@ -33,10 +39,16 @@ type ImagePair = {
   frontPath: string;
   backPath: string | null;
   createdAt: number;
+  /** The A file's modification time when the folder was read; versions its thumbnail. */
+  modifiedAt: number;
   doNotUpload: boolean;
   excludeMismatch: boolean;
   hasSidecar: boolean;
+  /** The A-file XMP date as YYYY-MM-DD when the folder was read, or an empty string. */
+  sidecarDate: string;
 };
+
+type ViewMode = "grid" | "review";
 
 type SetDoNotUploadResult = Pick<
   ImagePair,
@@ -141,6 +153,11 @@ declare global {
         filePath: string,
         rotation: number,
       ) => Promise<string>;
+      getThumbnailUrl: (
+        filePath: string,
+        size: number,
+        version: string,
+      ) => string;
       applyImageRotations: (request: {
         frontPath: string;
         backPath: string | null;
@@ -206,6 +223,41 @@ const formatImageStatus = (index: number, total: number, label: string) =>
  * @returns A formatted status string.
  */
 const formatSavedStatus = (label: string) => `Saved changes to ${label}.`;
+
+/**
+ * Returns a copy of a map with one entry set, or the same map when the value is unchanged.
+ * @param map - The map to update.
+ * @param key - The key to set.
+ * @param value - The new value.
+ * @returns The updated map.
+ */
+const withMapEntry = <Value,>(
+  map: ReadonlyMap<string, Value>,
+  key: string,
+  value: Value,
+): ReadonlyMap<string, Value> =>
+  map.get(key) === value ? map : new Map(map).set(key, value);
+
+/**
+ * Moves a map entry to a new key, for example after a "Do not upload" rename changes a group's ID.
+ * @param map - The map to update.
+ * @param from - The old key.
+ * @param to - The new key.
+ * @returns The updated map, or the same map when there is nothing to move.
+ */
+const renameMapKey = <Value,>(
+  map: ReadonlyMap<string, Value>,
+  from: string,
+  to: string,
+): ReadonlyMap<string, Value> => {
+  if (from === to || !map.has(from)) {
+    return map;
+  }
+  const next = new Map(map);
+  next.set(to, next.get(from) as Value);
+  next.delete(from);
+  return next;
+};
 
 /**
  * Input props that select the whole value when the field gains focus, so typing replaces it.
@@ -469,6 +521,18 @@ function App() {
   const [filterSnapshotPairIds, setFilterSnapshotPairIds] = useState<
     ReadonlySet<string>
   >(() => new Set());
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [gridFocusPairId, setGridFocusPairId] = useState<string | null>(null);
+  // Dates saved and front images rotated since the folder was read, so the grid shows
+  // them without reloading. Kept apart from `pairs` because replacing the selected pair
+  // would reload its metadata in Review.
+  const [savedDates, setSavedDates] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
+  const [thumbnailVersions, setThumbnailVersions] = useState<
+    ReadonlyMap<string, number>
+  >(() => new Map());
+  const [metadataReloadKey, setMetadataReloadKey] = useState(0);
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -570,6 +634,8 @@ function App() {
     savedPairIdsRef.current = empty;
     setSavedPairIds(empty);
     setFilterSnapshotPairIds(empty);
+    setSavedDates(new Map());
+    setThumbnailVersions(new Map());
   }, []);
 
   const displayPairs = useMemo(
@@ -595,6 +661,26 @@ function App() {
     () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
+
+  const gridCells = useMemo<ThumbnailGridCell[]>(() => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      return [];
+    }
+    return displayPairs.map((pair) => ({
+      id: pair.id,
+      imageLabel: pair.imageLabel,
+      date: savedDates.get(pair.id) ?? pair.sidecarDate,
+      isPaired: pair.backPath !== null,
+      doNotUpload: pair.doNotUpload,
+      isUnprocessed: !pair.doNotUpload && !isPairProcessed(pair, savedPairIds),
+      thumbnailUrl: electronApi.getThumbnailUrl(
+        pair.frontPath,
+        GRID_THUMBNAIL_SIZE,
+        `${pair.modifiedAt}-${thumbnailVersions.get(pair.id) ?? 0}`,
+      ),
+    }));
+  }, [displayPairs, savedDates, savedPairIds, thumbnailVersions]);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -742,6 +828,9 @@ function App() {
       });
 
       hasUserChangedRef.current = false;
+      setSavedDates((current) =>
+        withMapEntry(current, pair.id, formValues.date.slice(0, 10)),
+      );
       if (!pair.hasSidecar) {
         markPairsSaved([pair.id]);
       }
@@ -801,6 +890,16 @@ function App() {
               remainingRotations[imageResult.field] = 0;
             }
           }
+          if (
+            result.results.some(
+              (imageResult) => imageResult.ok && imageResult.field === "front",
+            )
+          ) {
+            const pairId = selectedPair.id;
+            setThumbnailVersions((current) =>
+              withMapEntry(current, pairId, (current.get(pairId) ?? 0) + 1),
+            );
+          }
 
           setRotations(remainingRotations);
           const failures = result.results.filter(
@@ -843,6 +942,18 @@ function App() {
       return operation;
     },
     [clearPendingSave, metadata, rotations, savePairMetadata, selectedPair],
+  );
+
+  /**
+   * Saves the reviewed pair before the image list changes. Nothing is saved from the grid:
+   * it makes no edits, and Review's edits are saved on the way back to the grid. Saving
+   * there would write a default date for an image the user never opened.
+   * @returns True when it is safe to continue.
+   */
+  const persistReviewedPair = useCallback(
+    () =>
+      viewMode === "review" ? persistCurrentPair() : Promise.resolve(true),
+    [persistCurrentPair, viewMode],
   );
 
   /**
@@ -959,7 +1070,8 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [displayPairs.length, selectedIndex, selectedPair]);
+    // metadataReloadKey reloads the same pair after a bulk write such as "Set date for all".
+  }, [displayPairs.length, metadataReloadKey, selectedIndex, selectedPair]);
 
   /**
    * Debounces metadata saves and clears pending changes when conditions change.
@@ -1005,7 +1117,7 @@ function App() {
    * Focuses the date input field when the component becomes hydrated and a pair is selected.
    */
   useEffect(() => {
-    if (!selectedPair || !isHydrated) {
+    if (!selectedPair || !isHydrated || viewMode !== "review") {
       return;
     }
 
@@ -1017,7 +1129,7 @@ function App() {
     return () => {
       window.cancelAnimationFrame(frameId);
     };
-  }, [isHydrated, selectedPair]);
+  }, [isHydrated, selectedPair, viewMode]);
 
   /**
    * Rotates an image by a given delta value (in 90-degree increments).
@@ -1077,6 +1189,10 @@ function App() {
         backPath: pair.backPath,
         value: !pair.doNotUpload,
       });
+      setSavedDates((current) => renameMapKey(current, pair.id, result.id));
+      setThumbnailVersions((current) =>
+        renameMapKey(current, pair.id, result.id),
+      );
       setPairs((current) =>
         current.map((candidate) =>
           candidate.id === pair.id
@@ -1130,7 +1246,13 @@ function App() {
         target === tagInputRef.current ||
         Boolean(target?.closest(".immich-content input"));
 
-      if (isPersistingRotation || isUploading || !isHydrated) {
+      // Review shortcuts act on the selected image, which the grid does not show.
+      if (
+        viewMode !== "review" ||
+        isPersistingRotation ||
+        isUploading ||
+        !isHydrated
+      ) {
         return;
       }
 
@@ -1207,6 +1329,7 @@ function App() {
     selectedIndex,
     selectedPair?.backPath,
     toggleDoNotUpload,
+    viewMode,
   ]);
 
   /**
@@ -1471,7 +1594,7 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
@@ -1484,6 +1607,8 @@ function App() {
       setIsHydrated(false);
       setPairs(result.files);
       resetSavedPairs();
+      setViewMode("grid");
+      setGridFocusPairId(null);
       setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
@@ -1520,7 +1645,7 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
@@ -1539,8 +1664,7 @@ function App() {
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
         setSelectedPairId(
-          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ??
-            null,
+          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ?? null,
         );
         setStatus(
           `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
@@ -1555,7 +1679,7 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, imageFilter, persistCurrentPair, resetSavedPairs],
+    [directoryPath, imageFilter, persistReviewedPair, resetSavedPairs],
   );
 
   /**
@@ -1569,7 +1693,7 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
@@ -1586,8 +1710,48 @@ function App() {
       setSelectedPairId(firstPairId);
       setImageNumberInput("1");
     },
-    [imageFilter, pairs, persistCurrentPair, selectedPairId],
+    [imageFilter, pairs, persistReviewedPair, selectedPairId],
   );
+
+  /**
+   * Opens an image from the grid in Review. The grid makes no edits, so there is
+   * nothing to save first.
+   * @param pairId - The ID of the image group to review.
+   */
+  const openPairInReview = useCallback(
+    (pairId: string) => {
+      const index = displayPairs.findIndex((pair) => pair.id === pairId);
+      if (index === -1) {
+        return;
+      }
+
+      if (pairId !== selectedPairId) {
+        setIsHydrated(false);
+        setSelectedPairId(pairId);
+      }
+      setImageNumberInput(String(index + 1));
+      setViewMode("review");
+    },
+    [displayPairs, selectedPairId],
+  );
+
+  /**
+   * Saves pending edits to the reviewed image, then returns to the grid with that
+   * image focused. Stays in Review when the edits cannot be saved; the status bar
+   * explains why.
+   */
+  const returnToGrid = useCallback(async () => {
+    if (viewMode === "grid") {
+      return;
+    }
+
+    if (hasUserChangedRef.current && !(await persistCurrentPair())) {
+      return;
+    }
+
+    setGridFocusPairId(selectedPair?.id ?? null);
+    setViewMode("grid");
+  }, [persistCurrentPair, selectedPair, viewMode]);
 
   /**
    * Updates an Immich setting field with a new value and persists it to storage.
@@ -1620,7 +1784,7 @@ function App() {
 
     try {
       setImmichStatus("Applying pending image rotation before upload...");
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         setImmichStatus(
           "Upload stopped because an image rotation could not be persisted.",
         );
@@ -1676,6 +1840,22 @@ function App() {
 
       const result = await electronApi.setFolderDate(directoryPath, date);
       const failedLabels = result.errors.map((error) => error.split(": ")[0]);
+      // The bulk write skips flagged groups and groups that already have a sidecar.
+      const datedPairIds = pairs
+        .filter(
+          (pair) =>
+            !pair.doNotUpload &&
+            !isPairProcessed(pair, savedPairIdsRef.current) &&
+            !failedLabels.includes(pair.imageLabel),
+        )
+        .map((pair) => pair.id);
+      setSavedDates((current) => {
+        const next = new Map(current);
+        for (const id of datedPairIds) {
+          next.set(id, date);
+        }
+        return next;
+      });
       markPairsSaved(
         pairs
           .filter((pair) => !failedLabels.includes(pair.imageLabel))
@@ -1713,6 +1893,7 @@ function App() {
       // Reload the current pair's metadata to reflect any write that may have
       // affected the currently displayed image.
       setIsHydrated(false);
+      setMetadataReloadKey((current) => current + 1);
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -1794,217 +1975,30 @@ function App() {
         </section>
       ) : (
         <main className="workspace">
-          <aside className="metadata-panel">
-            <div className="metadata-grid">
-              <fieldset className="metadata-date">
-                <legend>Date</legend>
-                <div className="date-segments">
-                  <input
-                    ref={dateInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={2}
-                    aria-label="Month"
-                    value={dateSegments.month}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("month", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("month")}
-                    onKeyDown={(event) =>
-                      void handleDateKeyDown(event, "month")
-                    }
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                  <span aria-hidden="true">/</span>
-                  <input
-                    ref={dayInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={2}
-                    aria-label="Day"
-                    value={dateSegments.day}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("day", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("day")}
-                    onKeyDown={(event) => void handleDateKeyDown(event, "day")}
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                  <span aria-hidden="true">/</span>
-                  <input
-                    ref={yearInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={4}
-                    aria-label="Year"
-                    value={dateSegments.year}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("year", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("year")}
-                    onKeyDown={(event) => void handleDateKeyDown(event, "year")}
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                </div>
-              </fieldset>
-
-              <label className="metadata-description">
-                Description
-                <input
-                  ref={descriptionInputRef}
-                  type="text"
-                  value={metadata.description}
-                  {...selectAllOnFocusProps}
-                  onChange={(event) =>
-                    updateFormField("description", event.target.value)
-                  }
-                  placeholder="Image description"
-                  onKeyDown={(event) => void handleDescriptionKeyDown(event)}
-                  disabled={isPersistingRotation || isUploading}
-                />
-              </label>
-
-              <details
-                className="metadata-details"
-                open={isMetadataEntryExpanded}
-                onToggle={(event) =>
-                  setIsMetadataEntryExpanded(event.currentTarget.open)
-                }
+          <div className="view-bar">
+            <div className="view-switch" role="group" aria-label="View">
+              <button
+                type="button"
+                aria-pressed={viewMode === "grid"}
+                onClick={() => void returnToGrid()}
+                disabled={isTransitionLocked}
               >
-                <summary className="metadata-details-summary">
-                  <span>Tags</span>
-                  <span className="metadata-details-action">
-                    {isMetadataEntryExpanded ? "Collapse" : "Expand"}
-                  </span>
-                </summary>
-                <div className="metadata-details-content">
-                  <div className="metadata-tags">
-                    <label htmlFor="new-tag">Tags</label>
-                    <div className="tag-entry">
-                      <input
-                        id="new-tag"
-                        ref={tagInputRef}
-                        type="text"
-                        value={tagInput}
-                        onChange={(event) => setTagInput(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === ",") {
-                            event.preventDefault();
-                            addTag();
-                          }
-                        }}
-                        placeholder="Type a new tag"
-                        disabled={isPersistingRotation || isUploading}
-                      />
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={addTag}
-                        disabled={
-                          !tagInput.trim() ||
-                          isPersistingRotation ||
-                          isUploading
-                        }
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-
-                  {metadata.tags.length ? (
-                    <div className="selected-tags" aria-label="Selected tags">
-                      {metadata.tags.map((tag) => (
-                        <button
-                          key={tag.toLocaleLowerCase()}
-                          type="button"
-                          onClick={() => toggleTag(tag)}
-                          disabled={isPersistingRotation || isUploading}
-                          aria-label={`Remove ${tag}`}
-                        >
-                          {tag} <span aria-hidden="true">&times;</span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  <fieldset className="recent-tags">
-                    <legend>Recent tags</legend>
-                    {recentTags.length ? (
-                      <div className="recent-tag-options">
-                        {recentTags.map((tag) => (
-                          <label key={tag.toLocaleLowerCase()}>
-                            <input
-                              type="checkbox"
-                              checked={metadata.tags.some(
-                                (selectedTag) =>
-                                  selectedTag.toLocaleLowerCase() ===
-                                  tag.toLocaleLowerCase(),
-                              )}
-                              onChange={() => toggleTag(tag)}
-                              disabled={isPersistingRotation || isUploading}
-                            />
-                            <span>{tag}</span>
-                          </label>
-                        ))}
-                      </div>
-                    ) : (
-                      <span className="field-help">
-                        Tags from recently modified XMP files appear here.
-                      </span>
-                    )}
-                  </fieldset>
-                </div>
-              </details>
-
-              <div className="do-not-upload">
-                <button
-                  type="button"
-                  className={`secondary-button do-not-upload-toggle${
-                    selectedPair?.doNotUpload
-                      ? " do-not-upload-toggle--active"
-                      : ""
-                  }`}
-                  aria-label="Do not upload"
-                  aria-pressed={selectedPair?.doNotUpload ?? false}
-                  aria-describedby="do-not-upload-help"
-                  title="Do not upload (Space)"
-                  onClick={() => void toggleDoNotUpload()}
-                  disabled={!selectedPair || isImageControlLocked}
-                >
-                  <svg
-                    className="do-not-upload-icon"
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
-                    focusable="false"
-                  >
-                    <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
-                  </svg>
-                </button>
-                <span id="do-not-upload-help" className="visually-hidden">
-                  Press Space to toggle. Flagged files are renamed with
-                  &ldquo;_exclude&rdquo; and skipped by Immich uploads.
-                </span>
-              </div>
+                Grid
+              </button>
+              <button
+                type="button"
+                aria-pressed={viewMode === "review"}
+                onClick={() => {
+                  if (selectedPair) {
+                    openPairInReview(selectedPair.id);
+                  }
+                }}
+                disabled={!selectedPair || isTransitionLocked}
+              >
+                Review
+              </button>
             </div>
-
-            {selectedPair?.excludeMismatch ? (
-              <p className="do-not-upload-warning" role="status">
-                Only one side of this group is flagged Do not upload. Toggle the
-                flag to rename both sides to match.
-              </p>
-            ) : null}
-            {selectedDoNotUploadError ? (
-              <p className="do-not-upload-error" role="alert">
-                {selectedDoNotUploadError}
-              </p>
-            ) : null}
-          </aside>
-
-          <section className="viewer-panel">
-            <div className="viewer-toolbar">
+            <div className="view-bar-controls">
               <label className="sort-control">
                 <span>Sort by</span>
                 <select
@@ -2051,159 +2045,408 @@ function App() {
                   ))}
                 </select>
               </label>
-              <label
-                className="size-control"
-                title={
-                  isExpanded
-                    ? "Image height applies to the collapsed view"
-                    : undefined
-                }
-              >
-                <span>Image height</span>
-                <input
-                  type="range"
-                  min={MIN_COLLAPSED_IMAGE_HEIGHT}
-                  max={MAX_COLLAPSED_IMAGE_HEIGHT}
-                  step={COLLAPSED_IMAGE_HEIGHT_STEP}
-                  value={collapsedImageHeight}
-                  onChange={(event) =>
-                    setCollapsedImageHeight(
-                      clampCollapsedImageHeight(Number(event.target.value)),
-                    )
-                  }
-                  aria-valuetext={`${collapsedImageHeight} pixels`}
-                  disabled={isExpanded}
-                />
-                <output aria-hidden="true">{collapsedImageHeight}px</output>
-              </label>
-              <button
-                type="button"
-                onClick={() => void navigateToIndex(selectedIndex - 1)}
-                disabled={selectedIndex === 0 || isImageControlLocked}
-              >
-                Previous
-              </button>
-
-              <label className="image-counter">
-                <span className="visually-hidden">Go to image</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={displayPairs.length}
-                  value={imageNumberInput}
-                  onChange={(event) => setImageNumberInput(event.target.value)}
-                  onKeyDown={handleImageNumberKeyDown}
-                  disabled={isImageControlLocked}
-                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
-                />
-                <span aria-hidden="true">/ {displayPairs.length}</span>
-              </label>
-              <button
-                type="button"
-                onClick={() => void navigateToIndex(selectedIndex + 1)}
-                disabled={
-                  selectedIndex >= displayPairs.length - 1 ||
-                  isImageControlLocked
-                }
-              >
-                Next
-              </button>
             </div>
+          </div>
 
-            <div
-              className={`image-stack${
-                !selectedPair || !selectedPair.backPath || isExpanded
-                  ? " image-stack--single"
-                  : ""
-              }${isExpanded ? " image-stack--expanded" : ""}`}
-              style={imageStackStyle}
-            >
-              {displayPairs.length > 0 ? (
-                <>
-                  <div className="image-card">
-                    <div className="image-card-header">
-                      <div className="image-label">
-                        Front image
-                        {selectedPair?.doNotUpload ? (
-                          <span className="do-not-upload-badge">
-                            Do not upload
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="image-actions">
-                        <button
-                          type="button"
-                          onClick={() => rotateImage("front", -90)}
-                          disabled={isImageControlLocked}
-                        >
-                          Rotate left
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => rotateImage("front", 90)}
-                          disabled={isImageControlLocked}
-                        >
-                          Rotate right
-                        </button>
-                        <button
-                          type="button"
-                          onClick={toggleExpanded}
-                          disabled={isImageControlLocked}
-                        >
-                          {isExpanded ? "Collapse" : "Expand"}
-                        </button>
-                      </div>
+          {viewMode === "grid" ? (
+            <section className="viewer-panel grid-panel" aria-label="Images">
+              <ThumbnailGrid
+                key={directoryPath}
+                cells={gridCells}
+                focusCellId={gridFocusPairId}
+                emptyMessage={getEmptyFilterMessage(imageFilter, pairs.length)}
+                onOpen={openPairInReview}
+              />
+            </section>
+          ) : (
+            <>
+              <aside className="metadata-panel">
+                <div className="metadata-grid">
+                  <fieldset className="metadata-date">
+                    <legend>Date</legend>
+                    <div className="date-segments">
+                      <input
+                        ref={dateInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        aria-label="Month"
+                        value={dateSegments.month}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("month", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("month")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "month")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
+                      <span aria-hidden="true">/</span>
+                      <input
+                        ref={dayInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        aria-label="Day"
+                        value={dateSegments.day}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("day", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("day")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "day")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
+                      <span aria-hidden="true">/</span>
+                      <input
+                        ref={yearInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={4}
+                        aria-label="Year"
+                        value={dateSegments.year}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("year", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("year")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "year")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
                     </div>
-                    <MagnifiedImage
-                      filePath={selectedPair?.frontPath ?? ""}
-                      altText={`${selectedPair?.imageLabel ?? ""}`}
-                      rotation={rotations.front}
-                    />
-                  </div>
+                  </fieldset>
 
-                  {selectedPair && selectedPair.backPath ? (
-                    <div className="image-card">
-                      <div className="image-card-header">
-                        <div className="image-label">Back image</div>
-                        <div className="image-actions">
+                  <label className="metadata-description">
+                    Description
+                    <input
+                      ref={descriptionInputRef}
+                      type="text"
+                      value={metadata.description}
+                      {...selectAllOnFocusProps}
+                      onChange={(event) =>
+                        updateFormField("description", event.target.value)
+                      }
+                      placeholder="Image description"
+                      onKeyDown={(event) =>
+                        void handleDescriptionKeyDown(event)
+                      }
+                      disabled={isPersistingRotation || isUploading}
+                    />
+                  </label>
+
+                  <details
+                    className="metadata-details"
+                    open={isMetadataEntryExpanded}
+                    onToggle={(event) =>
+                      setIsMetadataEntryExpanded(event.currentTarget.open)
+                    }
+                  >
+                    <summary className="metadata-details-summary">
+                      <span>Tags</span>
+                      <span className="metadata-details-action">
+                        {isMetadataEntryExpanded ? "Collapse" : "Expand"}
+                      </span>
+                    </summary>
+                    <div className="metadata-details-content">
+                      <div className="metadata-tags">
+                        <label htmlFor="new-tag">Tags</label>
+                        <div className="tag-entry">
+                          <input
+                            id="new-tag"
+                            ref={tagInputRef}
+                            type="text"
+                            value={tagInput}
+                            onChange={(event) =>
+                              setTagInput(event.target.value)
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === ",") {
+                                event.preventDefault();
+                                addTag();
+                              }
+                            }}
+                            placeholder="Type a new tag"
+                            disabled={isPersistingRotation || isUploading}
+                          />
                           <button
                             type="button"
-                            onClick={() => rotateImage("back", -90)}
-                            disabled={isImageControlLocked}
+                            className="secondary-button"
+                            onClick={addTag}
+                            disabled={
+                              !tagInput.trim() ||
+                              isPersistingRotation ||
+                              isUploading
+                            }
                           >
-                            Rotate left
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => rotateImage("back", 90)}
-                            disabled={isImageControlLocked}
-                          >
-                            Rotate right
-                          </button>
-                          <button
-                            type="button"
-                            onClick={toggleExpanded}
-                            disabled={isImageControlLocked}
-                          >
-                            {isExpanded ? "Collapse" : "Expand"}
+                            Add
                           </button>
                         </div>
                       </div>
-                      <MagnifiedImage
-                        filePath={selectedPair?.backPath ?? ""}
-                        altText={`${selectedPair?.imageLabel ?? ""} backside`}
-                        rotation={rotations.back}
-                      />
+
+                      {metadata.tags.length ? (
+                        <div
+                          className="selected-tags"
+                          aria-label="Selected tags"
+                        >
+                          {metadata.tags.map((tag) => (
+                            <button
+                              key={tag.toLocaleLowerCase()}
+                              type="button"
+                              onClick={() => toggleTag(tag)}
+                              disabled={isPersistingRotation || isUploading}
+                              aria-label={`Remove ${tag}`}
+                            >
+                              {tag} <span aria-hidden="true">&times;</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <fieldset className="recent-tags">
+                        <legend>Recent tags</legend>
+                        {recentTags.length ? (
+                          <div className="recent-tag-options">
+                            {recentTags.map((tag) => (
+                              <label key={tag.toLocaleLowerCase()}>
+                                <input
+                                  type="checkbox"
+                                  checked={metadata.tags.some(
+                                    (selectedTag) =>
+                                      selectedTag.toLocaleLowerCase() ===
+                                      tag.toLocaleLowerCase(),
+                                  )}
+                                  onChange={() => toggleTag(tag)}
+                                  disabled={isPersistingRotation || isUploading}
+                                />
+                                <span>{tag}</span>
+                              </label>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="field-help">
+                            Tags from recently modified XMP files appear here.
+                          </span>
+                        )}
+                      </fieldset>
                     </div>
-                  ) : null}
-                </>
-              ) : (
-                <p role="status">
-                  {getEmptyFilterMessage(imageFilter, pairs.length)}
-                </p>
-              )}
-            </div>
-          </section>
+                  </details>
+
+                  <div className="do-not-upload">
+                    <button
+                      type="button"
+                      className={`secondary-button do-not-upload-toggle${
+                        selectedPair?.doNotUpload
+                          ? " do-not-upload-toggle--active"
+                          : ""
+                      }`}
+                      aria-label="Do not upload"
+                      aria-pressed={selectedPair?.doNotUpload ?? false}
+                      aria-describedby="do-not-upload-help"
+                      title="Do not upload (Space)"
+                      onClick={() => void toggleDoNotUpload()}
+                      disabled={!selectedPair || isImageControlLocked}
+                    >
+                      <svg
+                        className="do-not-upload-icon"
+                        viewBox="0 0 24 24"
+                        aria-hidden="true"
+                        focusable="false"
+                      >
+                        <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
+                      </svg>
+                    </button>
+                    <span id="do-not-upload-help" className="visually-hidden">
+                      Press Space to toggle. Flagged files are renamed with
+                      &ldquo;_exclude&rdquo; and skipped by Immich uploads.
+                    </span>
+                  </div>
+                </div>
+
+                {selectedPair?.excludeMismatch ? (
+                  <p className="do-not-upload-warning" role="status">
+                    Only one side of this group is flagged Do not upload. Toggle
+                    the flag to rename both sides to match.
+                  </p>
+                ) : null}
+                {selectedDoNotUploadError ? (
+                  <p className="do-not-upload-error" role="alert">
+                    {selectedDoNotUploadError}
+                  </p>
+                ) : null}
+              </aside>
+
+              <section className="viewer-panel">
+                <div className="viewer-toolbar">
+                  <button
+                    type="button"
+                    className="back-to-grid"
+                    onClick={() => void returnToGrid()}
+                    disabled={isTransitionLocked}
+                  >
+                    <span aria-hidden="true">&larr;</span> Back to grid
+                  </button>
+                  <label
+                    className="size-control"
+                    title={
+                      isExpanded
+                        ? "Image height applies to the collapsed view"
+                        : undefined
+                    }
+                  >
+                    <span>Image height</span>
+                    <input
+                      type="range"
+                      min={MIN_COLLAPSED_IMAGE_HEIGHT}
+                      max={MAX_COLLAPSED_IMAGE_HEIGHT}
+                      step={COLLAPSED_IMAGE_HEIGHT_STEP}
+                      value={collapsedImageHeight}
+                      onChange={(event) =>
+                        setCollapsedImageHeight(
+                          clampCollapsedImageHeight(Number(event.target.value)),
+                        )
+                      }
+                      aria-valuetext={`${collapsedImageHeight} pixels`}
+                      disabled={isExpanded}
+                    />
+                    <output aria-hidden="true">{collapsedImageHeight}px</output>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void navigateToIndex(selectedIndex - 1)}
+                    disabled={selectedIndex === 0 || isImageControlLocked}
+                  >
+                    Previous
+                  </button>
+
+                  <label className="image-counter">
+                    <span className="visually-hidden">Go to image</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={displayPairs.length}
+                      value={imageNumberInput}
+                      onChange={(event) =>
+                        setImageNumberInput(event.target.value)
+                      }
+                      onKeyDown={handleImageNumberKeyDown}
+                      disabled={isImageControlLocked}
+                      aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
+                    />
+                    <span aria-hidden="true">/ {displayPairs.length}</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void navigateToIndex(selectedIndex + 1)}
+                    disabled={
+                      selectedIndex >= displayPairs.length - 1 ||
+                      isImageControlLocked
+                    }
+                  >
+                    Next
+                  </button>
+                </div>
+
+                <div
+                  className={`image-stack${
+                    !selectedPair || !selectedPair.backPath || isExpanded
+                      ? " image-stack--single"
+                      : ""
+                  }${isExpanded ? " image-stack--expanded" : ""}`}
+                  style={imageStackStyle}
+                >
+                  {displayPairs.length > 0 ? (
+                    <>
+                      <div className="image-card">
+                        <div className="image-card-header">
+                          <div className="image-label">
+                            Front image
+                            {selectedPair?.doNotUpload ? (
+                              <span className="do-not-upload-badge">
+                                Do not upload
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="image-actions">
+                            <button
+                              type="button"
+                              onClick={() => rotateImage("front", -90)}
+                              disabled={isImageControlLocked}
+                            >
+                              Rotate left
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => rotateImage("front", 90)}
+                              disabled={isImageControlLocked}
+                            >
+                              Rotate right
+                            </button>
+                            <button
+                              type="button"
+                              onClick={toggleExpanded}
+                              disabled={isImageControlLocked}
+                            >
+                              {isExpanded ? "Collapse" : "Expand"}
+                            </button>
+                          </div>
+                        </div>
+                        <MagnifiedImage
+                          filePath={selectedPair?.frontPath ?? ""}
+                          altText={`${selectedPair?.imageLabel ?? ""}`}
+                          rotation={rotations.front}
+                        />
+                      </div>
+
+                      {selectedPair && selectedPair.backPath ? (
+                        <div className="image-card">
+                          <div className="image-card-header">
+                            <div className="image-label">Back image</div>
+                            <div className="image-actions">
+                              <button
+                                type="button"
+                                onClick={() => rotateImage("back", -90)}
+                                disabled={isImageControlLocked}
+                              >
+                                Rotate left
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => rotateImage("back", 90)}
+                                disabled={isImageControlLocked}
+                              >
+                                Rotate right
+                              </button>
+                              <button
+                                type="button"
+                                onClick={toggleExpanded}
+                                disabled={isImageControlLocked}
+                              >
+                                {isExpanded ? "Collapse" : "Expand"}
+                              </button>
+                            </div>
+                          </div>
+                          <MagnifiedImage
+                            filePath={selectedPair?.backPath ?? ""}
+                            altText={`${selectedPair?.imageLabel ?? ""} backside`}
+                            rotation={rotations.back}
+                          />
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p role="status">
+                      {getEmptyFilterMessage(imageFilter, pairs.length)}
+                    </p>
+                  )}
+                </div>
+              </section>
+            </>
+          )}
 
           <details className="immich-panel">
             <summary className="immich-panel-summary">

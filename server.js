@@ -24,9 +24,11 @@ import {
   defaultSortBy,
   getImageRevision,
   getImmichGoDiagnostics,
+  getThumbnail,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeSortBy,
+  normalizeThumbnailSize,
   readDirectory,
   readSidecarMetadata,
   renderPreviewPng,
@@ -693,6 +695,62 @@ const handleBrowse = async (user, url) => {
 };
 
 /**
+ * Sends a cached WebP grid thumbnail for an already-confined image path.
+ * The ETag follows the image revision and modification time; thumbnail URLs carry a version,
+ * so browsers may reuse them without asking again. A request whose client disconnects while
+ * it waits in the image queue is dropped without rendering.
+ * @param {ClientRequest} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {string} filePath - The resolved image path inside the user's folders.
+ * @param {URL} url - The parsed URL; `thumb` holds the long-edge size in pixels.
+ * @returns {Promise<void>}
+ */
+const sendThumbnail = async (request, response, filePath, url) => {
+  const size = normalizeThumbnailSize(url.searchParams.get("thumb"));
+  const stats = await fs.stat(filePath);
+  const etag = `"thumb-${size}-${stats.size.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}-${getImageRevision(filePath)}"`;
+  const cacheHeaders = {
+    ETag: etag,
+    "Cache-Control": "private, max-age=86400",
+  };
+
+  if (request.headers["if-none-match"] === etag) {
+    response.writeHead(304, cacheHeaders);
+    response.end();
+    return;
+  }
+
+  const controller = new AbortController();
+  const abortIfUnanswered = () => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  };
+  response.once("close", abortIfUnanswered);
+  let thumbnail;
+  try {
+    thumbnail = await getThumbnail(filePath, {
+      size,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return;
+    }
+    throw error;
+  } finally {
+    response.off("close", abortIfUnanswered);
+  }
+
+  response.writeHead(200, {
+    ...cacheHeaders,
+    "Content-Type": "image/webp",
+    "Content-Length": thumbnail.length,
+  });
+  response.end(thumbnail);
+};
+
+/**
  * Handles an image request, returning the raw file or a rendered preview.
  * @param {ClientRequest} request - The HTTP request object.
  * @param {ServerResponse} response - The HTTP response object.
@@ -708,6 +766,11 @@ const handleImage = async (request, response, url) => {
   const extension = path.extname(filePath).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new HttpError(400, "Unsupported image type.");
+  }
+
+  if (url.searchParams.has("thumb")) {
+    await sendThumbnail(request, response, filePath, url);
+    return;
   }
 
   const rotation = Number(url.searchParams.get("rotation")) || 0;

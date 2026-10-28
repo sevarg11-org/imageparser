@@ -1,10 +1,19 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  protocol,
+  safeStorage,
+} from "electron";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  allowedExtensions,
   applyImageRotations,
   defaultSortBy,
   getImageRevision,
+  getThumbnail,
   loadImmichSettings,
   needsRenderedPreview,
   readDirectory,
@@ -91,6 +100,56 @@ const safeStorageCodec = Object.freeze({
  * @returns {string} The path to the settings directory.
  */
 const getSettingsDirectory = () => app.getPath("userData");
+
+/**
+ * The read-only URL scheme that serves grid thumbnails, so `<img>` elements can load them
+ * without holding base64 data URLs in renderer memory. The preload script builds its URLs.
+ * @type {string}
+ */
+const thumbnailScheme = "imageparser-thumb";
+
+// Custom schemes must be registered before the app is ready.
+protocol.registerSchemesAsPrivileged([
+  { scheme: thumbnailScheme, privileges: { standard: true, secure: true } },
+]);
+
+/**
+ * Serves a cached WebP thumbnail for a supported image file. Only GET requests for
+ * absolute paths to regular image files are answered; nothing can be written.
+ * @param {Request} request - The protocol request; `path` and `size` are query parameters.
+ * @returns {Promise<Response>} The thumbnail, or an empty error response.
+ */
+const handleThumbnailRequest = async (request) => {
+  const url = new URL(request.url);
+  const filePath = url.searchParams.get("path") ?? "";
+  if (
+    request.method !== "GET" ||
+    !path.isAbsolute(filePath) ||
+    !allowedExtensions.has(path.extname(filePath).toLowerCase())
+  ) {
+    return new Response(null, { status: 400 });
+  }
+
+  try {
+    if (!(await fs.stat(filePath)).isFile()) {
+      return new Response(null, { status: 404 });
+    }
+    const thumbnail = await getThumbnail(filePath, {
+      size: url.searchParams.get("size"),
+      signal: request.signal,
+    });
+    return new Response(thumbnail, {
+      headers: {
+        "Content-Type": "image/webp",
+        "Cache-Control": "private, max-age=86400",
+      },
+    });
+  } catch (error) {
+    return new Response(null, {
+      status: error?.code === "ENOENT" ? 404 : 500,
+    });
+  }
+};
 
 /**
  * Retrieves a preview data URL for an image file with optional rotation.
@@ -232,6 +291,7 @@ const createMainWindow = () => {
  * the app is ready, and recreates it if all windows are closed.
  */
 app.whenReady().then(() => {
+  protocol.handle(thumbnailScheme, handleThumbnailRequest);
   createMainWindow();
 
   app.on("activate", () => {
