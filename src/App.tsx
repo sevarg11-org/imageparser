@@ -862,7 +862,6 @@ function App() {
   const tagInputRef = useRef<HTMLInputElement | null>(null);
   const immichOutputRef = useRef<HTMLPreElement | null>(null);
   const isImmichOutputFollowingRef = useRef(true);
-  const saveTimeoutRef = useRef<number | null>(null);
 
   // Mirrors savedPairIds synchronously, so a filter change can snapshot a save
   // that finished in the same callback before React re-renders.
@@ -1063,13 +1062,6 @@ function App() {
     setIsExpanded((current) => !current);
   }, []);
 
-  const clearPendingSave = useCallback(() => {
-    if (saveTimeoutRef.current !== null) {
-      window.clearTimeout(saveTimeoutRef.current);
-      saveTimeoutRef.current = null;
-    }
-  }, []);
-
   /**
    * Records an edit to the current pair, so it is saved when the user moves on.
    */
@@ -1246,7 +1238,6 @@ function App() {
         return false;
       }
 
-      clearPendingSave();
       if (
         !needsSaveOnLeave({
           hasUserChanged: hasUserChangedRef.current,
@@ -1285,7 +1276,6 @@ function App() {
       }
     },
     [
-      clearPendingSave,
       isHydrated,
       metadata,
       rotations,
@@ -1523,7 +1513,8 @@ function App() {
   }, [displayPairs, imageVersions, isHydrated, selectedIndex, selectedPair]);
 
   /**
-   * Warns before leaving the web app while saves are pending or have failed.
+   * Warns before leaving the web app while saves are pending or have failed,
+   * or while the current pair has edits that have not been saved yet.
    * The desktop app instead waits for pending writes before it quits.
    */
   useEffect(() => {
@@ -1535,7 +1526,7 @@ function App() {
       if (
         pendingSavesRef.current.size ||
         unsavedEditsRef.current.size ||
-        saveTimeoutRef.current !== null
+        hasUserChangedRef.current
       ) {
         event.preventDefault();
       }
@@ -1544,45 +1535,6 @@ function App() {
     return () =>
       window.removeEventListener("beforeunload", warnAboutPendingSaves);
   }, []);
-
-  /**
-   * Debounces metadata saves while the user edits the current pair.
-   * Rotations are applied when the pair is left, so these saves only write metadata.
-   */
-  useEffect(() => {
-    const electronApi = window.electronAPI;
-    if (!selectedPair || !electronApi || !isHydrated) {
-      clearPendingSave();
-      return;
-    }
-
-    if (!hasUserChangedRef.current) {
-      return;
-    }
-
-    clearPendingSave();
-    if (!toIsoDate(dateSegmentsRef.current)) {
-      return;
-    }
-    saveTimeoutRef.current = window.setTimeout(() => {
-      saveTimeoutRef.current = null;
-      const pair = selectedPair;
-      void startPairSave(
-        pair,
-        metadata,
-        { front: 0, back: 0 },
-        editRevisionRef.current,
-      ).then((ok) => {
-        if (ok && selectedPairIdRef.current === pair.id) {
-          setStatus(formatSavedStatus(pair.imageLabel));
-        }
-      });
-    }, 350);
-
-    return () => {
-      clearPendingSave();
-    };
-  }, [clearPendingSave, selectedPair, metadata, isHydrated, startPairSave]);
 
   /**
    * Focuses the date input field when the component becomes hydrated and a pair is selected.
@@ -1911,7 +1863,6 @@ function App() {
   ) => {
     const digits = value.replace(/\D/g, "").slice(0, field === "year" ? 4 : 2);
     const next = { ...dateSegmentsRef.current, [field]: digits };
-    clearPendingSave();
     updateDateSegments(next);
 
     // Advance once the segment is complete, including single digits that cannot start a
@@ -2034,7 +1985,6 @@ function App() {
       return;
     }
 
-    clearPendingSave();
     updateDateSegments(next);
     const formValues =
       nextDate === metadata.date ? metadata : { ...metadata, date: nextDate };
