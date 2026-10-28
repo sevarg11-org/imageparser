@@ -8,6 +8,7 @@
   type FocusEvent as ReactFocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type SyntheticEvent,
 } from "react";
 import "./App.css";
 import {
@@ -254,54 +255,134 @@ const selectAllOnFocusProps = {
   },
 };
 
+type DisplayedPreview = {
+  filePath: string;
+  version: string;
+  src: string;
+  rotation: number;
+  naturalWidth: number;
+  naturalHeight: number;
+};
+
 /**
- * Resolves the preview source URL for one version of an image.
+ * Resolves the preview shown for one version of an image.
  * The web app builds the URL locally; Electron renders TIFF files in the main process.
- * Rotation is shown with CSS, so it never changes the URL.
+ * When a save rewrites the shown file (a new date or an applied rotation gives it a new version), the new
+ * preview is downloaded and decoded before it replaces the old one, together with its size. Until then the
+ * old image stays, with the rotation it was shown with, so the picture never shrinks, blanks, or flips.
  * @param filePath - The path to the image file.
  * @param version - The file's version; it changes whenever the file is rewritten.
- * @returns A resolved source URL for displaying the image preview.
+ * @param rotation - The CSS rotation for the current version, in degrees.
+ * @returns The shown source URL, the rotation to show it with, its natural size (0 until known), and a load handler for the image element.
  */
-const useResolvedPreviewSrc = (filePath: string, version: string) => {
-  const [src, setSrc] = useState("");
+const useDisplayedPreview = (
+  filePath: string,
+  version: string,
+  rotation: number,
+) => {
+  const [shown, setShown] = useState<DisplayedPreview>({
+    filePath: "",
+    version: "",
+    src: "",
+    rotation: 0,
+    naturalWidth: 0,
+    naturalHeight: 0,
+  });
+  const rotationRef = useRef(rotation);
+  const shownRef = useRef(shown);
+  const isCurrentVersion =
+    shown.filePath === filePath && shown.version === version;
+
+  // While the shown version is current, it keeps the latest rotation, ready for the next version swap.
+  if (isCurrentVersion && shown.rotation !== rotation) {
+    setShown({ ...shown, rotation });
+  }
+
+  useEffect(() => {
+    rotationRef.current = rotation;
+    shownRef.current = shown;
+  });
 
   useEffect(() => {
     let isActive = true;
 
-    const resolvePreviewUrl = async () => {
-      if (!filePath) {
-        setSrc("");
+    const resolvePreview = async () => {
+      let src = "";
+      if (filePath) {
+        try {
+          src = window.electronAPI
+            ? (await window.electronAPI.getPreviewDataUrl(filePath, version)) ||
+              toFileUrl(filePath)
+            : toFileUrl(filePath);
+        } catch {
+          src = toFileUrl(filePath);
+        }
+      }
+      if (!isActive) {
         return;
       }
 
-      if (!window.electronAPI) {
-        setSrc(toFileUrl(filePath));
-        return;
+      let naturalWidth = 0;
+      let naturalHeight = 0;
+      const previous = shownRef.current;
+      if (
+        src &&
+        previous.filePath === filePath &&
+        previous.src &&
+        previous.src !== src
+      ) {
+        const preloadedImage = new Image();
+        preloadedImage.src = src;
+        try {
+          await preloadedImage.decode();
+          naturalWidth = preloadedImage.naturalWidth;
+          naturalHeight = preloadedImage.naturalHeight;
+        } catch {
+          // Show the new version anyway; the image element reports its own loading errors.
+        }
+        if (!isActive) {
+          return;
+        }
       }
 
-      try {
-        const previewUrl = await window.electronAPI.getPreviewDataUrl(
-          filePath,
-          version,
-        );
-        if (isActive) {
-          setSrc(previewUrl || toFileUrl(filePath));
-        }
-      } catch {
-        if (isActive) {
-          setSrc(toFileUrl(filePath));
-        }
-      }
+      setShown({
+        filePath,
+        version,
+        src,
+        rotation: rotationRef.current,
+        naturalWidth,
+        naturalHeight,
+      });
     };
 
-    void resolvePreviewUrl();
+    void resolvePreview();
 
     return () => {
       isActive = false;
     };
   }, [filePath, version]);
 
-  return src;
+  /**
+   * Records the natural size of the shown image once the element has loaded it.
+   * @param event - The image element's load event.
+   */
+  const handleImageLoad = (event: SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth, naturalHeight } = event.currentTarget;
+    const loadedSrc = event.currentTarget.getAttribute("src");
+    setShown((current) =>
+      current.src === loadedSrc
+        ? { ...current, naturalWidth, naturalHeight }
+        : current,
+    );
+  };
+
+  return {
+    src: shown.src,
+    rotation: isCurrentVersion ? rotation : shown.rotation,
+    naturalWidth: shown.naturalWidth,
+    naturalHeight: shown.naturalHeight,
+    handleImageLoad,
+  };
 };
 
 const MAGNIFIER_LENS_SIZE = 160;
@@ -312,7 +393,7 @@ const MagnifiedImage = ({
   filePath,
   version,
   altText,
-  rotation,
+  rotation: requestedRotation,
   isExpanded,
   collapsedHeight,
 }: {
@@ -323,15 +404,12 @@ const MagnifiedImage = ({
   isExpanded: boolean;
   collapsedHeight: number;
 }) => {
-  const src = useResolvedPreviewSrc(filePath, version);
+  // The rotation that matches the shown image, which lags the requested one only while a new version loads.
+  const { src, rotation, naturalWidth, naturalHeight, handleImageLoad } =
+    useDisplayedPreview(filePath, version, requestedRotation);
   const [isLoading, setIsLoading] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
-  const [naturalSize, setNaturalSize] = useState<{
-    src: string;
-    width: number;
-    height: number;
-  } | null>(null);
   const [availableWidth, setAvailableWidth] = useState(0);
   const [lensStyle, setLensStyle] = useState<{
     left: number;
@@ -363,12 +441,11 @@ const MagnifiedImage = ({
 
   // A quarter turn swaps the visible width and height, so the image is sized and centred in a frame
   // that has the rotated proportions.
-  const knownSize = naturalSize?.src === src ? naturalSize : null;
   const rotatedBox =
-    rotation % 180 !== 0 && knownSize && availableWidth > 0
+    rotation % 180 !== 0 && naturalWidth > 0 && availableWidth > 0
       ? getRotatedImageBox({
-          naturalWidth: knownSize.width,
-          naturalHeight: knownSize.height,
+          naturalWidth,
+          naturalHeight,
           rotation,
           availableWidth,
           targetHeight: isExpanded ? null : collapsedHeight,
@@ -491,11 +568,7 @@ const MagnifiedImage = ({
           style={imageStyle}
           onLoad={(event) => {
             setIsLoading(false);
-            setNaturalSize({
-              src,
-              width: event.currentTarget.naturalWidth,
-              height: event.currentTarget.naturalHeight,
-            });
+            handleImageLoad(event);
           }}
         />
       </div>
