@@ -11,12 +11,20 @@
   type SyntheticEvent,
 } from "react";
 import "./App.css";
+import { chooseDirectory } from "./chooseDirectory";
 import {
   completeDateSegment,
   parseDateSegments,
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import type { DirectoryListing } from "./DirectoryBrowser";
+import {
+  describeFolderState,
+  unprocessedFolderState,
+  type FolderState,
+  type SetFolderProcessedResult,
+} from "./folderState";
 import {
   describeSaveFailure,
   describeUnsavedImages,
@@ -157,7 +165,9 @@ type ApplyImageRotationsResult = {
 declare global {
   interface Window {
     electronAPI?: {
-      chooseDirectory: () => Promise<string | null>;
+      browseDirectory: (
+        directoryPath: string | null,
+      ) => Promise<DirectoryListing>;
       readDirectory: (
         directoryPath: string,
         sortBy: SortOption,
@@ -165,6 +175,8 @@ declare global {
         directoryPath: string;
         files: ImagePair[];
         recentTags: string[];
+        folderState: FolderState;
+        hasSubfolders: boolean;
       }>;
       readSidecarMetadata: (filePath: string) => Promise<SidecarValues>;
       saveMetadata: (metadata: {
@@ -197,6 +209,11 @@ declare global {
         backPath: string | null;
         value: boolean;
       }) => Promise<SetDoNotUploadResult>;
+      setFolderProcessed: (
+        directoryPath: string,
+        value: boolean,
+        includeSubfolders: boolean,
+      ) => Promise<SetFolderProcessedResult>;
       loadImmichSettings: () => Promise<ImmichSettings>;
       saveImmichSettings: (settings: ImmichSettings) => Promise<ImmichSettings>;
       uploadToImmich: (
@@ -729,6 +746,17 @@ const readPairSidecars = (
 function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
+  const [folderState, setFolderState] = useState<FolderState>(
+    unprocessedFolderState,
+  );
+  const [hasSubfolders, setHasSubfolders] = useState(false);
+  const [includeSubfoldersInProcessed, setIncludeSubfoldersInProcessed] =
+    useState(false);
+  const [isSettingFolderProcessed, setIsSettingFolderProcessed] =
+    useState(false);
+  const [folderProcessedError, setFolderProcessedError] = useState("");
+  // Set after a successful upload of the open folder, to offer marking it processed.
+  const [hasUploadedFolder, setHasUploadedFolder] = useState(false);
   const [pairs, setPairs] = useState<ImagePair[]>([]);
   const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
   const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
@@ -2041,7 +2069,9 @@ function App() {
     setStatus("Scanning directory for photos...");
 
     try {
-      const selectedDirectory = await window.electronAPI.chooseDirectory();
+      const selectedDirectory = await chooseDirectory(
+        window.electronAPI.browseDirectory,
+      );
       if (!selectedDirectory) {
         setStatus("No directory selected.");
         return;
@@ -2074,6 +2104,11 @@ function App() {
       sidecarPrefetchRef.current.clear();
       setImageVersions({});
       setDirectoryPath(result.directoryPath);
+      setFolderState(result.folderState);
+      setHasSubfolders(result.hasSubfolders);
+      setIncludeSubfoldersInProcessed(false);
+      setFolderProcessedError("");
+      setHasUploadedFolder(false);
       setIsHydrated(false);
       setPairs(result.files);
       resetSavedPairs();
@@ -2131,6 +2166,8 @@ function App() {
         sidecarPrefetchRef.current.clear();
         setImageVersions({});
         setSortBy(nextSortBy);
+        setFolderState(result.folderState);
+        setHasSubfolders(result.hasSubfolders);
         setIsHydrated(false);
         setPairs(result.files);
         resetSavedPairs();
@@ -2288,6 +2325,7 @@ function App() {
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
+      setHasUploadedFolder(false);
       isImmichOutputFollowingRef.current = true;
       setImmichStatus("Uploading the selected directory to Immich...");
       const savedSettings =
@@ -2298,6 +2336,7 @@ function App() {
         directoryPath,
       );
       setImmichOutput(result.output);
+      setHasUploadedFolder(result.ok);
       setImmichStatus(
         result.ok
           ? "Immich upload completed successfully."
@@ -2400,6 +2439,49 @@ function App() {
       setIsSettingFolderDate(false);
     }
   };
+  /**
+   * Marks the open folder, and optionally every subfolder, as processed or not processed.
+   * @param value - Whether the folder is processed.
+   * @param includeSubfolders - Whether to mark every subfolder the same way.
+   */
+  const handleSetFolderProcessed = async (
+    value: boolean,
+    includeSubfolders: boolean,
+  ) => {
+    const electronApi = window.electronAPI;
+    if (!electronApi || !directoryPath) {
+      return;
+    }
+
+    setIsSettingFolderProcessed(true);
+    setFolderProcessedError("");
+    try {
+      const result = await electronApi.setFolderProcessed(
+        directoryPath,
+        value,
+        includeSubfolders,
+      );
+      setFolderState(result.state);
+      const scope =
+        result.updatedFolders === 1
+          ? "this folder"
+          : `${result.updatedFolders} folders`;
+      setStatus(`Marked ${scope} as ${value ? "processed" : "not processed"}.`);
+      if (!result.ok) {
+        setFolderProcessedError(
+          `Some subfolders could not be marked: ${result.errors.join("; ")}`,
+        );
+      }
+    } catch (error) {
+      setFolderProcessedError(
+        error instanceof Error
+          ? error.message
+          : "Unable to change the folder's processed state.",
+      );
+    } finally {
+      setIsSettingFolderProcessed(false);
+    }
+  };
   const canUploadToImmich =
     Boolean(directoryPath) &&
     Boolean(immichSettings.serverUrl.trim()) &&
@@ -2409,6 +2491,7 @@ function App() {
     isPersistingRotation ||
     isUploading ||
     isSettingFolderDate ||
+    isSettingFolderProcessed ||
     isTogglingDoNotUpload;
   const flaggedPairCount = pairs.filter((pair) => pair.doNotUpload).length;
   const selectedDoNotUploadError =
@@ -2471,7 +2554,47 @@ function App() {
             Saving {pendingSaveCount} image{pendingSaveCount === 1 ? "" : "s"}…
           </span>
         ) : null}
-        {directoryPath ? <strong>{directoryPath}</strong> : null}
+        {directoryPath ? (
+          <div className="folder-processed">
+            <strong>{directoryPath}</strong>
+            <button
+              type="button"
+              className="processed-toggle"
+              aria-pressed={folderState.processed}
+              title={describeFolderState(folderState)}
+              onClick={() =>
+                void handleSetFolderProcessed(
+                  !folderState.processed,
+                  hasSubfolders && includeSubfoldersInProcessed,
+                )
+              }
+              disabled={isTransitionLocked}
+            >
+              <span aria-hidden="true">
+                {folderState.processed ? "✓" : "○"}
+              </span>{" "}
+              Processed
+            </button>
+            {hasSubfolders ? (
+              <label className="processed-subfolders">
+                <input
+                  type="checkbox"
+                  checked={includeSubfoldersInProcessed}
+                  onChange={(event) =>
+                    setIncludeSubfoldersInProcessed(event.target.checked)
+                  }
+                  disabled={isTransitionLocked}
+                />
+                Include subfolders
+              </label>
+            ) : null}
+            {folderProcessedError ? (
+              <span className="folder-processed-error" role="alert">
+                {folderProcessedError}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       {!directoryPath ? (
@@ -3146,6 +3269,34 @@ function App() {
                   </pre>
                 ) : null}
               </div>
+
+              {hasUploadedFolder && !folderState.processed ? (
+                <div
+                  className="immich-mark-processed"
+                  role="group"
+                  aria-label="Mark folder as processed"
+                >
+                  <span>Mark folder as processed?</span>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void handleSetFolderProcessed(true, false)}
+                    disabled={isTransitionLocked}
+                  >
+                    This folder
+                  </button>
+                  {hasSubfolders ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void handleSetFolderProcessed(true, true)}
+                      disabled={isTransitionLocked}
+                    >
+                      This folder and all subfolders
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </details>
         </main>

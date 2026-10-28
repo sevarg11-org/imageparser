@@ -8,6 +8,7 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
 - **Metadata Editing**: Edit EXIF dates embedded in image files and XMP sidecar metadata (description, tags, orientation).
 - **Immich Upload**: Batch upload paired images to Immich with configurable albums, tags, and concurrent tasks.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
+- **Processed Folders**: Mark a folder (optionally with all its subfolders) as processed from the main screen or after an Immich upload; the folder browser shows a checkmark next to processed folders.
 - **Cross-Platform**: Desktop app for Windows/macOS/Linux via Electron; web server version for TrueNAS/Docker or local deployment.
 
 ## Architecture
@@ -288,6 +289,7 @@ The shared core logic handles:
 - **XMP Sidecars**: Create/update `.xmp` files containing description, tags, EXIF dates, and Adobe Photoshop date fields.
 - **Embedded EXIF**: Write creation date directly into image files (`.jpg`, `.tif`, etc.) using ExifTool.
 - **Rotation**: Apply orientation to metadata (`Orientation` tag) or rotate pixel data for PNG/WebP formats.
+- **Folder State**: Store the processed mark, with who set it and when, in a hidden `.imageparser.json` file inside the folder, so every user and both apps see the same state. A missing or unreadable file means the folder is not processed.
 
 ## Testing
 

@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAPI", {
-  chooseDirectory: () => ipcRenderer.invoke("choose-directory"),
+  browseDirectory: (directoryPath) =>
+    ipcRenderer.invoke("browse-directory", directoryPath),
   readDirectory: (directoryPath, sortBy) =>
     ipcRenderer.invoke("read-directory", directoryPath, sortBy),
   readSidecarMetadata: (filePath) =>
@@ -21,6 +22,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setFolderDate: (directoryPath, date) =>
     ipcRenderer.invoke("set-folder-date", { directoryPath, date }),
   setDoNotUpload: (request) => ipcRenderer.invoke("set-do-not-upload", request),
+  setFolderProcessed: (directoryPath, value, includeSubfolders) =>
+    ipcRenderer.invoke("set-folder-processed", {
+      directoryPath,
+      value,
+      includeSubfolders,
+    }),
   loadImmichSettings: () => ipcRenderer.invoke("load-immich-settings"),
   saveImmichSettings: (settings) =>
     ipcRenderer.invoke("save-immich-settings", settings),

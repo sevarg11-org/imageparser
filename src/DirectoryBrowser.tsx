@@ -1,14 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import './DirectoryBrowser.css'
+import { describeFolderState, type FolderState } from './folderState'
 
-export type DirectoryListing = {
+export type DirectoryEntry = FolderState & { name: string; path: string }
+
+// The listed folder's own processed state is always false for a virtual root.
+export type DirectoryListing = FolderState & {
   path: string
-  rootPath: string
-  // "" means the virtual root that lists the user's shared folders; null means there is nothing above.
+  // The web share root that paths are shown relative to; null in the desktop app, which shows full paths.
+  rootPath: string | null
+  // "" means the virtual root (the user's shared folders on the web, the drive list on Windows desktop);
+  // null means there is nothing above.
   parent: string | null
   // False for the virtual root, which is not a real folder and cannot be opened.
   selectable?: boolean
-  directories: { name: string; path: string }[]
+  directories: DirectoryEntry[]
   imageCount: number
 }
 
@@ -18,11 +24,26 @@ type DirectoryBrowserProps = {
   onClose: (selectedPath: string | null) => void
 }
 
+// Text and color both mark a processed folder; the visible check mark is hidden from screen readers.
+const ProcessedMark = ({ state }: { state: FolderState }) =>
+  state.processed ? (
+    <span className="directory-browser-processed" title={describeFolderState(state)}>
+      <span aria-hidden="true">✓</span>
+      <span className="visually-hidden">processed</span>
+    </span>
+  ) : null
+
 const isSelectable = (listing: DirectoryListing) => listing.selectable !== false
+
+const isDesktopListing = (listing: DirectoryListing) => listing.rootPath === null
 
 const toDisplayPath = (listing: DirectoryListing) => {
   if (!isSelectable(listing)) {
-    return 'Your folders'
+    return isDesktopListing(listing) ? 'Drives' : 'Your folders'
+  }
+
+  if (listing.rootPath === null) {
+    return listing.path
   }
 
   if (listing.path === listing.rootPath) {
@@ -60,7 +81,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
       try {
         setListing(await loadListing(initialPath))
       } catch {
-        // The remembered folder may have been removed; fall back to the share root.
+        // The remembered folder may have been removed; fall back to the default starting folder.
         try {
           setListing(await loadListing(null))
         } catch (loadError) {
@@ -86,6 +107,11 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
         <h2 id="directory-browser-title">Select image folder</h2>
         <p className="directory-browser-path" aria-live="polite">
           {listing ? toDisplayPath(listing) : 'Loading...'}
+          {listing?.processed ? (
+            <span className="directory-browser-processed-badge" title={describeFolderState(listing)}>
+              <span aria-hidden="true">✓</span> Processed
+            </span>
+          ) : null}
         </p>
       </header>
 
@@ -94,7 +120,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
         <ul className="directory-browser-list">
           {listing && listing.parent !== null ? (
             <li>
-              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent || null)}>
+              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent)}>
                 <span aria-hidden="true">↑</span> Parent folder
               </button>
             </li>
@@ -102,13 +128,17 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
           {listing?.directories.map((directory) => (
             <li key={directory.path}>
               <button type="button" disabled={isLoading} onClick={() => void navigate(directory.path)}>
-                <span aria-hidden="true">📁</span> {directory.name}
+                <span aria-hidden="true">📁</span> {directory.name} <ProcessedMark state={directory} />
               </button>
             </li>
           ))}
           {listing && !listing.directories.length ? (
             <li className="directory-browser-empty">
-              {isSelectable(listing) ? 'No subfolders' : 'No folders are shared with your account.'}
+              {isSelectable(listing)
+                ? 'No subfolders'
+                : isDesktopListing(listing)
+                  ? 'No drives are available.'
+                  : 'No folders are shared with your account.'}
             </li>
           ) : null}
         </ul>
