@@ -16,6 +16,14 @@ import {
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import {
+  countImageFilterMatches,
+  filterImagePairs,
+  getEmptyFilterMessage,
+  imageFilterOptions,
+  isImageFilter,
+  type ImageFilter,
+} from "./imageFilters";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { fetchCurrentUser, type CurrentUser } from "./webApi";
 
@@ -25,6 +33,7 @@ type ImagePair = {
   frontPath: string;
   backPath: string | null;
   createdAt: number;
+  hasSidecar: boolean;
 };
 
 type SortField = "createdAt" | "dateTaken" | "fileName";
@@ -431,7 +440,10 @@ function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
   const [pairs, setPairs] = useState<ImagePair[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
+  const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -450,7 +462,7 @@ function App() {
   });
   const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
-  const [filterOnlyPairs, setFilterOnlyPairs] = useState(false);
+  const [imageFilter, setImageFilter] = useState<ImageFilter>("all");
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
   );
@@ -497,16 +509,29 @@ function App() {
   const saveTimeoutRef = useRef<number | null>(null);
   const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
+  // The selected group is retained in the filtered list until the selection
+  // moves, so an image saved under "Unprocessed" stays on screen.
   const displayPairs = useMemo(
-    () => (filterOnlyPairs ? pairs.filter((p) => !!p.backPath) : pairs),
-    [pairs, filterOnlyPairs],
+    () => filterImagePairs(pairs, imageFilter, savedPairIds, selectedPairId),
+    [pairs, imageFilter, savedPairIds, selectedPairId],
+  );
+
+  const filterCounts = useMemo(
+    () => countImageFilterMatches(pairs, savedPairIds),
+    [pairs, savedPairIds],
+  );
+
+  const selectedIndex = useMemo(
+    () =>
+      Math.max(
+        displayPairs.findIndex((pair) => pair.id === selectedPairId),
+        0,
+      ),
+    [displayPairs, selectedPairId],
   );
 
   const selectedPair = useMemo(
-    () =>
-      displayPairs.length > 0 && selectedIndex < displayPairs.length
-        ? displayPairs[selectedIndex]
-        : null,
+    () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
 
@@ -656,6 +681,11 @@ function App() {
       });
 
       hasUserChangedRef.current = false;
+      if (!pair.hasSidecar) {
+        setSavedPairIds((current) =>
+          current.has(pair.id) ? current : new Set(current).add(pair.id),
+        );
+      }
     },
     [rotations],
   );
@@ -773,19 +803,35 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair(formValues))) {
+      const nextPair = displayPairs[boundedIndex];
+      if (!nextPair || !(await persistCurrentPair(formValues))) {
         return;
       }
 
-      setImageNumberInput(String(boundedIndex + 1));
+      // The previous group may drop out of the filtered list once it is no
+      // longer selected, so the next group's index is recalculated from its ID.
+      const nextDisplayPairs = filterImagePairs(
+        pairs,
+        imageFilter,
+        savedPairIds,
+        nextPair.id,
+      );
+      setImageNumberInput(
+        String(
+          nextDisplayPairs.findIndex((pair) => pair.id === nextPair.id) + 1,
+        ),
+      );
       setIsHydrated(false);
-      setSelectedIndex(boundedIndex);
+      setSelectedPairId(nextPair.id);
     },
     [
-      displayPairs.length,
+      displayPairs,
+      imageFilter,
       isHydrated,
       isUploading,
+      pairs,
       persistCurrentPair,
+      savedPairIds,
       selectedIndex,
     ],
   );
@@ -803,7 +849,7 @@ function App() {
     let isMounted = true;
     const imageStatus = formatImageStatus(
       selectedIndex,
-      pairs.length,
+      displayPairs.length,
       selectedPair.imageLabel,
     );
 
@@ -875,7 +921,7 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [pairs.length, selectedIndex, selectedPair]);
+  }, [displayPairs.length, selectedIndex, selectedPair]);
 
   /**
    * Debounces metadata saves and clears pending changes when conditions change.
@@ -1162,9 +1208,9 @@ function App() {
     if (
       !Number.isInteger(imageNumber) ||
       imageNumber < 1 ||
-      imageNumber > pairs.length
+      imageNumber > displayPairs.length
     ) {
-      setStatus(`Enter an image number from 1 to ${pairs.length}.`);
+      setStatus(`Enter an image number from 1 to ${displayPairs.length}.`);
       return;
     }
 
@@ -1201,7 +1247,7 @@ function App() {
     }
 
     event.preventDefault();
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         try {
           if (await persistCurrentPair()) {
@@ -1252,7 +1298,7 @@ function App() {
     const formValues =
       nextDate === metadata.date ? metadata : { ...metadata, date: nextDate };
 
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         try {
           await savePairMetadata(selectedPair, formValues);
@@ -1307,9 +1353,11 @@ function App() {
       setDirectoryPath(result.directoryPath);
       setIsHydrated(false);
       setPairs(result.files);
+      setSavedPairIds(new Set());
+      setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
-      setSelectedIndex(0);
+      setSelectedPairId(result.files[0]?.id ?? null);
 
       if (!result.files.length) {
         setStatus("No supported images were found in that directory.");
@@ -1357,9 +1405,13 @@ function App() {
         setSortBy(nextSortBy);
         setIsHydrated(false);
         setPairs(result.files);
+        setSavedPairIds(new Set());
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
-        setSelectedIndex(0);
+        setSelectedPairId(
+          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ??
+            null,
+        );
         setStatus(
           `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
         );
@@ -1373,7 +1425,34 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, persistCurrentPair],
+    [directoryPath, imageFilter, persistCurrentPair],
+  );
+
+  /**
+   * Switches the image filter after persisting pending changes to the current
+   * pair, then selects the first image in the newly filtered list.
+   * @param nextFilter - The filter to apply.
+   */
+  const changeImageFilter = useCallback(
+    async (nextFilter: ImageFilter) => {
+      if (nextFilter === imageFilter) {
+        return;
+      }
+
+      if (!(await persistCurrentPair())) {
+        return;
+      }
+
+      const firstPairId =
+        filterImagePairs(pairs, nextFilter, savedPairIds)[0]?.id ?? null;
+      if (firstPairId !== selectedPairId) {
+        setIsHydrated(false);
+      }
+      setImageFilter(nextFilter);
+      setSelectedPairId(firstPairId);
+      setImageNumberInput("1");
+    },
+    [imageFilter, pairs, persistCurrentPair, savedPairIds, selectedPairId],
   );
 
   /**
@@ -1462,6 +1541,16 @@ function App() {
       }
 
       const result = await electronApi.setFolderDate(directoryPath, date);
+      const failedLabels = result.errors.map((error) => error.split(": ")[0]);
+      setSavedPairIds((current) => {
+        const next = new Set(current);
+        for (const pair of pairs) {
+          if (!failedLabels.includes(pair.imageLabel)) {
+            next.add(pair.id);
+          }
+        }
+        return next;
+      });
 
       if (result.ok) {
         const parts: string[] = [];
@@ -1755,13 +1844,25 @@ function App() {
                   <option value="fileName-desc">File name (Z-A)</option>
                 </select>
               </label>
-              <label className="filter-control">
-                <input
-                  type="checkbox"
-                  checked={filterOnlyPairs}
-                  onChange={(event) => setFilterOnlyPairs(event.target.checked)}
-                />
-                <span>Only pairs</span>
+              <label className="sort-control filter-control">
+                <span>Show</span>
+                <select
+                  value={imageFilter}
+                  onChange={(event) => {
+                    if (isImageFilter(event.target.value)) {
+                      void changeImageFilter(event.target.value);
+                    }
+                  }}
+                  disabled={
+                    isTransitionLocked || (!isHydrated && selectedPair !== null)
+                  }
+                >
+                  {imageFilterOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} ({filterCounts[option.value]})
+                    </option>
+                  ))}
+                </select>
               </label>
               <label
                 className="size-control"
@@ -1801,20 +1902,21 @@ function App() {
                 <input
                   type="number"
                   min={1}
-                  max={pairs.length}
+                  max={displayPairs.length}
                   value={imageNumberInput}
                   onChange={(event) => setImageNumberInput(event.target.value)}
                   onKeyDown={handleImageNumberKeyDown}
                   disabled={isImageControlLocked}
-                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${pairs.length}`}
+                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
                 />
-                <span aria-hidden="true">/ {pairs.length}</span>
+                <span aria-hidden="true">/ {displayPairs.length}</span>
               </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex + 1)}
                 disabled={
-                  selectedIndex === pairs.length - 1 || isImageControlLocked
+                  selectedIndex >= displayPairs.length - 1 ||
+                  isImageControlLocked
                 }
               >
                 Next
@@ -1902,7 +2004,9 @@ function App() {
                   ) : null}
                 </>
               ) : (
-                <p>No Pairs Available</p>
+                <p role="status">
+                  {getEmptyFilterMessage(imageFilter, pairs.length)}
+                </p>
               )}
             </div>
           </section>
