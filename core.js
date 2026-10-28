@@ -256,13 +256,14 @@ const normalizeImmichSettings = (settings) => {
  * Constructs the full upload command with all required and optional flags.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
- * @param {{debug?: boolean}} [options] - Set debug to request verbose immich-go logging.
+ * @param {{debug?: boolean, recursive?: boolean}} [options] - Set debug to request verbose immich-go logging,
+ *   and recursive to upload every nested folder as well.
  * @returns {string[]} An array of command-line arguments for immich-go.
  */
 const buildImmichUploadArguments = (
   settings,
   directoryPath,
-  { debug = false } = {},
+  { debug = false, recursive = false } = {},
 ) => {
   const tags = normalizeImmichTags(settings.tags);
   const uploadArguments = [
@@ -273,7 +274,7 @@ const buildImmichUploadArguments = (
     "--no-ui",
     "--server",
     String(settings.serverUrl),
-    "--recursive=false",
+    `--recursive=${recursive === true}`,
     "--api-key",
     String(settings.userApiKey),
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
@@ -417,7 +418,7 @@ const getImmichGoDiagnostics = () =>
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
- * @param {{debug?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
+ * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
  * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
@@ -425,7 +426,7 @@ const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
-  { debug = false, log, lockKey = "default" } = {},
+  { debug = false, recursive = false, log, lockKey = "default" } = {},
 ) => {
   if (runningImmichUploads.has(lockKey)) {
     throw new Error("An Immich upload is already running.");
@@ -448,7 +449,7 @@ const runImmichUpload = async (
     const uploadArguments = buildImmichUploadArguments(
       normalizedSettings,
       normalizedDirectoryPath,
-      { debug },
+      { debug, recursive },
     );
     const redact = (text) => redactImmichSecrets(text, normalizedSettings);
 
@@ -877,11 +878,49 @@ const compareFileNames = (left, right) =>
     sensitivity: "base",
   });
 
+/**
+ * Orders folders relative to the scanned folder depth-first, in natural name order, with a folder
+ * before its subfolders. The scanned folder itself ("") comes first.
+ * @param {string} left - The first folder, as forward-slash separated segments.
+ * @param {string} right - The second folder, as forward-slash separated segments.
+ * @returns {number} The sort order.
+ */
+const compareRelativeDirectories = (left, right) => {
+  const leftSegments = left ? left.split("/") : [];
+  const rightSegments = right ? right.split("/") : [];
+  const sharedLength = Math.min(leftSegments.length, rightSegments.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const order = leftSegments[index].localeCompare(
+      rightSegments[index],
+      undefined,
+      { numeric: true },
+    );
+    if (order !== 0) {
+      return order;
+    }
+  }
+  return leftSegments.length - rightSegments.length;
+};
+
+/**
+ * Sorts pairs by folder (see compareRelativeDirectories), then by the chosen sort inside each folder.
+ * @param {Array} pairs - The pairs to sort in place.
+ * @param {*} sortBy - The sort field and direction.
+ * @returns {Array} The sorted pairs.
+ */
 const sortPairs = (pairs, sortBy) => {
   const { field, direction } = normalizeSortBy(sortBy);
   const directionFactor = direction === "desc" ? -1 : 1;
 
   return pairs.sort((left, right) => {
+    const folderOrder = compareRelativeDirectories(
+      left.relativeDirectory,
+      right.relativeDirectory,
+    );
+    if (folderOrder !== 0) {
+      return folderOrder;
+    }
+
     if (field === "fileName") {
       return compareFileNames(left, right) * directionFactor;
     }
@@ -970,14 +1009,18 @@ const toSidecarDay = (rawDate) => {
  * The flag is read from the A file name; a B file that disagrees marks the group as mixed.
  * @param {string} frontPath - The path to the front (A) image.
  * @param {string|null} backPath - The path to the back (B) image, if any.
- * @returns {{id: string, imageLabel: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
+ * @param {string} [relativeDirectory=""] - The pair's folder relative to the scanned folder, with forward
+ *   slashes; it scopes the id and prefixes the label so equal names in different folders stay apart.
+ * @returns {{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
  */
-const describePair = (frontPath, backPath) => {
+const describePair = (frontPath, backPath, relativeDirectory = "") => {
   const frontName = path.basename(frontPath);
   const doNotUpload = isExcludedName(frontName);
+  const folderPrefix = relativeDirectory ? `${relativeDirectory}/` : "";
   return {
-    id: `${getGroupKey(frontName)}-${frontName}`,
-    imageLabel: frontName,
+    id: `${folderPrefix}${getGroupKey(frontName)}-${frontName}`,
+    imageLabel: `${folderPrefix}${frontName}`,
+    relativeDirectory,
     frontPath,
     backPath,
     doNotUpload,
@@ -990,21 +1033,30 @@ const describePair = (frontPath, backPath) => {
 /**
  * Groups image files by their base name and creates front/back pairs.
  * Supports date-taken sorting when available, falling back to file creation time.
- * @param {string[]} filePaths - The array of image file paths in the directory.
+ * Files only pair with files in the same folder.
+ * @param {string[]} filePaths - The image file paths.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
+ * @param {string} [baseDirectory] - The scanned folder; when given, each pair records its folder relative to it.
+ * @returns {Promise<Array<{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
  */
-const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
+const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
   const grouped = new Map();
 
   for (const filePath of filePaths) {
     const fileName = path.basename(filePath);
-    const key = getGroupKey(fileName);
+    const relativeDirectory = baseDirectory
+      ? path
+          .relative(baseDirectory, path.dirname(filePath))
+          .split(path.sep)
+          .join("/")
+      : "";
+    const key = `${relativeDirectory}/${getGroupKey(fileName)}`;
     const group = grouped.get(key) ?? [];
     group.push({
       filePath,
       fileName,
+      relativeDirectory,
       side: getSideFromFileName(fileName),
     });
     grouped.set(key, group);
@@ -1033,6 +1085,7 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
         ...describePair(
           frontCandidate.filePath,
           backCandidate ? backCandidate.filePath : null,
+          frontCandidate.relativeDirectory,
         ),
         frontVersion: buildImageVersion(frontStats),
         backVersion: backStats ? buildImageVersion(backStats) : null,
@@ -1204,31 +1257,33 @@ const writeSidecarFile = async (filePath, dateValue, description, tags) => {
 };
 
 /**
- * Reads tag suggestions from all .xmp sidecar files in the directory.
- * Collects tags from recently modified sidecars and returns deduplicated list.
- * @param {string} directoryPath - The path to the directory containing images and sidecars.
+ * The most sidecars read for tag suggestions, so a large nested scan does not read every sidecar.
+ * @type {number}
+ */
+const maxRecentTagSidecars = 500;
+
+/**
+ * Reads tag suggestions from .xmp sidecar files, most recently modified first.
+ * Only the newest maxRecentTagSidecars sidecars are read.
+ * @param {string[]} sidecarPaths - The sidecar files found by the directory scan.
  * @returns {Promise<string[]>} An array of unique tag strings found in sidecar files.
  */
-const readRecentTags = async (directoryPath) => {
-  const directoryEntries = await fs.readdir(directoryPath, {
-    withFileTypes: true,
-  });
-  const sidecarPaths = directoryEntries
-    .filter(
-      (entry) =>
-        entry.isFile() && path.extname(entry.name).toLowerCase() === ".xmp",
-    )
-    .map((entry) => path.join(directoryPath, entry.name));
-  const sidecarsByRecency = await Promise.all(
-    sidecarPaths.map(async (sidecarPath) => ({
+const readRecentTags = async (sidecarPaths) => {
+  const sidecarsByRecency = await mapWithConcurrency(
+    sidecarPaths,
+    folderListingConcurrency,
+    async (sidecarPath) => ({
       sidecarPath,
       modifiedAt: (await fs.stat(sidecarPath)).mtimeMs,
-    })),
+    }),
   );
   sidecarsByRecency.sort((left, right) => right.modifiedAt - left.modifiedAt);
 
   const recentTags = [];
-  for (const { sidecarPath } of sidecarsByRecency) {
+  for (const { sidecarPath } of sidecarsByRecency.slice(
+    0,
+    maxRecentTagSidecars,
+  )) {
     try {
       recentTags.push(
         ...readTagsFromXmp(await fs.readFile(sidecarPath, "utf8")),
@@ -1898,19 +1953,181 @@ const listDrives = async () => {
 };
 
 /**
- * Reads all image files from a directory and groups them into pairs.
+ * How many folder levels below the selected folder a nested scan may enter.
+ * @type {number}
+ */
+const maxNestedScanDepth = 10;
+
+/**
+ * How many supported image files a nested scan may find before it stops.
+ * @type {number}
+ */
+const maxNestedScanFiles = 1000;
+
+/**
+ * How many folders a nested scan reads at once; kept small so network shares are not flooded.
+ * @type {number}
+ */
+const nestedScanConcurrency = 4;
+
+/**
+ * Splits one folder's entries into supported images, sidecars, and visible subfolders.
+ * Symbolic links are followed with stat, so linked folders count as folders.
+ * @param {string} directoryPath - The folder that was read.
+ * @param {import("node:fs").Dirent[]} entries - The folder's entries.
+ * @returns {Promise<{imageFiles: string[], sidecarFiles: string[], subfolders: string[]}>} The sorted entries.
+ */
+const classifyDirectoryEntries = async (directoryPath, entries) => {
+  const imageFiles = [];
+  const sidecarFiles = [];
+  const subfolders = [];
+  for (const entry of entries) {
+    const entryPath = path.join(directoryPath, entry.name);
+    let isDirectory = entry.isDirectory();
+    if (entry.isSymbolicLink()) {
+      isDirectory = await fs
+        .stat(entryPath)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+    }
+    if (isDirectory) {
+      if (!entry.name.startsWith(".")) {
+        subfolders.push(entryPath);
+      }
+      continue;
+    }
+    const extension = path.extname(entry.name).toLowerCase();
+    if (allowedExtensions.has(extension)) {
+      imageFiles.push(entryPath);
+    } else if (extension === ".xmp" && entry.isFile()) {
+      sidecarFiles.push(entryPath);
+    }
+  }
+  return { imageFiles, sidecarFiles, subfolders };
+};
+
+/**
+ * Finds the supported images in a folder and, when recursive, in every visible folder below it.
+ * Hidden folders are skipped. Each folder is visited once by its real path, so symbolic-link loops end,
+ * and a folder whose real path the isAllowedPath callback rejects is skipped. Going over the depth or
+ * file limit throws instead of returning a partial result.
+ * @param {string} directoryPath - The folder to scan.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, maxDepth?: number, maxFiles?: number}} [options]
+ *   Whether to scan nested folders, a confinement check for the real path of each nested folder, and the limits.
+ * @returns {Promise<{imageFiles: string[], sidecarFiles: string[], folderCount: number, hasSubfolders: boolean}>}
+ *   The image and sidecar files, the number of folders scanned, and whether the folder has visible subfolders.
+ * @throws {Error} If a folder cannot be read or the scan goes over a limit.
+ */
+const scanImageFiles = async (
+  directoryPath,
+  {
+    recursive = false,
+    isAllowedPath = () => true,
+    maxDepth = maxNestedScanDepth,
+    maxFiles = maxNestedScanFiles,
+  } = {},
+) => {
+  const rootListing = await classifyDirectoryEntries(
+    directoryPath,
+    await fs.readdir(directoryPath, { withFileTypes: true }),
+  );
+  const imageFiles = [...rootListing.imageFiles];
+  const sidecarFiles = [...rootListing.sidecarFiles];
+  const hasSubfolders = rootListing.subfolders.length > 0;
+  if (!recursive) {
+    return { imageFiles, sidecarFiles, folderCount: 1, hasSubfolders };
+  }
+
+  const tooManyFiles = () =>
+    new Error(
+      `The folder and its nested folders contain more than ${maxFiles} images. Choose a smaller folder.`,
+    );
+  if (imageFiles.length > maxFiles) {
+    throw tooManyFiles();
+  }
+
+  const visitedRealPaths = new Set([await fs.realpath(directoryPath)]);
+  let folderCount = 1;
+  let currentLevel = rootListing.subfolders;
+  for (let depth = 1; currentLevel.length; depth += 1) {
+    const candidates = await mapWithConcurrency(
+      currentLevel,
+      nestedScanConcurrency,
+      async (folderPath) => {
+        const realPath = await fs.realpath(folderPath).catch(() => null);
+        return realPath && isAllowedPath(realPath)
+          ? { folderPath, realPath }
+          : null;
+      },
+    );
+    const folders = [];
+    for (const candidate of candidates) {
+      if (candidate && !visitedRealPaths.has(candidate.realPath)) {
+        visitedRealPaths.add(candidate.realPath);
+        folders.push(candidate.folderPath);
+      }
+    }
+    if (folders.length && depth > maxDepth) {
+      throw new Error(
+        `The folder has nested folders more than ${maxDepth} levels deep. Choose a folder closer to the images.`,
+      );
+    }
+
+    const listings = await mapWithConcurrency(
+      folders,
+      nestedScanConcurrency,
+      async (folderPath) => {
+        try {
+          return await classifyDirectoryEntries(
+            folderPath,
+            await fs.readdir(folderPath, { withFileTypes: true }),
+          );
+        } catch (error) {
+          throw new Error(
+            `Unable to read ${path.relative(directoryPath, folderPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+          );
+        }
+      },
+    );
+    folderCount += folders.length;
+    currentLevel = [];
+    for (const listing of listings) {
+      imageFiles.push(...listing.imageFiles);
+      sidecarFiles.push(...listing.sidecarFiles);
+      currentLevel.push(...listing.subfolders);
+    }
+    if (imageFiles.length > maxFiles) {
+      throw tooManyFiles();
+    }
+  }
+
+  return { imageFiles, sidecarFiles, folderCount, hasSubfolders };
+};
+
+/**
+ * Reads all image files from a directory, and optionally its nested folders, and groups them into pairs.
  * Returns file listings with pairing information, creation dates, and date-taken if sorting by date.
  * Also collects tag suggestions from existing sidecar metadata files.
  * @param {string} directoryPath - The path to the directory containing image files.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction for ordering results (default: createdAt-asc).
- * @returns {Promise<{directoryPath: string, files: Array, recentTags: string[], folderState: {processed: boolean, processedAt: string|null, processedBy: string|null}, hasSubfolders: boolean}>}
- *   An object with directory path, array of paired images, tag suggestions, the folder's processed state,
- *   and whether it has visible subfolders.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
+ *   nested folders, and a check the web server supplies to confine nested folders by their real path.
+ * @returns {Promise<{directoryPath: string, recursive: boolean, folderCount: number, files: Array, recentTags: string[], folderState: {processed: boolean, processedAt: string|null, processedBy: string|null}, hasSubfolders: boolean}>}
+ *   An object with directory path, whether nested folders were included and how many folders were scanned,
+ *   array of paired images, tag suggestions, the folder's processed state, and whether it has visible subfolders.
+ * @throws {Error} If a folder cannot be read or a nested scan goes over its limits.
  */
-const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
+const readDirectory = async (
+  directoryPath,
+  sortBy = defaultSortBy,
+  { recursive = false, isAllowedPath } = {},
+) => {
+  const isRecursive = recursive === true;
   if (!directoryPath) {
     return {
       directoryPath,
+      recursive: isRecursive,
+      folderCount: 0,
       files: [],
       recentTags: [],
       folderState: unprocessedFolderState,
@@ -1918,24 +2135,20 @@ const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
     };
   }
 
-  const directoryEntries = await fs.readdir(directoryPath, {
-    withFileTypes: true,
-  });
-  const imageFiles = directoryEntries
-    .filter((entry) => !entry.isDirectory())
-    .map((entry) => path.join(directoryPath, entry.name))
-    .filter((filePath) =>
-      allowedExtensions.has(path.extname(filePath).toLowerCase()),
-    );
+  const { imageFiles, sidecarFiles, folderCount, hasSubfolders } =
+    await scanImageFiles(directoryPath, {
+      recursive: isRecursive,
+      isAllowedPath,
+    });
 
   return {
     directoryPath,
-    files: await pairFiles(imageFiles, sortBy),
-    recentTags: await readRecentTags(directoryPath),
+    recursive: isRecursive,
+    folderCount,
+    files: await pairFiles(imageFiles, sortBy, directoryPath),
+    recentTags: await readRecentTags(sidecarFiles),
     folderState: await readFolderState(directoryPath),
-    hasSubfolders: directoryEntries.some(
-      (entry) => entry.isDirectory() && !entry.name.startsWith("."),
-    ),
+    hasSubfolders,
   };
 };
 
@@ -2370,15 +2583,20 @@ const planDoNotUploadRenames = async (imagePaths, value) => {
  * Flags an image group "Do not upload" by renaming its images and sidecars to carry the
  * exclude marker, or clears the flag by removing it. Nothing is renamed when a target name
  * already exists, and renames already done are undone if a later one fails.
- * @param {{frontPath: string, backPath: string|null, value: boolean}} request - The group and the flag value.
+ * @param {{frontPath: string, backPath: string|null, value: boolean, relativeDirectory?: string}} request - The group,
+ *   the flag value, and the group's folder relative to the loaded folder, used only for the returned id and label.
  * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
- * @returns {Promise<{ok: boolean, id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
+ * @returns {Promise<{ok: boolean, id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
  * @throws {Error} If the request is invalid, a target exists, or a rename fails.
  */
 const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
   const frontPath = String(request?.frontPath ?? "");
   const backPath = request?.backPath ? String(request.backPath) : null;
   const value = request?.value;
+  const relativeDirectory =
+    typeof request?.relativeDirectory === "string"
+      ? request.relativeDirectory
+      : "";
   if (!frontPath) {
     throw new Error("No image selected to flag.");
   }
@@ -2463,7 +2681,7 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
   const nextBackPath = backPath && renamedPath(backPath);
   return {
     ok: true,
-    ...describePair(nextFrontPath, nextBackPath),
+    ...describePair(nextFrontPath, nextBackPath, relativeDirectory),
     frontVersion: await getImageVersion(nextFrontPath),
     backVersion: nextBackPath ? await getImageVersion(nextBackPath) : null,
     renamed,
@@ -2486,12 +2704,22 @@ const setDoNotUploadQueued = (request, options) =>
  * an XMP sidecar file. Pairs with an existing sidecar are skipped so their
  * previously saved metadata is preserved, and pairs flagged "Do not upload"
  * are skipped as well.
+ * With recursive set, every nested folder is covered, within the same limits as the nested scan.
  * @param {string} directoryPath - The path to the directory.
  * @param {string} date - The ISO date string to apply (e.g. "1991-12-31").
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
+ *   nested folders, and the confinement check for them (see readDirectory).
  * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, excludedPairs: number, errors: string[]}>}
  */
-const setFolderDate = async (directoryPath, date) => {
-  const { files: pairs } = await readDirectory(directoryPath);
+const setFolderDate = async (
+  directoryPath,
+  date,
+  { recursive = false, isAllowedPath } = {},
+) => {
+  const { files: pairs } = await readDirectory(directoryPath, defaultSortBy, {
+    recursive,
+    isAllowedPath,
+  });
 
   const errors = [];
   let updatedPairs = 0;
@@ -2584,6 +2812,7 @@ export {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
   setFolderDate,
   setFolderProcessed,

@@ -9,6 +9,8 @@ import "./SetFolderDateModal.css";
 type SetFolderDateModalProps = {
   isOpen: boolean;
   totalCount: number;
+  /** The number of folders covered in nested mode, or null when only the loaded folder is covered. */
+  nestedFolderCount: number | null;
   onConfirm: (date: string) => void;
   onClose: () => void;
   isSubmitting?: boolean;
@@ -16,6 +18,7 @@ type SetFolderDateModalProps = {
 
 const SetFolderDateDialogContent = ({
   totalCount,
+  nestedFolderCount,
   onConfirm,
   onClose,
   isSubmitting,
@@ -116,7 +119,10 @@ const SetFolderDateDialogContent = ({
       <header className="set-folder-date-header">
         <h2 id="set-folder-date-title">Set Date for Folder</h2>
         <p className="set-folder-date-subtitle">
-          Apply a date to all images in this folder without existing metadata ({totalCount} total photo group{totalCount === 1 ? "" : "s"}).
+          {nestedFolderCount === null
+            ? "Apply a date to all images in this folder without existing metadata"
+            : `Apply a date to all images in this folder and all its nested folders (${nestedFolderCount} folder${nestedFolderCount === 1 ? "" : "s"} in total) without existing metadata`}{" "}
+          ({totalCount} total photo group{totalCount === 1 ? "" : "s"}).
         </p>
       </header>
 
@@ -201,6 +207,7 @@ const SetFolderDateDialogContent = ({
 export const SetFolderDateModal = ({
   isOpen,
   totalCount,
+  nestedFolderCount,
   onConfirm,
   onClose,
   isSubmitting = false,
@@ -212,6 +219,7 @@ export const SetFolderDateModal = ({
   return (
     <SetFolderDateDialogContent
       totalCount={totalCount}
+      nestedFolderCount={nestedFolderCount}
       onConfirm={onConfirm}
       onClose={onClose}
       isSubmitting={isSubmitting}

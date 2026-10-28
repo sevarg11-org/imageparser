@@ -28,10 +28,16 @@ export type DirectoryListing = FolderState & {
   imageCount: number
 }
 
+// The chosen folder, and whether its nested folders are loaded with it.
+export type DirectorySelection = {
+  path: string
+  recursive: boolean
+}
+
 type DirectoryBrowserProps = {
   initialPath: string | null
   loadListing: (directoryPath: string | null) => Promise<DirectoryListing>
-  onClose: (selectedPath: string | null) => void
+  onClose: (selection: DirectorySelection | null) => void
 }
 
 // Text and color both mark a processed folder; the visible check mark is hidden from screen readers.
@@ -85,6 +91,8 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(true)
   const [sort, setSort] = useState(readFolderSort)
+  // Unchecked each time the browser opens, so nested scans are always a deliberate choice.
+  const [includeNested, setIncludeNested] = useState(false)
 
   const updateSort = (nextSort: FolderSort) => {
     setSort(nextSort)
@@ -216,6 +224,14 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             : ''}
         </span>
         <div className="directory-browser-actions">
+          <label className="directory-browser-nested">
+            <input
+              type="checkbox"
+              checked={includeNested}
+              onChange={(event) => setIncludeNested(event.target.checked)}
+            />
+            Include nested folders
+          </label>
           <button type="button" className="secondary-button" onClick={() => onClose(null)}>
             Cancel
           </button>
@@ -223,7 +239,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             type="button"
             className="primary-button"
             disabled={!listing || isLoading || !isSelectable(listing)}
-            onClick={() => listing && onClose(listing.path)}
+            onClick={() => listing && onClose({ path: listing.path, recursive: includeNested })}
           >
             Open this folder
           </button>

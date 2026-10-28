@@ -204,6 +204,20 @@ const resolveOptionalPathForUser = async (user, requestedPath) =>
   requestedPath ? resolvePathForUser(user, requestedPath) : null;
 
 /**
+ * Builds the options for a directory scan, confining nested folders to the user's allowed folders by real path.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
+ * @param {unknown} recursive - The request's recursive flag; only true includes nested folders.
+ * @returns {Promise<{recursive: boolean, isAllowedPath: (realPath: string) => boolean}>} The scan options.
+ */
+const getScanOptionsForUser = async (user, recursive) => {
+  const allowedRoots = await getAllowedRoots(user);
+  return {
+    recursive: recursive === true,
+    isAllowedPath: (realPath) => isPathAllowed(realPath, allowedRoots),
+  };
+};
+
+/**
  * Returns the directory holding a user's Immich settings.
  * OpenID Connect users each get a private directory keyed by a hash of their subject.
  * @param {{userKey: string}} user - The request's user context.
@@ -823,7 +837,11 @@ const createApiRoutes = (secretCodec) => ({
       body.directoryPath,
     );
     const { field, direction } = normalizeSortBy(body.sortBy ?? defaultSortBy);
-    return readDirectory(directoryPath, `${field}-${direction}`);
+    return readDirectory(
+      directoryPath,
+      `${field}-${direction}`,
+      await getScanOptionsForUser(request.user, body.recursive),
+    );
   },
   "POST /api/read-sidecar-metadata": async (request) => {
     const body = await readJsonBody(request);
@@ -864,6 +882,7 @@ const createApiRoutes = (secretCodec) => ({
       frontPath: body.frontPath,
       backPath: body.backPath,
       value: body.value,
+      relativeDirectory: body.relativeDirectory,
     });
   },
   "POST /api/folder-processed": async (request) => {
@@ -881,7 +900,11 @@ const createApiRoutes = (secretCodec) => ({
       request.user,
       body.directoryPath,
     );
-    return setFolderDate(directoryPath, body.date);
+    return setFolderDate(
+      directoryPath,
+      body.date,
+      await getScanOptionsForUser(request.user, body.recursive),
+    );
   },
   "POST /api/upload-to-immich": async (request) => {
     const body = await readJsonBody(request);
@@ -898,6 +921,7 @@ const createApiRoutes = (secretCodec) => ({
       createProgressReporter(request.user.userKey),
       {
         debug: debugEnabled,
+        recursive: body.recursive === true,
         log: logger,
         lockKey: request.user.userKey || "default",
       },

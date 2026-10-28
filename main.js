@@ -381,12 +381,13 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
  * @param {*} _event - The IPC event object.
  * @param {string} directoryPath - The path to the directory to read.
  * @param {string} [sortBy=defaultSortBy] - The field to sort by.
- * @returns {Promise<string[]>} An array of file paths in the directory.
+ * @param {boolean} [recursive=false] - Whether to include nested folders.
+ * @returns {Promise<Object>} The paired images and folder details.
  */
 ipcMain.handle(
   "read-directory",
-  (_event, directoryPath, sortBy = defaultSortBy) =>
-    readDirectory(directoryPath, sortBy),
+  (_event, directoryPath, sortBy = defaultSortBy, recursive = false) =>
+    readDirectory(directoryPath, sortBy, { recursive: recursive === true }),
 );
 
 /**
@@ -466,11 +467,13 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
  * IPC handler for setting the date on all images in a directory that do not
  * already have an XMP sidecar file.
  * @param {*} _event - The IPC event object.
- * @param {{directoryPath: string, date: string}} payload
+ * @param {{directoryPath: string, date: string, recursive?: boolean}} payload
  * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, errors: string[]}>}
  */
-ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
-  setFolderDate(directoryPath, date),
+ipcMain.handle(
+  "set-folder-date",
+  (_event, { directoryPath, date, recursive }) =>
+    setFolderDate(directoryPath, date, { recursive: recursive === true }),
 );
 
 /**
@@ -517,15 +520,21 @@ ipcMain.handle("set-do-not-upload", (_event, request) =>
     frontPath: request?.frontPath,
     backPath: request?.backPath,
     value: request?.value,
+    relativeDirectory: request?.relativeDirectory,
   }),
 );
 
-ipcMain.handle("upload-to-immich", async (_event, settings, directoryPath) => {
-  const reportProgress = (progress) => {
-    if (!_event.sender.isDestroyed()) {
-      _event.sender.send("immich-upload-progress", progress);
-    }
-  };
+ipcMain.handle(
+  "upload-to-immich",
+  async (_event, settings, directoryPath, recursive = false) => {
+    const reportProgress = (progress) => {
+      if (!_event.sender.isDestroyed()) {
+        _event.sender.send("immich-upload-progress", progress);
+      }
+    };
 
-  return runImmichUpload(settings, directoryPath, reportProgress);
-});
+    return runImmichUpload(settings, directoryPath, reportProgress, {
+      recursive: recursive === true,
+    });
+  },
+);
