@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   buildImageVersion,
   buildPreviewCacheKey,
+  buildThumbnailCacheKey,
   createPreviewCache,
 } from "./previewCache.js";
 
@@ -28,6 +29,23 @@ test("preview cache keys change with the path, size, modification time, change t
     // Pixel rotation restores the modification time, so the change time must also count.
     buildPreviewCacheKey("/photos/a.jpg", { ...stats, ctimeMs: stats.ctimeMs + 1000 }, 0),
     buildPreviewCacheKey("/photos/a.jpg", stats, 90),
+  ];
+  for (const variant of variants) {
+    assert.notEqual(variant, key);
+  }
+  assert.equal(new Set(variants).size, variants.length);
+});
+
+test("thumbnail cache keys never match preview keys and change with the version, rotation, and size", () => {
+  const key = buildThumbnailCacheKey("/photos/a.jpg", stats, 0, 320);
+  assert.match(key, /^[0-9a-f]{64}$/);
+  assert.equal(key, buildThumbnailCacheKey("/photos/a.jpg", { ...stats }, 0, 320));
+  const variants = [
+    buildPreviewCacheKey("/photos/a.jpg", stats, 0),
+    buildThumbnailCacheKey("/photos/b.jpg", stats, 0, 320),
+    buildThumbnailCacheKey("/photos/a.jpg", { ...stats, ctimeMs: stats.ctimeMs + 1000 }, 0, 320),
+    buildThumbnailCacheKey("/photos/a.jpg", stats, 90, 320),
+    buildThumbnailCacheKey("/photos/a.jpg", stats, 0, 640),
   ];
   for (const variant of variants) {
     assert.notEqual(variant, key);
