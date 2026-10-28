@@ -87,9 +87,9 @@ const createWebApi = (): ImageParserApi => ({
   readSidecarMetadata: (filePath) =>
     postJson("api/read-sidecar-metadata", { filePath }),
   saveMetadata: (metadata) => postJson("api/save-metadata", metadata),
-  getPreviewDataUrl: async (filePath, rotation) =>
-    (await postJson<{ url: string }>("api/preview-url", { filePath, rotation }))
-      .url,
+  // Built locally: the version changes whenever the file is rewritten, so the browser can cache each URL.
+  getPreviewDataUrl: async (filePath, version) =>
+    `api/image?${new URLSearchParams({ path: filePath, v: version }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>
@@ -168,6 +168,11 @@ const connectServerDebugLog = async () => {
     // Debug logging is optional; the app works without it.
   }
 };
+
+/**
+ * Reports whether the app runs in a browser against the web server rather than in Electron.
+ */
+export const isWebApp = () => isWebApiInstalled;
 
 /**
  * Returns the signed-in web user, or null in the desktop app or when the server cannot say.

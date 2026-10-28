@@ -7,8 +7,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   readSidecarMetadata: (filePath) =>
     ipcRenderer.invoke("read-sidecar-metadata", filePath),
   saveMetadata: (metadata) => ipcRenderer.invoke("save-metadata", metadata),
-  getPreviewDataUrl: (filePath, rotation) =>
-    ipcRenderer.invoke("get-preview-data-url", filePath, rotation),
+  getPreviewDataUrl: (filePath, version) =>
+    ipcRenderer.invoke("get-preview-data-url", filePath, version),
   applyImageRotations: (request) =>
     ipcRenderer.invoke("apply-image-rotations", request),
   setFolderDate: (directoryPath, date) =>
