@@ -120,6 +120,9 @@ Create a stack from `docker-compose.yml`. Configure these environment variables:
 | `IMAGEPARSER_DEBUG`      | `false`                      | Streams server logs to the browser  |
 | `IMAGEPARSER_TAG`        | `latest`                     | Image tag to run (default `latest`) |
 
+Resized previews are cached in `preview-cache/` inside the config directory and trimmed when the cache grows past
+1 GB. Set `IMAGEPARSER_PREVIEW_CACHE_MB` on the container to change the limit. The folder is safe to delete.
+
 For single sign-on with per-user folders, set the `OIDC_*` variables instead of the Basic auth pair; see
 [Single sign-on with Authentik](#single-sign-on-with-authentik).
 

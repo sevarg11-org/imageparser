@@ -16,15 +16,44 @@ import {
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import {
+  describeSaveFailure,
+  describeUnsavedImages,
+  getRemainingRotations,
+  getRotatedImageBox,
+  getUpdatedImageVersions,
+  mapRotatedPointToImage,
+  needsSaveOnLeave,
+  rotatePoint,
+  type ImageSaveResult,
+  type PairRotationState,
+  type RotationField,
+} from "./pairPersistence";
 import { SetFolderDateModal } from "./SetFolderDateModal";
-import { fetchCurrentUser, type CurrentUser } from "./webApi";
+import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
 
 type ImagePair = {
   id: string;
   imageLabel: string;
   frontPath: string;
   backPath: string | null;
+  frontVersion: string;
+  backVersion: string | null;
   createdAt: number;
+};
+
+type SidecarValues = {
+  date: string;
+  description: string;
+  tags: string[];
+  rotation: number;
+  hasSidecar: boolean;
+};
+
+type UnsavedPairEdits = {
+  imageLabel: string;
+  formValues: MetadataForm;
+  rotations: PairRotationState;
 };
 
 type SortField = "createdAt" | "dateTaken" | "fileName";
@@ -35,13 +64,6 @@ type MetadataForm = {
   date: string;
   description: string;
   tags: string[];
-};
-
-type RotationField = "front" | "back";
-
-type PairRotationState = {
-  front: number;
-  back: number;
 };
 
 type ImmichSettings = {
@@ -76,7 +98,16 @@ type ImageRotationResult = {
   field: RotationField;
   filePath: string;
   ok: boolean;
+  version?: string;
   error?: string;
+};
+
+type SaveMetadataResult = {
+  ok: boolean;
+  updatedFiles: number;
+  sidecarFile: string;
+  sidecarWritten: boolean;
+  results: ImageSaveResult[];
 };
 
 type ApplyImageRotationsResult = {
@@ -97,12 +128,7 @@ declare global {
         files: ImagePair[];
         recentTags: string[];
       }>;
-      readSidecarMetadata: (filePath: string) => Promise<{
-        date: string;
-        description: string;
-        tags: string[];
-        rotation: number;
-      }>;
+      readSidecarMetadata: (filePath: string) => Promise<SidecarValues>;
       saveMetadata: (metadata: {
         frontPath: string;
         backPath: string | null;
@@ -111,11 +137,8 @@ declare global {
         tags: string[];
         frontRotation: number;
         backRotation: number;
-      }) => Promise<{ ok: boolean; updatedFiles: number; sidecarFile: string }>;
-      getPreviewDataUrl: (
-        filePath: string,
-        rotation: number,
-      ) => Promise<string>;
+      }) => Promise<SaveMetadataResult>;
+      getPreviewDataUrl: (filePath: string, version: string) => Promise<string>;
       applyImageRotations: (request: {
         frontPath: string;
         backPath: string | null;
@@ -200,13 +223,14 @@ const selectAllOnFocusProps = {
 };
 
 /**
- * Resolves the preview source URL for an image, accounting for rotation.
- * When running in Electron, attempts to use a preview data URL; otherwise falls back to a file URL.
+ * Resolves the preview source URL for one version of an image.
+ * The web app builds the URL locally; Electron renders TIFF files in the main process.
+ * Rotation is shown with CSS, so it never changes the URL.
  * @param filePath - The path to the image file.
- * @param rotation - The rotation value in degrees.
+ * @param version - The file's version; it changes whenever the file is rewritten.
  * @returns A resolved source URL for displaying the image preview.
  */
-const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
+const useResolvedPreviewSrc = (filePath: string, version: string) => {
   const [src, setSrc] = useState("");
 
   useEffect(() => {
@@ -226,7 +250,7 @@ const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
       try {
         const previewUrl = await window.electronAPI.getPreviewDataUrl(
           filePath,
-          rotation,
+          version,
         );
         if (isActive) {
           setSrc(previewUrl || toFileUrl(filePath));
@@ -243,7 +267,7 @@ const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
     return () => {
       isActive = false;
     };
-  }, [filePath, rotation]);
+  }, [filePath, version]);
 
   return src;
 };
@@ -254,17 +278,29 @@ const MAGNIFIER_EDGE_BUFFER = 32;
 
 const MagnifiedImage = ({
   filePath,
+  version,
   altText,
   rotation,
+  isExpanded,
+  collapsedHeight,
 }: {
   filePath: string;
+  version: string;
   altText: string;
   rotation: number;
+  isExpanded: boolean;
+  collapsedHeight: number;
 }) => {
-  const src = useResolvedPreviewSrc(filePath, rotation);
+  const src = useResolvedPreviewSrc(filePath, version);
   const [isLoading, setIsLoading] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const [naturalSize, setNaturalSize] = useState<{
+    src: string;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [availableWidth, setAvailableWidth] = useState(0);
   const [lensStyle, setLensStyle] = useState<{
     left: number;
     top: number;
@@ -273,7 +309,65 @@ const MagnifiedImage = ({
   } | null>(null);
 
   /**
+   * Tracks the width available to the image, so quarter-turned images can be fitted to it.
+   */
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      const style = window.getComputedStyle(container);
+      setAvailableWidth(
+        container.clientWidth -
+          parseFloat(style.paddingLeft) -
+          parseFloat(style.paddingRight),
+      );
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  // A quarter turn swaps the visible width and height, so the image is sized and centred in a frame
+  // that has the rotated proportions.
+  const knownSize = naturalSize?.src === src ? naturalSize : null;
+  const rotatedBox =
+    rotation % 180 !== 0 && knownSize && availableWidth > 0
+      ? getRotatedImageBox({
+          naturalWidth: knownSize.width,
+          naturalHeight: knownSize.height,
+          rotation,
+          availableWidth,
+          targetHeight: isExpanded ? null : collapsedHeight,
+        })
+      : null;
+  const frameStyle: CSSProperties | undefined = rotatedBox
+    ? {
+        position: "relative",
+        width: rotatedBox.width,
+        height: rotatedBox.height,
+        marginInline: "auto",
+      }
+    : undefined;
+  const imageStyle: CSSProperties | undefined = rotatedBox
+    ? {
+        position: "absolute",
+        left: (rotatedBox.width - rotatedBox.height) / 2,
+        top: (rotatedBox.height - rotatedBox.width) / 2,
+        width: rotatedBox.height,
+        height: rotatedBox.width,
+        maxWidth: "none",
+        margin: 0,
+        transform: `rotate(${rotation}deg)`,
+      }
+    : rotation
+      ? { transform: `rotate(${rotation}deg)` }
+      : undefined;
+
+  /**
    * Handles mouse movement events to update the magnifier lens position and style.
+   * The lens samples the unrotated image and rotates its contents to match the displayed image.
    * @param event - The React mouse event object containing mouse position information.
    */
   const handleMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -327,12 +421,25 @@ const MagnifiedImage = ({
           )
         : hoverTop + (hoverHeight - MAGNIFIER_LENS_SIZE) / 2;
 
+    // offsetWidth/offsetHeight ignore the CSS rotation, giving the unrotated layout size.
+    const layoutSize = { width: image.offsetWidth, height: image.offsetHeight };
+    const sample = mapRotatedPointToImage(
+      { x: sampledImageX, y: sampledImageY },
+      { width: imageRect.width, height: imageRect.height },
+      layoutSize,
+      rotation,
+    );
+    const pointerInLens = rotatePoint(
+      { x: pointerX - lensLeft - halfLens, y: pointerY - lensTop - halfLens },
+      -rotation,
+    );
+
     setLensStyle({
       left: lensLeft,
       top: lensTop,
-      backgroundSize: `${imageRect.width * MAGNIFIER_ZOOM}px ${imageRect.height * MAGNIFIER_ZOOM}px`,
-      backgroundPosition: `${pointerX - lensLeft - sampledImageX * MAGNIFIER_ZOOM}px ${
-        pointerY - lensTop - sampledImageY * MAGNIFIER_ZOOM
+      backgroundSize: `${layoutSize.width * MAGNIFIER_ZOOM}px ${layoutSize.height * MAGNIFIER_ZOOM}px`,
+      backgroundPosition: `${halfLens + pointerInLens.x - sample.x * MAGNIFIER_ZOOM}px ${
+        halfLens + pointerInLens.y - sample.y * MAGNIFIER_ZOOM
       }px`,
     });
   };
@@ -344,12 +451,22 @@ const MagnifiedImage = ({
       onMouseMove={handleMouseMove}
       onMouseLeave={() => setLensStyle(null)}
     >
-      <img
-        ref={imageRef}
-        src={src}
-        alt={altText}
-        onLoad={() => setIsLoading(false)}
-      />
+      <div className="magnifier-frame" style={frameStyle}>
+        <img
+          ref={imageRef}
+          src={src}
+          alt={altText}
+          style={imageStyle}
+          onLoad={(event) => {
+            setIsLoading(false);
+            setNaturalSize({
+              src,
+              width: event.currentTarget.naturalWidth,
+              height: event.currentTarget.naturalHeight,
+            });
+          }}
+        />
+      </div>
       {!isLoading && lensStyle && src ? (
         <div
           className="magnifier-lens"
@@ -358,12 +475,19 @@ const MagnifiedImage = ({
             top: lensStyle.top,
             width: MAGNIFIER_LENS_SIZE,
             height: MAGNIFIER_LENS_SIZE,
-            backgroundImage: `url(${src})`,
-            backgroundRepeat: "no-repeat",
-            backgroundSize: lensStyle.backgroundSize,
-            backgroundPosition: lensStyle.backgroundPosition,
           }}
-        />
+        >
+          <div
+            className="magnifier-lens-image"
+            style={{
+              backgroundImage: `url("${src.replace(/"/g, '\\"')}")`,
+              backgroundRepeat: "no-repeat",
+              backgroundSize: lensStyle.backgroundSize,
+              backgroundPosition: lensStyle.backgroundPosition,
+              transform: rotation ? `rotate(${rotation}deg)` : undefined,
+            }}
+          />
+        </div>
       ) : null}
     </div>
   );
@@ -427,6 +551,23 @@ const defaultImmichSettings: ImmichSettings = {
   concurrentTasks: 2,
 };
 
+/**
+ * Reads the sidecar metadata of both images in a pair.
+ * @param electronApi - The desktop or web API.
+ * @param pair - The pair to read.
+ * @returns The front and back sidecar values (null without a back image).
+ */
+const readPairSidecars = (
+  electronApi: NonNullable<Window["electronAPI"]>,
+  pair: ImagePair,
+) =>
+  Promise.all([
+    electronApi.readSidecarMetadata(pair.frontPath),
+    pair.backPath
+      ? electronApi.readSidecarMetadata(pair.backPath)
+      : Promise.resolve(null),
+  ]);
+
 function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
@@ -485,7 +626,28 @@ function App() {
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] = useState(false);
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0);
+  // Versions of files rewritten since the directory was listed, so their previews are reloaded.
+  const [imageVersions, setImageVersions] = useState<Record<string, string>>(
+    {},
+  );
+  // The pair whose pending save has finished, so its images can be shown without stale orientation.
+  const [readyPairId, setReadyPairId] = useState<string | null>(null);
+  const [pairReloadToken, setPairReloadToken] = useState(0);
+  const [pendingSaveCount, setPendingSaveCount] = useState(0);
   const hasUserChangedRef = useRef(false);
+  // Incremented on every edit, so a save only marks the form clean if nothing changed meanwhile.
+  const editRevisionRef = useRef(0);
+  const pairHasSidecarRef = useRef(false);
+  const selectedPairIdRef = useRef<string | null>(null);
+  const pendingSavesRef = useRef(new Map<string, Promise<boolean>>());
+  const unsavedEditsRef = useRef(new Map<string, UnsavedPairEdits>());
+  const sidecarPrefetchRef = useRef(
+    new Map<string, Promise<[SidecarValues, SidecarValues | null]>>(),
+  );
+  const leavingSaveRef = useRef<{
+    pairId: string;
+    operation: Promise<boolean>;
+  } | null>(null);
   const dateInputRef = useRef<HTMLInputElement | null>(null);
   const dayInputRef = useRef<HTMLInputElement | null>(null);
   const yearInputRef = useRef<HTMLInputElement | null>(null);
@@ -495,7 +657,6 @@ function App() {
   const immichOutputRef = useRef<HTMLPreElement | null>(null);
   const isImmichOutputFollowingRef = useRef(true);
   const saveTimeoutRef = useRef<number | null>(null);
-  const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
   const displayPairs = useMemo(
     () => (filterOnlyPairs ? pairs.filter((p) => !!p.backPath) : pairs),
@@ -638,127 +799,215 @@ function App() {
     }
   }, []);
 
-  const savePairMetadata = useCallback(
-    async (pair: ImagePair, formValues: MetadataForm) => {
-      const electronApi = window.electronAPI;
-      if (!electronApi) {
-        throw new Error("This application must run inside Electron.");
-      }
-
-      await electronApi.saveMetadata({
-        frontPath: pair.frontPath,
-        backPath: pair.backPath,
-        date: formValues.date,
-        description: formValues.description,
-        tags: formValues.tags,
-        frontRotation: rotations.front,
-        backRotation: rotations.back,
-      });
-
-      hasUserChangedRef.current = false;
-    },
-    [rotations],
-  );
+  /**
+   * Records an edit to the current pair, so it is saved when the user moves on.
+   */
+  const markUserChanged = useCallback(() => {
+    hasUserChangedRef.current = true;
+    editRevisionRef.current += 1;
+  }, []);
 
   /**
-   * Persists metadata changes to the current selected pair and applies image rotations if needed.
-   * This is a debounced operation that saves changes after user input stabilizes.
-   * @param formValues - The metadata form values (description, date, tags) to persist.
-   *                      If not provided, uses the current metadata state.
+   * Keeps the selected pair's id in a ref, so background saves can tell whether their pair is still shown.
    */
-  const persistCurrentPair = useCallback(
-    (formValues: MetadataForm = metadata) => {
-      if (pendingPersistenceRef.current) {
-        return pendingPersistenceRef.current;
+  useEffect(() => {
+    selectedPairIdRef.current = selectedPair?.id ?? null;
+  }, [selectedPair?.id]);
+
+  /**
+   * Saves a pair's metadata and applies its pending rotations without blocking the UI.
+   * Saves of the same pair run in order. The returned promise never rejects; it resolves to whether the save succeeded.
+   * A failed save names the image in the status line and keeps its values (and any rotation not yet applied),
+   * so reopening the pair shows the user's edits.
+   * @param pair - The pair to save.
+   * @param formValues - The pair's form values.
+   * @param pairRotations - The rotations to apply to the files (zero to save metadata only).
+   * @param editRevision - The edit revision the form values belong to.
+   * @returns Whether the save succeeded.
+   */
+  const startPairSave = useCallback(
+    (
+      pair: ImagePair,
+      formValues: MetadataForm,
+      pairRotations: PairRotationState,
+      editRevision: number,
+    ) => {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        return Promise.resolve(false);
       }
 
-      const operation = (async () => {
-        if (!selectedPair) {
-          return true;
-        }
+      const appliesRotation =
+        pairRotations.front !== 0 || pairRotations.back !== 0;
+      const previousSave =
+        pendingSavesRef.current.get(pair.id) ?? Promise.resolve(true);
+      sidecarPrefetchRef.current.delete(pair.id);
 
-        if (!toIsoDate(dateSegmentsRef.current)) {
-          setStatus("Enter a valid month, day, and year before saving.");
-          return false;
-        }
-
-        const electronApi = window.electronAPI;
-        if (!electronApi) {
-          setStatus("This application must run inside Electron.");
-          return false;
-        }
-
-        const rotationSnapshot = { ...rotations };
-        setIsPersistingRotation(true);
-        clearPendingSave();
-
+      const operation = previousSave.then(async () => {
         try {
-          await savePairMetadata(selectedPair, formValues);
-
-          if (rotationSnapshot.front === 0 && rotationSnapshot.back === 0) {
-            return true;
+          const result = await electronApi.saveMetadata({
+            frontPath: pair.frontPath,
+            backPath: pair.backPath,
+            date: formValues.date,
+            description: formValues.description,
+            tags: formValues.tags,
+            frontRotation: pairRotations.front,
+            backRotation: pairRotations.back,
+          });
+          const updatedVersions = getUpdatedImageVersions(result.results);
+          if (Object.keys(updatedVersions).length) {
+            setImageVersions((current) => ({ ...current, ...updatedVersions }));
           }
 
-          const result = await electronApi.applyImageRotations({
-            frontPath: selectedPair.frontPath,
-            backPath: selectedPair.backPath,
-            frontRotation: rotationSnapshot.front,
-            backRotation: rotationSnapshot.back,
-          });
-          const remainingRotations = { ...rotationSnapshot };
-
-          for (const imageResult of result.results) {
-            if (imageResult.ok) {
-              remainingRotations[imageResult.field] = 0;
+          const remainingRotations = getRemainingRotations(
+            pairRotations,
+            result.results,
+          );
+          if (selectedPairIdRef.current === pair.id) {
+            pairHasSidecarRef.current = true;
+            if (appliesRotation) {
+              setRotations(remainingRotations);
+            }
+            if (result.ok && editRevisionRef.current === editRevision) {
+              hasUserChangedRef.current = false;
             }
           }
 
-          setRotations(remainingRotations);
-          const failures = result.results.filter(
-            (imageResult) => !imageResult.ok,
-          );
-          hasUserChangedRef.current =
-            remainingRotations.front !== 0 || remainingRotations.back !== 0;
-
-          if (failures.length) {
-            setStatus(
-              failures
-                .map((failure) => failure.error)
-                .filter(Boolean)
-                .join(" "),
-            );
-            return false;
+          if (result.ok) {
+            unsavedEditsRef.current.delete(pair.id);
+            return true;
           }
 
-          return result.ok;
-        } catch (error) {
-          hasUserChangedRef.current =
-            rotationSnapshot.front !== 0 || rotationSnapshot.back !== 0;
+          unsavedEditsRef.current.set(pair.id, {
+            imageLabel: pair.imageLabel,
+            formValues,
+            rotations: remainingRotations,
+          });
           setStatus(
-            error instanceof Error
-              ? error.message
-              : "Unable to persist image rotation.",
+            describeSaveFailure(
+              pair.imageLabel,
+              result.results
+                .filter((imageResult) => !imageResult.ok)
+                .map((imageResult) => imageResult.error),
+            ),
           );
           return false;
-        } finally {
-          setIsPersistingRotation(false);
+        } catch (error) {
+          unsavedEditsRef.current.set(pair.id, {
+            imageLabel: pair.imageLabel,
+            formValues,
+            rotations: pairRotations,
+          });
+          setStatus(
+            describeSaveFailure(pair.imageLabel, [
+              error instanceof Error ? error.message : undefined,
+            ]),
+          );
+          return false;
         }
-      })();
+      });
 
-      pendingPersistenceRef.current = operation;
-      void operation.finally(() => {
-        if (pendingPersistenceRef.current === operation) {
-          pendingPersistenceRef.current = null;
+      pendingSavesRef.current.set(pair.id, operation);
+      setPendingSaveCount(pendingSavesRef.current.size);
+      void operation.then(() => {
+        if (pendingSavesRef.current.get(pair.id) === operation) {
+          pendingSavesRef.current.delete(pair.id);
         }
+        setPendingSaveCount(pendingSavesRef.current.size);
       });
       return operation;
     },
-    [clearPendingSave, metadata, rotations, savePairMetadata, selectedPair],
+    [],
   );
 
   /**
-   * Navigates to a specific image index after persisting changes from the current pair.
-   * Binds the index to the valid range of displayed pairs and returns early if already at the target.
+   * Waits until every pending save has finished.
+   * @returns The labels of images whose changes could not be saved (empty when all saves succeeded).
+   */
+  const waitForPendingSaves = useCallback(async () => {
+    while (pendingSavesRef.current.size) {
+      await Promise.all(pendingSavesRef.current.values());
+    }
+    return Array.from(
+      unsavedEditsRef.current.values(),
+      (edits) => edits.imageLabel,
+    );
+  }, []);
+
+  /**
+   * Saves the selected pair when it has changes, a pending rotation, or no sidecar yet; otherwise writes nothing.
+   * @param formValues - The metadata form values to persist. If not provided, uses the current metadata state.
+   * @param options - Set wait to false to save in the background and return as soon as the date is validated.
+   * @returns False when the date is invalid or (when waiting) the save failed.
+   */
+  const persistCurrentPair = useCallback(
+    async (
+      formValues: MetadataForm = metadata,
+      { wait = true }: { wait?: boolean } = {},
+    ) => {
+      if (!selectedPair || !isHydrated) {
+        return true;
+      }
+
+      const leavingSave = leavingSaveRef.current;
+      if (leavingSave?.pairId === selectedPair.id) {
+        return wait ? leavingSave.operation : true;
+      }
+
+      if (!toIsoDate(dateSegmentsRef.current)) {
+        setStatus("Enter a valid month, day, and year before saving.");
+        return false;
+      }
+
+      if (!window.electronAPI) {
+        setStatus("This application must run inside Electron.");
+        return false;
+      }
+
+      clearPendingSave();
+      if (
+        !needsSaveOnLeave({
+          hasUserChanged: hasUserChangedRef.current,
+          rotations,
+          hasSidecar: pairHasSidecarRef.current,
+        })
+      ) {
+        return wait
+          ? ((await pendingSavesRef.current.get(selectedPair.id)) ?? true)
+          : true;
+      }
+
+      const operation = startPairSave(
+        selectedPair,
+        formValues,
+        rotations,
+        editRevisionRef.current,
+      );
+      const nextLeavingSave = { pairId: selectedPair.id, operation };
+      leavingSaveRef.current = nextLeavingSave;
+      void operation.then(() => {
+        if (leavingSaveRef.current === nextLeavingSave) {
+          leavingSaveRef.current = null;
+        }
+      });
+
+      if (!wait) {
+        return true;
+      }
+
+      setIsPersistingRotation(true);
+      try {
+        return await operation;
+      } finally {
+        setIsPersistingRotation(false);
+      }
+    },
+    [clearPendingSave, isHydrated, metadata, rotations, selectedPair, startPairSave],
+  );
+
+  /**
+   * Navigates to a specific image index, saving the current pair in the background.
+   * Only an invalid date blocks moving on; a failed save is reported in the status line.
    * @param nextIndex - The target zero-based image index to navigate to.
    * @param formValues - Optional metadata form values to persist before navigating.
    */
@@ -773,7 +1022,7 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair(formValues))) {
+      if (!(await persistCurrentPair(formValues, { wait: false }))) {
         return;
       }
 
@@ -792,7 +1041,8 @@ function App() {
 
   /**
    * Loads metadata from XMP sidecar files when the selected pair changes.
-   * Hydrates the component with initial state and updates metadata, rotations, and status.
+   * Waits for the pair's own pending save first, then uses prefetched sidecar values when available.
+   * Unsaved values from a failed save take precedence over the sidecar.
    */
   useEffect(() => {
     const electronApi = window.electronAPI;
@@ -801,72 +1051,101 @@ function App() {
     }
 
     let isMounted = true;
+    const pair = selectedPair;
     const imageStatus = formatImageStatus(
       selectedIndex,
       pairs.length,
-      selectedPair.imageLabel,
+      pair.imageLabel,
     );
 
+    const applyLoadedValues = (
+      values: MetadataForm,
+      pairRotations: PairRotationState,
+      hasChanges: boolean,
+      statusMessage: string,
+    ) => {
+      hasUserChangedRef.current = hasChanges;
+      setMetadata(values);
+      const loadedSegments = parseDateSegments(values.date);
+      dateSegmentsRef.current = loadedSegments;
+      setDateSegments(loadedSegments);
+      setTagInput("");
+      setRotations(pairRotations);
+      setIsHydrated(true);
+      setStatus(statusMessage);
+    };
+
     const loadMetadataFromSidecar = async () => {
+      await pendingSavesRef.current.get(pair.id);
+      if (!isMounted) {
+        return;
+      }
+      setReadyPairId(pair.id);
+
+      const unsavedEdits = unsavedEditsRef.current.get(pair.id);
+      const otherUnsavedImages = describeUnsavedImages(
+        Array.from(unsavedEditsRef.current)
+          .filter(([pairId]) => pairId !== pair.id)
+          .map(([, edits]) => edits.imageLabel),
+      );
+      const unsavedStatus = unsavedEdits
+        ? " Changes to this image are not saved yet."
+        : "";
+
       try {
-        const [frontXmpValues, backXmpValues] = await Promise.all([
-          electronApi.readSidecarMetadata(selectedPair.frontPath),
-          selectedPair.backPath
-            ? electronApi.readSidecarMetadata(selectedPair.backPath)
-            : Promise.resolve(null),
-        ]);
+        const prefetchedSidecars = sidecarPrefetchRef.current.get(pair.id);
+        sidecarPrefetchRef.current.delete(pair.id);
+        const [frontXmpValues, backXmpValues] = await (prefetchedSidecars ??
+          readPairSidecars(electronApi, pair));
 
         if (!isMounted) {
           return;
         }
 
-        hasUserChangedRef.current = false;
-        const loadedDate = frontXmpValues.date
-          ? frontXmpValues.date.slice(0, 10)
-          : defaultDate;
-        setMetadata({
-          date: loadedDate,
-          description: frontXmpValues.description ?? "",
-          tags: frontXmpValues.tags ?? [],
-        });
-        const loadedSegments = parseDateSegments(loadedDate);
-        dateSegmentsRef.current = loadedSegments;
-        setDateSegments(loadedSegments);
+        pairHasSidecarRef.current = frontXmpValues.hasSidecar;
+        const loadedTags = frontXmpValues.tags ?? [];
         setRecentTags((current) => [
-          ...(frontXmpValues.tags ?? []),
+          ...loadedTags,
           ...current.filter(
             (tag) =>
-              !(frontXmpValues.tags ?? []).some(
+              !loadedTags.some(
                 (loadedTag) =>
                   loadedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
               ),
           ),
         ]);
-        setTagInput("");
-        setRotations({
-          front: normalizeRotation(frontXmpValues.rotation ?? 0),
-          back: normalizeRotation(backXmpValues?.rotation ?? 0),
-        });
-        setIsHydrated(true);
-        setStatus(imageStatus);
+        applyLoadedValues(
+          unsavedEdits?.formValues ?? {
+            date: frontXmpValues.date
+              ? frontXmpValues.date.slice(0, 10)
+              : defaultDate,
+            description: frontXmpValues.description ?? "",
+            tags: loadedTags,
+          },
+          unsavedEdits?.rotations ?? {
+            front: normalizeRotation(frontXmpValues.rotation ?? 0),
+            back: normalizeRotation(backXmpValues?.rotation ?? 0),
+          },
+          Boolean(unsavedEdits),
+          `${imageStatus}${unsavedStatus}${otherUnsavedImages}`,
+        );
       } catch {
         if (!isMounted) {
           return;
         }
 
-        hasUserChangedRef.current = false;
-        setMetadata({
-          date: defaultDate,
-          description: "",
-          tags: [],
-        });
-        const defaultSegments = parseDateSegments(defaultDate);
-        dateSegmentsRef.current = defaultSegments;
-        setDateSegments(defaultSegments);
-        setTagInput("");
-        setRotations({ front: 0, back: 0 });
-        setIsHydrated(true);
-        setStatus(`${imageStatus} Unable to read saved metadata.`);
+        // Treat an unreadable sidecar as existing, so leaving the pair unchanged does not overwrite it.
+        pairHasSidecarRef.current = true;
+        applyLoadedValues(
+          unsavedEdits?.formValues ?? {
+            date: defaultDate,
+            description: "",
+            tags: [],
+          },
+          unsavedEdits?.rotations ?? { front: 0, back: 0 },
+          Boolean(unsavedEdits),
+          `${imageStatus} Unable to read saved metadata.${unsavedStatus}${otherUnsavedImages}`,
+        );
       }
     };
 
@@ -875,17 +1154,105 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [pairs.length, selectedIndex, selectedPair]);
+  }, [pairReloadToken, pairs.length, selectedIndex, selectedPair]);
 
   /**
-   * Debounces metadata saves and clears pending changes when conditions change.
-   * Triggers a save after user changes stabilize or when navigation occurs.
+   * Prefetches the neighbouring pairs' images and sidecar metadata once the current pair is shown.
+   * Pairs with a pending save are skipped; they are loaded after their save finishes.
+   */
+  useEffect(() => {
+    const electronApi = window.electronAPI;
+    if (!electronApi || !selectedPair || !isHydrated) {
+      return;
+    }
+
+    const neighbours = [
+      displayPairs[selectedIndex + 1],
+      displayPairs[selectedIndex - 1],
+    ].filter((pair): pair is ImagePair => Boolean(pair));
+    const neighbourIds = new Set(neighbours.map((pair) => pair.id));
+    for (const pairId of sidecarPrefetchRef.current.keys()) {
+      if (!neighbourIds.has(pairId)) {
+        sidecarPrefetchRef.current.delete(pairId);
+      }
+    }
+
+    const timer = window.setTimeout(() => {
+      for (const pair of neighbours) {
+        if (pendingSavesRef.current.has(pair.id)) {
+          continue;
+        }
+
+        if (!sidecarPrefetchRef.current.has(pair.id)) {
+          const request = readPairSidecars(electronApi, pair);
+          sidecarPrefetchRef.current.set(pair.id, request);
+          request.catch(() => {
+            if (sidecarPrefetchRef.current.get(pair.id) === request) {
+              sidecarPrefetchRef.current.delete(pair.id);
+            }
+          });
+        }
+
+        const images: [string | null, string | null][] = [
+          [pair.frontPath, pair.frontVersion],
+          [pair.backPath, pair.backVersion],
+        ];
+        for (const [filePath, listedVersion] of images) {
+          if (!filePath) {
+            continue;
+          }
+          void electronApi
+            .getPreviewDataUrl(
+              filePath,
+              imageVersions[filePath] ?? listedVersion ?? "",
+            )
+            .then((url) => {
+              if (url) {
+                const preloadedImage = new Image();
+                preloadedImage.src = url;
+              }
+            })
+            .catch(() => {
+              // Prefetching is optional; the image loads normally when the pair is opened.
+            });
+        }
+      }
+    }, 150);
+
+    return () => window.clearTimeout(timer);
+  }, [displayPairs, imageVersions, isHydrated, selectedIndex, selectedPair]);
+
+  /**
+   * Warns before leaving the web app while saves are pending or have failed.
+   * The desktop app instead waits for pending writes before it quits.
+   */
+  useEffect(() => {
+    if (!isWebApp()) {
+      return;
+    }
+
+    const warnAboutPendingSaves = (event: BeforeUnloadEvent) => {
+      if (
+        pendingSavesRef.current.size ||
+        unsavedEditsRef.current.size ||
+        saveTimeoutRef.current !== null
+      ) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("beforeunload", warnAboutPendingSaves);
+    return () =>
+      window.removeEventListener("beforeunload", warnAboutPendingSaves);
+  }, []);
+
+  /**
+   * Debounces metadata saves while the user edits the current pair.
+   * Rotations are applied when the pair is left, so these saves only write metadata.
    */
   useEffect(() => {
     const electronApi = window.electronAPI;
     if (!selectedPair || !electronApi || !isHydrated) {
       clearPendingSave();
-      hasUserChangedRef.current = false;
       return;
     }
 
@@ -897,25 +1264,25 @@ function App() {
     if (!toIsoDate(dateSegmentsRef.current)) {
       return;
     }
-    saveTimeoutRef.current = window.setTimeout(async () => {
-      try {
-        await savePairMetadata(selectedPair, metadata);
-        setStatus(formatSavedStatus(selectedPair.imageLabel));
-      } catch (error) {
-        setStatus(
-          error instanceof Error
-            ? error.message
-            : "Unable to save the metadata.",
-        );
-      } finally {
-        saveTimeoutRef.current = null;
-      }
+    saveTimeoutRef.current = window.setTimeout(() => {
+      saveTimeoutRef.current = null;
+      const pair = selectedPair;
+      void startPairSave(
+        pair,
+        metadata,
+        { front: 0, back: 0 },
+        editRevisionRef.current,
+      ).then((ok) => {
+        if (ok && selectedPairIdRef.current === pair.id) {
+          setStatus(formatSavedStatus(pair.imageLabel));
+        }
+      });
     }, 350);
 
     return () => {
       clearPendingSave();
     };
-  }, [clearPendingSave, selectedPair, metadata, isHydrated, savePairMetadata]);
+  }, [clearPendingSave, selectedPair, metadata, isHydrated, startPairSave]);
 
   /**
    * Focuses the date input field when the component becomes hydrated and a pair is selected.
@@ -937,6 +1304,7 @@ function App() {
 
   /**
    * Rotates an image by a given delta value (in 90-degree increments).
+   * The rotation is shown with CSS straight away and written to the file when the pair is left.
    * Does not apply rotation if already persisting, uploading, or not hydrated.
    * @param field - Which image to rotate ("front" or "back").
    * @param delta - The rotation change in degrees (typically Â±90).
@@ -947,13 +1315,13 @@ function App() {
         return;
       }
 
-      hasUserChangedRef.current = true;
+      markUserChanged();
       setRotations((current) => ({
         ...current,
         [field]: normalizeRotation(current[field] + delta),
       }));
     },
-    [isHydrated, isPersistingRotation, isUploading],
+    [isHydrated, isPersistingRotation, isUploading, markUserChanged],
   );
 
   /**
@@ -1040,7 +1408,7 @@ function App() {
    * @param value - The new value for the field.
    */
   const updateFormField = (field: "date" | "description", value: string) => {
-    hasUserChangedRef.current = true;
+    markUserChanged();
     setMetadata((current) => ({ ...current, [field]: value }));
   };
 
@@ -1050,7 +1418,7 @@ function App() {
    * @param tags - The new array of tag strings.
    */
   const updateTags = (tags: string[]) => {
-    hasUserChangedRef.current = true;
+    markUserChanged();
     setMetadata((current) => ({ ...current, tags }));
   };
 
@@ -1254,15 +1622,8 @@ function App() {
 
     if (selectedIndex + 1 >= pairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
-        try {
-          await savePairMetadata(selectedPair, formValues);
+        if (await persistCurrentPair(formValues)) {
           setStatus(formatSavedStatus(selectedPair.imageLabel));
-        } catch (error) {
-          setStatus(
-            error instanceof Error
-              ? error.message
-              : "Unable to save the metadata.",
-          );
         }
       }
       return;
@@ -1299,11 +1660,28 @@ function App() {
         return;
       }
 
+      setStatus("Saving changes...");
+      const unsavedImages = await waitForPendingSaves();
+      if (
+        unsavedImages.length &&
+        !window.confirm(
+          `Changes to ${unsavedImages.join(", ")} could not be saved and will be lost. Open the other folder anyway?`,
+        )
+      ) {
+        setStatus(
+          `Stayed in this folder.${describeUnsavedImages(unsavedImages)}`,
+        );
+        return;
+      }
+
       setStatus("Scanning directory for photos...");
       const result = await window.electronAPI.readDirectory(
         selectedDirectory,
         sortBy,
       );
+      unsavedEditsRef.current.clear();
+      sidecarPrefetchRef.current.clear();
+      setImageVersions({});
       setDirectoryPath(result.directoryPath);
       setIsHydrated(false);
       setPairs(result.files);
@@ -1350,10 +1728,13 @@ function App() {
       setStatus("Sorting photos...");
 
       try {
+        await waitForPendingSaves();
         const result = await window.electronAPI.readDirectory(
           directoryPath,
           nextSortBy,
         );
+        sidecarPrefetchRef.current.clear();
+        setImageVersions({});
         setSortBy(nextSortBy);
         setIsHydrated(false);
         setPairs(result.files);
@@ -1373,8 +1754,25 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, persistCurrentPair],
+    [directoryPath, persistCurrentPair, waitForPendingSaves],
   );
+
+  /**
+   * Turns the "Only pairs" filter on or off after the current pair and all pending saves are written.
+   * @param checked - Whether only pairs with a back image are shown.
+   */
+  const handleFilterOnlyPairsChange = async (checked: boolean) => {
+    if (!(await persistCurrentPair())) {
+      return;
+    }
+
+    await waitForPendingSaves();
+    const nextPairs = checked ? pairs.filter((pair) => !!pair.backPath) : pairs;
+    if (nextPairs[selectedIndex]?.id !== selectedPair?.id) {
+      setIsHydrated(false);
+    }
+    setFilterOnlyPairs(checked);
+  };
 
   /**
    * Updates an Immich setting field with a new value and persists it to storage.
@@ -1410,6 +1808,14 @@ function App() {
       if (!(await persistCurrentPair())) {
         setImmichStatus(
           "Upload stopped because an image rotation could not be persisted.",
+        );
+        return;
+      }
+
+      const unsavedImages = await waitForPendingSaves();
+      if (unsavedImages.length) {
+        setImmichStatus(
+          `Upload stopped because changes to ${unsavedImages.join(", ")} could not be saved. Open those images to retry.`,
         );
         return;
       }
@@ -1461,6 +1867,7 @@ function App() {
         throw new Error("API is not available.");
       }
 
+      await waitForPendingSaves();
       const result = await electronApi.setFolderDate(directoryPath, date);
 
       if (result.ok) {
@@ -1488,7 +1895,9 @@ function App() {
       setIsSetFolderDateModalOpen(false);
       // Reload the current pair's metadata to reflect any write that may have
       // affected the currently displayed image.
+      sidecarPrefetchRef.current.clear();
       setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -1505,6 +1914,10 @@ function App() {
     Boolean(immichSettings.userApiKey.trim());
   const isTransitionLocked = isBusy || isPersistingRotation || isUploading || isSettingFolderDate;
   const isImageControlLocked = isTransitionLocked || !isHydrated;
+  const getDisplayedVersion = (
+    filePath: string | null,
+    listedVersion: string | null,
+  ) => (filePath ? (imageVersions[filePath] ?? listedVersion ?? "") : "");
   const imageStackStyle: ImageStackStyle = {
     "--collapsed-image-height": `${collapsedImageHeight}px`,
   };
@@ -1551,6 +1964,11 @@ function App() {
 
       <div className="status-bar">
         <span>{status}</span>
+        {pendingSaveCount > 0 ? (
+          <span className="save-indicator" role="status">
+            Saving {pendingSaveCount} image{pendingSaveCount === 1 ? "" : "s"}…
+          </span>
+        ) : null}
         {directoryPath ? <strong>{directoryPath}</strong> : null}
       </div>
 
@@ -1759,7 +2177,10 @@ function App() {
                 <input
                   type="checkbox"
                   checked={filterOnlyPairs}
-                  onChange={(event) => setFilterOnlyPairs(event.target.checked)}
+                  disabled={isTransitionLocked}
+                  onChange={(event) =>
+                    void handleFilterOnlyPairsChange(event.target.checked)
+                  }
                 />
                 <span>Only pairs</span>
               </label>
@@ -1859,9 +2280,19 @@ function App() {
                       </div>
                     </div>
                     <MagnifiedImage
-                      filePath={selectedPair?.frontPath ?? ""}
+                      filePath={
+                        selectedPair && readyPairId === selectedPair.id
+                          ? selectedPair.frontPath
+                          : ""
+                      }
+                      version={getDisplayedVersion(
+                        selectedPair?.frontPath ?? null,
+                        selectedPair?.frontVersion ?? null,
+                      )}
                       altText={`${selectedPair?.imageLabel ?? ""}`}
                       rotation={rotations.front}
+                      isExpanded={isExpanded}
+                      collapsedHeight={collapsedImageHeight}
                     />
                   </div>
 
@@ -1894,9 +2325,19 @@ function App() {
                         </div>
                       </div>
                       <MagnifiedImage
-                        filePath={selectedPair?.backPath ?? ""}
+                        filePath={
+                          readyPairId === selectedPair.id
+                            ? selectedPair.backPath
+                            : ""
+                        }
+                        version={getDisplayedVersion(
+                          selectedPair.backPath,
+                          selectedPair.backVersion,
+                        )}
                         altText={`${selectedPair?.imageLabel ?? ""} backside`}
                         rotation={rotations.back}
+                        isExpanded={isExpanded}
+                        collapsedHeight={collapsedImageHeight}
                       />
                     </div>
                   ) : null}

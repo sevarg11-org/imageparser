@@ -365,12 +365,25 @@
   border-radius: 6px;
   pointer-events: none;
   box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.45);
+  overflow: hidden;
   z-index: 5;
   transition:
     left 100ms ease-out,
-    top 100ms ease-out,
+    top 100ms ease-out;
+}
+
+/* Holds the magnified image; rotated with the displayed image so the lens matches it. */
+.magnifier-lens-image {
+  position: absolute;
+  inset: 0;
+  transition:
     background-size 100ms ease-out,
     background-position 100ms ease-out;
+}
+
+.save-indicator {
+  color: #7dd3fc;
+  white-space: nowrap;
 }
 
 .metadata-panel {

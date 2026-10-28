@@ -4,7 +4,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { exiftool } from "exiftool-vendored";
 import sharp from "sharp";
-import { createSerialQueue } from "./imageFileQueue.js";
+import { createKeyedQueue } from "./imageFileQueue.js";
+import {
+  buildImageVersion,
+  buildPreviewCacheKey,
+  createPreviewCache,
+} from "./previewCache.js";
 
 /**
  * The set of supported image file extensions.
@@ -74,18 +79,42 @@ const metadataRotationExtensions = new Set([".jpg", ".jpeg", ".tif", ".tiff"]);
 const pixelRotationExtensions = new Set([".png", ".webp"]);
 
 /**
- * A Map tracking revision numbers for modified image files.
- * Used to detect changes between the original and processed images.
- * @type {Map<string, number>}
+ * Serializes operations per image file: reads and writes of the same file stay ordered,
+ * while previews and saves for unrelated files (or other users) run concurrently.
+ * @type {{run: Function, whenIdle: () => Promise<void>, size: () => number}}
  */
-const imageRevisionByPath = new Map();
+const imageFileLock = createKeyedQueue();
 
 /**
- * Creates a serial queue to prevent concurrent image file operations.
- * Ensures metadata writes and preview reads do not conflict.
- * @type {AsyncQueue}
+ * Runs an operation while holding the lock for each of the given image files.
+ * @param {Array<string|null|undefined>} filePaths - The image files the operation reads or writes.
+ * @param {() => Promise<*>} operation - The operation to run.
+ * @returns {Promise<*>} The operation's result.
  */
-const runImageFileOperation = createSerialQueue();
+const runImageFileOperation = (filePaths, operation) =>
+  imageFileLock.run(
+    filePaths.filter(Boolean).map((filePath) => path.resolve(filePath)),
+    operation,
+  );
+
+/**
+ * The longest side, in pixels, of a rendered preview.
+ * Large enough for the 2.5x magnifier on a typical display.
+ * @type {number}
+ */
+const previewMaxDimension = 2560;
+
+/**
+ * The number of previews rendered at the same time, to bound memory use on small servers.
+ * @type {number}
+ */
+const maxConcurrentPreviewRenders = 2;
+
+/**
+ * The preview cache, or null until configurePreviewCache is called.
+ * @type {ReturnType<typeof createPreviewCache>|null}
+ */
+let previewCache = null;
 
 /**
  * The default Immich settings object with empty or default values.
@@ -819,7 +848,7 @@ const readDateTakenTimestamp = async (frontPath, backPath) => {
  * Supports date-taken sorting when available, falling back to file creation time.
  * @param {string[]} filePaths - The array of image file paths in the directory.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, createdAt: number, dateTaken: number|null}>>}
+ * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null}>>}
  */
 const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
@@ -842,13 +871,18 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
       const frontCandidate =
         items.find((item) => item.side === "a") ?? items[0];
       const backCandidate = items.find((item) => item.side === "b") ?? null;
-      const frontStats = await fs.stat(frontCandidate.filePath);
+      const [frontStats, backStats] = await Promise.all([
+        fs.stat(frontCandidate.filePath),
+        backCandidate ? fs.stat(backCandidate.filePath) : null,
+      ]);
 
       return {
         id: `${getGroupKey(frontCandidate.fileName)}-${frontCandidate.fileName}`,
         imageLabel: frontCandidate.fileName,
         frontPath: frontCandidate.filePath,
         backPath: backCandidate ? backCandidate.filePath : null,
+        frontVersion: buildImageVersion(frontStats),
+        backVersion: backStats ? buildImageVersion(backStats) : null,
         createdAt:
           frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
         dateTaken: shouldReadDateTaken
@@ -939,17 +973,12 @@ ${blocks}
  * Reads image metadata (date, description, tags, rotation) from a sidecar file.
  * Falls back to EXIF tool if date is missing from XMP, returning empty metadata if not found.
  * @param {string} filePath - The path to the image file whose sidecar metadata is being read.
- * @returns {Promise<Object>} An object with date, description, tags, and rotation (default: 0).
+ * @returns {Promise<Object>} An object with date, description, tags, rotation (default: 0), and whether a sidecar exists.
  */
 const readSidecarMetadata = async (filePath) => {
   const sidecarPath = await resolveExistingSidecarPath(filePath);
   if (!sidecarPath) {
-    return {
-      date: "",
-      description: "",
-      tags: [],
-      rotation: 0,
-    };
+    return emptySidecarMetadata();
   }
 
   try {
@@ -985,14 +1014,11 @@ const readSidecarMetadata = async (filePath) => {
       description,
       tags: readTagsFromXmp(rawXml),
       rotation: 0,
+      hasSidecar: true,
     };
   } catch {
-    return {
-      date: "",
-      description: "",
-      tags: [],
-      rotation: 0,
-    };
+    // An unreadable sidecar still exists, so it is rewritten on the next save.
+    return { ...emptySidecarMetadata(), hasSidecar: true };
   }
 };
 
@@ -1003,17 +1029,28 @@ const readSidecarMetadata = async (filePath) => {
  * @param {string} dateValue - The date value to normalize and store.
  * @param {string} description - The description text to store (can be empty).
  * @param {string[]} [tags=[]] - An optional array of tag strings.
+ * @returns {Promise<{sidecarPath: string, written: boolean}>} The sidecar path and whether it changed.
  */
 const writeSidecarFile = async (filePath, dateValue, description, tags) => {
-  const sidecarPath =
-    (await resolveExistingSidecarPath(filePath)) ?? buildSidecarPath(filePath);
+  const existingSidecarPath = await resolveExistingSidecarPath(filePath);
+  const sidecarPath = existingSidecarPath ?? buildSidecarPath(filePath);
   const xml = buildSidecarDocument({
     dateValue,
     description,
     tags,
   });
 
+  if (existingSidecarPath) {
+    const currentXml = await fs
+      .readFile(existingSidecarPath, "utf8")
+      .catch(() => null);
+    if (currentXml === xml) {
+      return { sidecarPath, written: false };
+    }
+  }
+
   await fs.writeFile(sidecarPath, xml, "utf8");
+  return { sidecarPath, written: true };
 };
 
 /**
@@ -1055,59 +1092,134 @@ const readRecentTags = async (directoryPath) => {
 };
 
 /**
- * Writes a normalized date value as embedded EXIF metadata into an image file.
- * Validates the file extension and ensures ExifTool successfully updates the created date field.
- * @param {string} filePath - The path to the image file whose metadata is being updated.
- * @param {string} dateValue - The date value to embed in EXIF fields.
- * @throws {Error} If the file type doesn't support embedded metadata or ExifTool fails to update the field.
+ * Asserts that embedded metadata can be written to an image file.
+ * @param {string} filePath - The path to the image file.
+ * @throws {Error} If the file type doesn't support embedded metadata.
  */
-const writeEmbeddedImageDate = async (filePath, dateValue) => {
+const assertEmbeddedMetadataSupported = (filePath) => {
   const extension = path.extname(filePath).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new Error(
       `Embedded metadata is not supported for ${extension || "this file type"}.`,
     );
   }
+};
 
-  const exifDate = normalizeExifDate(dateValue);
-  const result = await exiftool.write(
-    filePath,
-    {
-      "EXIF:CreateDate": exifDate,
-      "EXIF:DateTimeOriginal": exifDate,
-      SubSecTimeOriginal: 0,
-    },
-    { writeArgs: ["-overwrite_original"] },
-  );
+/**
+ * Reads the embedded tags that saving compares against: the EXIF dates and the orientation.
+ * Reads only these tags, so it does not scan or rewrite the whole image.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<{CreateDate?: string, DateTimeOriginal?: string, SubSecTimeOriginal?: number|string, Orientation?: number}>}
+ */
+const readEmbeddedImageTags = (filePath) =>
+  exiftool.readRaw(filePath, {
+    readArgs: [
+      "-fast",
+      "-n",
+      "-EXIF:CreateDate",
+      "-EXIF:DateTimeOriginal",
+      "-EXIF:SubSecTimeOriginal",
+      "-Orientation",
+    ],
+  });
+
+/**
+ * Checks whether an image already stores the given EXIF date, so writing it again can be skipped.
+ * @param {{CreateDate?: string, DateTimeOriginal?: string, SubSecTimeOriginal?: number|string}} tags - Tags from readEmbeddedImageTags.
+ * @param {string} exifDate - The date in EXIF format ("YYYY:MM:DD HH:mm:ss").
+ * @returns {boolean} True when the stored date matches.
+ */
+const hasEmbeddedImageDate = (tags, exifDate) =>
+  String(tags?.CreateDate ?? "") === exifDate &&
+  String(tags?.DateTimeOriginal ?? "") === exifDate &&
+  tags?.SubSecTimeOriginal !== undefined &&
+  Number(tags.SubSecTimeOriginal) === 0;
+
+/**
+ * Writes embedded EXIF tags with ExifTool, replacing the original file.
+ * @param {string} filePath - The path to the image file.
+ * @param {Object} tags - The tags to write.
+ * @param {string} description - What is being updated, for the error message.
+ * @throws {Error} If ExifTool fails to update the file.
+ */
+const writeEmbeddedTags = async (filePath, tags, description) => {
+  const result = await exiftool.write(filePath, tags, {
+    writeArgs: ["-overwrite_original"],
+  });
 
   if (result.updated !== 1 && result.unchanged !== 1) {
     throw new Error(
-      `ExifTool did not update the created date for ${path.basename(filePath)}.`,
+      `ExifTool did not update the ${description} for ${path.basename(filePath)}.`,
     );
   }
 };
 
 /**
- * Rotates an image by updating its EXIF Orientation metadata.
- * Uses ExifTool to modify the Orientation field without changing image pixels.
- * @param {string} filePath - The path to the image file whose orientation is being updated.
- * @param {number} rotation - The rotation angle in degrees.
- * @throws {Error} If ExifTool fails to update the orientation field.
+ * Builds the EXIF tags that store a date taken.
+ * @param {string} exifDate - The date in EXIF format.
+ * @returns {Object} The tags for ExifTool.
  */
-const rotateImageMetadata = async (filePath, rotation) => {
-  const tags = await exiftool.read(filePath);
-  const orientation = composeExifOrientation(tags.Orientation, rotation);
-  const result = await exiftool.write(
-    filePath,
-    { "Orientation#": orientation },
-    { writeArgs: ["-overwrite_original"] },
-  );
+const buildEmbeddedDateTags = (exifDate) => ({
+  "EXIF:CreateDate": exifDate,
+  "EXIF:DateTimeOriginal": exifDate,
+  SubSecTimeOriginal: 0,
+});
 
-  if (result.updated !== 1 && result.unchanged !== 1) {
+/**
+ * Writes a date and an optional rotation into one image file with as few rewrites as possible.
+ * JPEG and TIFF rotations update the Orientation tag in the same ExifTool write as the date.
+ * PNG and WebP rotations rewrite the pixels, which keeps the embedded date.
+ * Nothing is written when the stored date already matches and no rotation is requested.
+ * @param {string} filePath - The path to the image file.
+ * @param {string} dateValue - The date value to embed.
+ * @param {*} [rotation=0] - The clockwise rotation to apply, in degrees.
+ * @returns {Promise<{dateWritten: boolean, rotated: boolean}>} What was written.
+ * @throws {Error} If the file type is unsupported or a write fails.
+ */
+const writeEmbeddedImageMetadata = async (
+  filePath,
+  dateValue,
+  rotation = 0,
+) => {
+  assertEmbeddedMetadataSupported(filePath);
+  const exifDate = normalizeExifDate(dateValue);
+  const normalizedRotation = normalizeRotationValue(rotation);
+  const extension = path.extname(filePath).toLowerCase();
+  const tags = await readEmbeddedImageTags(filePath);
+  const needsDate = !hasEmbeddedImageDate(tags, exifDate);
+
+  if (normalizedRotation && metadataRotationExtensions.has(extension)) {
+    await writeEmbeddedTags(
+      filePath,
+      {
+        ...(needsDate ? buildEmbeddedDateTags(exifDate) : {}),
+        "Orientation#": composeExifOrientation(
+          tags.Orientation,
+          normalizedRotation,
+        ),
+      },
+      needsDate ? "created date and orientation" : "orientation",
+    );
+    return { dateWritten: needsDate, rotated: true };
+  }
+
+  if (normalizedRotation && !pixelRotationExtensions.has(extension)) {
     throw new Error(
-      `ExifTool did not update the orientation for ${path.basename(filePath)}.`,
+      `Rotation is not supported for ${extension || "this file type"}.`,
     );
   }
+
+  if (normalizedRotation) {
+    await rotateImagePixels(filePath, normalizedRotation);
+  }
+  if (needsDate) {
+    await writeEmbeddedTags(
+      filePath,
+      buildEmbeddedDateTags(exifDate),
+      "created date",
+    );
+  }
+  return { dateWritten: needsDate, rotated: Boolean(normalizedRotation) };
 };
 
 /**
@@ -1144,7 +1256,6 @@ const rotateImagePixels = async (filePath, rotation) => {
 /**
  * Applies a rotation to an image file using the appropriate method for its format.
  * Updates EXIF Orientation for JPEG/TIFF or rotates pixels for PNG/WebP.
- * Tracks the revision number for changed files and increments it after successful rotation.
  * @param {string} filePath - The path to the image file being rotated.
  * @param {*} rotation - The requested rotation angle in degrees.
  * @returns {Promise<boolean>} True if rotation was applied, false if no rotation is needed.
@@ -1162,7 +1273,17 @@ const applyImageRotation = async (filePath, rotation) => {
   }
 
   if (metadataRotationExtensions.has(extension)) {
-    await rotateImageMetadata(filePath, normalizedRotation);
+    const tags = await readEmbeddedImageTags(filePath);
+    await writeEmbeddedTags(
+      filePath,
+      {
+        "Orientation#": composeExifOrientation(
+          tags.Orientation,
+          normalizedRotation,
+        ),
+      },
+      "orientation",
+    );
   } else if (pixelRotationExtensions.has(extension)) {
     await rotateImagePixels(filePath, normalizedRotation);
   } else {
@@ -1171,10 +1292,6 @@ const applyImageRotation = async (filePath, rotation) => {
     );
   }
 
-  imageRevisionByPath.set(
-    filePath,
-    (imageRevisionByPath.get(filePath) ?? 0) + 1,
-  );
   return true;
 };
 
@@ -1205,7 +1322,12 @@ const applyImageRotations = async (request) => {
     rotations.map(async ({ field, filePath, rotation }) => {
       try {
         await applyImageRotation(filePath, rotation);
-        return { field, filePath, ok: true };
+        return {
+          field,
+          filePath,
+          ok: true,
+          version: buildImageVersion(await fs.stat(filePath)),
+        };
       } catch (error) {
         return {
           field,
@@ -1230,13 +1352,14 @@ const applyImageRotations = async (request) => {
 /**
  * Returns an empty metadata object with default placeholder values.
  * Used when no metadata exists or as a fallback return value.
- * @returns {{date: string, description: string, tags: string[], rotation: number}} An object with empty date/description and empty tags array.
+ * @returns {{date: string, description: string, tags: string[], rotation: number, hasSidecar: boolean}} An object with empty date/description and empty tags array.
  */
 const emptySidecarMetadata = () => ({
   date: "",
   description: "",
   tags: [],
   rotation: 0,
+  hasSidecar: false,
 });
 
 /**
@@ -1339,57 +1462,90 @@ const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
 };
 
 /**
- * Updates image metadata with provided date, description, and tags.
- * Writes sidecar files for the front image (and back if provided) and embeds the date in EXIF.
- * Runs through the serial queue to prevent concurrent file operations.
- * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[]}} metadata - The metadata update request containing paths and values.
- * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string}>} Success result with count of updated files and path to the sidecar file created.
- */
-/**
- * Updates image metadata with provided date, description, and tags.
- * Writes sidecar files for the front image (and back if provided) and embeds the date in EXIF.
- * Runs through the serial queue to prevent concurrent file operations.
- * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[]}} metadata - The metadata update request containing paths and values.
- * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string}>} Success result with count of updated files and path to the sidecar file created.
+ * Updates image metadata with provided date, description, and tags, and applies any requested rotations.
+ * Writes the A-file sidecar and embeds the date in each image, combining a rotation with the date in one
+ * ExifTool write per file. Writes whose stored values already match are skipped.
+ * Holds the lock for both images so reads and writes of the same files stay ordered.
+ * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[], frontRotation?: number, backRotation?: number}} metadata - The metadata update request containing paths, values, and rotations.
+ * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string, sidecarWritten: boolean, results: Array<{field: "front"|"back", filePath: string, ok: boolean, dateWritten: boolean, rotated: boolean, version?: string, error?: string}>}>} The per-image results; ok is false when any image could not be updated.
+ * @throws {Error} If no image is selected, the date is invalid, or the sidecar cannot be written.
  */
 const saveMetadata = (metadata) =>
-  runImageFileOperation(async () => {
+  runImageFileOperation([metadata?.frontPath, metadata?.backPath], async () => {
     if (!metadata?.frontPath) {
       throw new Error("No image selected for metadata update.");
     }
 
     const dateValue = normalizeDateValue(metadata.date);
+    normalizeExifDate(dateValue);
 
-    await writeSidecarFile(
+    const { sidecarPath, written } = await writeSidecarFile(
       metadata.frontPath,
       dateValue,
       metadata.description,
       metadata.tags,
     );
 
-    const imagePaths = [metadata.frontPath, metadata.backPath].filter(Boolean);
-    await Promise.all(
-      imagePaths.map((filePath) => writeEmbeddedImageDate(filePath, dateValue)),
+    const images = [
+      {
+        field: "front",
+        filePath: metadata.frontPath,
+        rotation: metadata.frontRotation,
+      },
+      {
+        field: "back",
+        filePath: metadata.backPath,
+        rotation: metadata.backRotation,
+      },
+    ].filter(({ filePath }) => filePath);
+
+    const results = await Promise.all(
+      images.map(async ({ field, filePath, rotation }) => {
+        try {
+          const { dateWritten, rotated } = await writeEmbeddedImageMetadata(
+            filePath,
+            dateValue,
+            rotation,
+          );
+          return {
+            field,
+            filePath,
+            ok: true,
+            dateWritten,
+            rotated,
+            version: buildImageVersion(await fs.stat(filePath)),
+          };
+        } catch (error) {
+          return {
+            field,
+            filePath,
+            ok: false,
+            dateWritten: false,
+            rotated: false,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Unable to update the image metadata.",
+          };
+        }
+      }),
     );
 
     return {
-      ok: true,
-      updatedFiles: imagePaths.length,
-      sidecarFile:
-        (await resolveExistingSidecarPath(metadata.frontPath)) ??
-        buildSidecarPath(metadata.frontPath),
+      ok: results.every((result) => result.ok),
+      updatedFiles: results.filter(
+        (result) => result.ok && (result.dateWritten || result.rotated),
+      ).length,
+      sidecarFile: sidecarPath,
+      sidecarWritten: written,
+      results,
     };
   });
 
 /**
  * Reads metadata from an image's sidecar file or returns empty defaults if not found.
  * @param {string} [filePath] - The path to the image file (optional).
- * @returns {Promise<Object>} An object containing date, description, tags array, and rotation value.
- */
-/**
- * Reads metadata from an image's sidecar file or returns empty defaults if not found.
- * @param {string} [filePath] - The path to the image file (optional).
- * @returns {Promise<Object>} An object containing date, description, tags array, and rotation value.
+ * @returns {Promise<Object>} An object containing date, description, tags array, rotation value, and whether a sidecar exists.
  */
 const readSidecarMetadataForFile = async (filePath) => {
   if (!filePath) {
@@ -1400,27 +1556,20 @@ const readSidecarMetadataForFile = async (filePath) => {
 };
 
 /**
- * Retrieves the current revision number for an image file from the revision map.
- * The revision count tracks how many times an image has been modified or rotated.
+ * Returns the current version string of an image file.
+ * The version changes whenever the file is rewritten, so it can be used to refresh cached previews.
  * @param {string} filePath - The path to the image file.
- * @returns {number} The revision number (0 if no prior modifications have been recorded).
+ * @returns {Promise<string>} The version string.
  */
-/**
- * Retrieves the current revision number for an image file from the revision map.
- * The revision count tracks how many times an image has been modified or rotated.
- * @param {string} filePath - The path to the image file.
- * @returns {number} The revision number (0 if no prior modifications have been recorded).
- */
-const getImageRevision = (filePath) => imageRevisionByPath.get(filePath) ?? 0;
+const getImageVersion = async (filePath) =>
+  buildImageVersion(await fs.stat(filePath));
 
-// Browsers cannot display TIFF and un-rotated previews can be served as-is.
 /**
- * Checks whether an image needs to be rendered as a PNG preview in the browser.
- * TIFF images always need rendering since browsers cannot display them natively.
- * Images with non-zero rotation also need rendering for proper orientation.
+ * Checks whether the desktop app needs a rendered preview because the browser cannot show the file.
+ * TIFF images always need rendering; so do images with a non-zero rotation.
  * @param {string} filePath - The path to the image file.
  * @param {number} [rotation=0] - The current rotation angle in degrees.
- * @returns {boolean} True if the image needs a rendered PNG preview, false otherwise.
+ * @returns {boolean} True if the image needs a rendered preview, false otherwise.
  */
 const needsRenderedPreview = (filePath, rotation = 0) => {
   const extension = path.extname(filePath).toLowerCase();
@@ -1431,29 +1580,108 @@ const needsRenderedPreview = (filePath, rotation = 0) => {
 };
 
 /**
- * Renders an image file as a PNG buffer with optional rotation applied.
- * First applies EXIF auto-orientation, then rotates if needed, and converts to PNG format.
+ * Renders an image file as a WebP preview whose longest side is at most previewMaxDimension pixels.
+ * First applies EXIF auto-orientation, then rotates if needed.
  * @param {string} filePath - The path to the source image file.
  * @param {number} [rotation=0] - The rotation angle in degrees to apply after auto-orientation.
- * @returns {Promise<Buffer>} A Promise resolving to a PNG image buffer.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
  */
-const renderPreviewPng = async (filePath, rotation = 0) => {
+const renderPreview = (filePath, rotation = 0) => {
   const normalizedRotation = normalizeRotationValue(rotation);
   let image = sharp(filePath).autoOrient();
   if (normalizedRotation) {
     image = image.rotate(normalizedRotation);
   }
-  return image.webp({ preset: "photo", quality: 50 }).toBuffer();
+  return image
+    .resize({
+      width: previewMaxDimension,
+      height: previewMaxDimension,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ preset: "photo", quality: 80 })
+    .toBuffer();
+};
+
+let activePreviewRenders = 0;
+const waitingPreviewRenders = [];
+
+/**
+ * Runs a preview render once one of the limited render slots is free.
+ * @param {() => Promise<Buffer>} operation - The render to run.
+ * @returns {Promise<Buffer>} The render's result.
+ */
+const withPreviewRenderSlot = async (operation) => {
+  if (activePreviewRenders >= maxConcurrentPreviewRenders) {
+    // The finishing render hands its slot straight to the next waiting render.
+    await new Promise((resolve) => waitingPreviewRenders.push(resolve));
+  } else {
+    activePreviewRenders += 1;
+  }
+
+  try {
+    return await operation();
+  } finally {
+    const next = waitingPreviewRenders.shift();
+    if (next) {
+      next();
+    } else {
+      activePreviewRenders -= 1;
+    }
+  }
 };
 
 /**
- * Queues an image rotation request to run through the serial file operation queue.
- * Ensures rotations are processed sequentially to avoid concurrent file conflicts.
+ * Returns a resized WebP preview of an image, from the preview cache when possible.
+ * Holds only this file's lock, so previews never wait behind writes to other files.
+ * @param {string} filePath - The path to the source image file.
+ * @param {number} [rotation=0] - The rotation angle in degrees to apply after auto-orientation.
+ * @returns {Promise<{buffer: Buffer, version: string, contentType: string}>} The preview and the source file's version.
+ */
+const getImagePreview = (filePath, rotation = 0) =>
+  runImageFileOperation([filePath], async () => {
+    const normalizedRotation = normalizeRotationValue(rotation);
+    const stats = await fs.stat(filePath);
+    const version = buildImageVersion(stats);
+    const cache = previewCache;
+    const cacheKey = cache
+      ? buildPreviewCacheKey(filePath, stats, normalizedRotation)
+      : null;
+
+    const cachedBuffer = cacheKey ? await cache.get(cacheKey) : null;
+    if (cachedBuffer) {
+      return { buffer: cachedBuffer, version, contentType: "image/webp" };
+    }
+
+    const buffer = await withPreviewRenderSlot(() =>
+      renderPreview(filePath, normalizedRotation),
+    );
+    if (cacheKey) {
+      // Storing the preview does not touch the source file, so it does not need to hold the lock.
+      void cache.put(cacheKey, buffer);
+    }
+    return { buffer, version, contentType: "image/webp" };
+  });
+
+/**
+ * Enables the on-disk preview cache.
+ * @param {{directory: string, maxBytes?: number}} options - The cache directory (outside the photo root) and its size cap.
+ * @returns {ReturnType<typeof createPreviewCache>} The configured cache.
+ */
+const configurePreviewCache = (options) => {
+  previewCache = createPreviewCache(options);
+  return previewCache;
+};
+
+/**
+ * Queues an image rotation request while holding the lock for both images.
  * @param {{frontPath: string|null, frontRotation: number|null, backPath: string|null, backRotation: number|null}} request - The rotation request with file paths and angles.
  * @returns {Promise<{ok: boolean, updatedFiles: number, results: Array}>>} The result of applying rotations to both images (if present).
  */
 const applyImageRotationsQueued = (request) =>
-  runImageFileOperation(() => applyImageRotations(request));
+  runImageFileOperation([request?.frontPath, request?.backPath], () =>
+    applyImageRotations(request),
+  );
 
 /**
  * Sets the date on every image pair in a directory that does not already have
@@ -1478,13 +1706,21 @@ const setFolderDate = async (directoryPath, date) => {
         continue;
       }
 
-      await saveMetadata({
+      const result = await saveMetadata({
         frontPath: pair.frontPath,
         backPath: pair.backPath,
         date,
         description: "",
         tags: [],
       });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
       updatedPairs += 1;
     } catch (error) {
       errors.push(
@@ -1497,6 +1733,12 @@ const setFolderDate = async (directoryPath, date) => {
 };
 
 /**
+ * Resolves once every queued image file operation (saves, rotations, previews) has finished.
+ * @returns {Promise<void>}
+ */
+const whenImageFileOperationsIdle = () => imageFileLock.whenIdle();
+
+/**
  * Gracefully shuts down ExifTool to release file handles and system resources.
  * Should be called when the application is closing to ensure clean shutdown.
  */
@@ -1506,8 +1748,10 @@ export {
   allowedExtensions,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
+  configurePreviewCache,
   defaultSortBy,
-  getImageRevision,
+  getImagePreview,
+  getImageVersion,
   getImmichFailureHints,
   getImmichGoDiagnostics,
   loadImmichSettings,
@@ -1516,11 +1760,10 @@ export {
   normalizeSortBy,
   readDirectory,
   readSidecarMetadataForFile as readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setFolderDate,
   shutdownCore,
+  whenImageFileOperationsIdle,
 };

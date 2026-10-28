@@ -21,21 +21,22 @@ import {
 import {
   allowedExtensions,
   applyImageRotations,
+  configurePreviewCache,
   defaultSortBy,
-  getImageRevision,
+  getImagePreview,
+  getImageVersion,
   getImmichGoDiagnostics,
   loadImmichSettings,
-  needsRenderedPreview,
+  normalizeRotationValue,
   normalizeSortBy,
   readDirectory,
   readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setFolderDate,
   shutdownCore,
+  whenImageFileOperationsIdle,
 } from "./core.js";
 import {
   createAllowedRootsCache,
@@ -52,6 +53,10 @@ const configuredRoot = path.resolve(process.env.IMAGEPARSER_ROOT || "/data");
 const configDirectory = path.resolve(
   process.env.IMAGEPARSER_CONFIG_DIR || "/config",
 );
+// Previews are cached under the config directory, never inside the photo root.
+const previewCacheDirectory = path.join(configDirectory, "preview-cache");
+const previewCacheMaxBytes =
+  (Number(process.env.IMAGEPARSER_PREVIEW_CACHE_MB) || 1024) * 1024 * 1024;
 const authUsername = process.env.IMAGEPARSER_USERNAME || "";
 const authPassword = process.env.IMAGEPARSER_PASSWORD || "";
 const debugEnabled = /^(1|true|yes|on)$/i.test(
@@ -459,21 +464,6 @@ const readJsonBody = async (request) => {
 };
 
 /**
- * Builds an image URL with rotation and revision parameters.
- * @param {string} filePath - The path to the image file.
- * @param {number} rotation - The rotation value (0-360).
- * @returns {string} The constructed image URL.
- */
-const buildImageUrl = (filePath, rotation) => {
-  const params = new URLSearchParams({
-    path: filePath,
-    rotation: String(Number(rotation) || 0),
-    rev: String(getImageRevision(filePath)),
-  });
-  return `api/image?${params.toString()}`;
-};
-
-/**
  * Progress stream clients grouped by user key, so upload output only reaches its owner.
  * @type {Map<string, Set<ServerResponse>>}
  */
@@ -692,7 +682,9 @@ const handleBrowse = async (user, url) => {
 };
 
 /**
- * Handles an image request, returning the raw file or a rendered preview.
+ * Handles an image request, returning a resized WebP preview of the file.
+ * The browser builds the URL with the file's version (`v`); a request whose version matches the
+ * file on disk may be cached indefinitely, because any rewrite of the file changes its version.
  * @param {ClientRequest} request - The HTTP request object.
  * @param {ServerResponse} response - The HTTP response object.
  * @param {URL} url - The parsed URL object containing query parameters.
@@ -709,37 +701,30 @@ const handleImage = async (request, response, url) => {
     throw new HttpError(400, "Unsupported image type.");
   }
 
-  const rotation = Number(url.searchParams.get("rotation")) || 0;
-  const stats = await fs.stat(filePath);
-  const etag = `"${stats.size.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}-${rotation}"`;
-  const cacheHeaders = { ETag: etag, "Cache-Control": "private, no-cache" };
+  const rotation = normalizeRotationValue(url.searchParams.get("rotation"));
+  const buildCacheHeaders = (version) => ({
+    ETag: `"${version}-${rotation}"`,
+    "Cache-Control":
+      url.searchParams.get("v") === version
+        ? "private, max-age=31536000, immutable"
+        : "private, no-cache",
+  });
 
-  if (request.headers["if-none-match"] === etag) {
-    response.writeHead(304, cacheHeaders);
+  const currentVersion = await getImageVersion(filePath);
+  const currentHeaders = buildCacheHeaders(currentVersion);
+  if (request.headers["if-none-match"] === currentHeaders.ETag) {
+    response.writeHead(304, currentHeaders);
     response.end();
     return;
   }
 
-  if (needsRenderedPreview(filePath, rotation)) {
-    const pngBuffer = await runImageFileOperation(() =>
-      renderPreviewPng(filePath, rotation),
-    );
-    response.writeHead(200, {
-      ...cacheHeaders,
-      "Content-Type": "image/webp",
-      "Content-Length": pngBuffer.length,
-    });
-    response.end(pngBuffer);
-    return;
-  }
-
+  const preview = await getImagePreview(filePath, rotation);
   response.writeHead(200, {
-    ...cacheHeaders,
-    "Content-Type":
-      contentTypeByExtension[extension] ?? "application/octet-stream",
-    "Content-Length": stats.size,
+    ...buildCacheHeaders(preview.version),
+    "Content-Type": preview.contentType,
+    "Content-Length": preview.buffer.length,
   });
-  fsSync.createReadStream(filePath).pipe(response);
+  response.end(preview.buffer);
 };
 
 /**
@@ -790,15 +775,6 @@ const createApiRoutes = (secretCodec) => ({
     saveMetadata(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
-  "POST /api/preview-url": async (request) => {
-    const body = await readJsonBody(request);
-    return {
-      url: buildImageUrl(
-        await resolvePathForUser(request.user, body.filePath),
-        body.rotation,
-      ),
-    };
-  },
   "POST /api/apply-image-rotations": async (request) =>
     applyImageRotations(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
@@ -1189,6 +1165,24 @@ const start = async () => {
 
   rootDirectory = await fs.realpath(configuredRoot);
   const masterKey = await loadSecretKey();
+  const realConfigDirectory = await fs
+    .realpath(configDirectory)
+    .catch(() => configDirectory);
+  const realPreviewCacheDirectory = path.join(
+    realConfigDirectory,
+    path.basename(previewCacheDirectory),
+  );
+  if (isInsideDirectory(realPreviewCacheDirectory, rootDirectory)) {
+    // Cached previews must never appear among (or be served as) the user's photos.
+    logger.warn(
+      "IMAGEPARSER_CONFIG_DIR is inside IMAGEPARSER_ROOT; the preview cache is disabled.",
+    );
+  } else {
+    configurePreviewCache({
+      directory: realPreviewCacheDirectory,
+      maxBytes: previewCacheMaxBytes,
+    });
+  }
   const server = http.createServer(
     createRequestHandler({
       secretCodec: createAesGcmCodec(masterKey),
@@ -1207,7 +1201,10 @@ const start = async () => {
     ]) {
       client.end();
     }
-    void shutdownCore().finally(() => process.exit(0));
+    // Let in-flight metadata writes finish so no image is left half-written.
+    void whenImageFileOperationsIdle()
+      .then(() => shutdownCore())
+      .finally(() => process.exit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
