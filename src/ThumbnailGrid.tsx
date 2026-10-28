@@ -27,10 +27,16 @@ type ThumbnailGridProps = {
   /** Shown instead of the grid when there are no cells. */
   emptyMessage: string;
   onOpen: (id: string) => void;
+  /** Rotates a cell's A image by the given degrees (±90). */
+  onRotate: (id: string, delta: number) => void;
+  /** False while rotating is unavailable, such as during an upload. */
+  canRotate: boolean;
 };
 
 type LazyThumbnailProps = {
   url: string;
+  /** The rotation, in degrees, to show the thumbnail with until the file itself is rotated. */
+  rotation: number;
   observeVisibility: ObserveVisibility;
   loadQueue: ThumbnailLoadQueue;
 };
@@ -41,6 +47,7 @@ type LazyThumbnailProps = {
  */
 const LazyThumbnail = ({
   url,
+  rotation,
   observeVisibility,
   loadQueue,
 }: LazyThumbnailProps) => {
@@ -100,6 +107,7 @@ const LazyThumbnail = ({
         ref={imageRef}
         src={src || undefined}
         alt=""
+        style={rotation ? { transform: `rotate(${rotation}deg)` } : undefined}
         decoding="async"
         draggable={false}
         onLoad={() => finishLoad("loaded")}
@@ -118,6 +126,8 @@ type ThumbnailCellProps = {
   loadQueue: ThumbnailLoadQueue;
   registerButton: RegisterButton;
   onOpen: (id: string) => void;
+  onRotate: (id: string, delta: number) => void;
+  canRotate: boolean;
 };
 
 const ThumbnailCell = memo(function ThumbnailCell({
@@ -126,6 +136,8 @@ const ThumbnailCell = memo(function ThumbnailCell({
   loadQueue,
   registerButton,
   onOpen,
+  onRotate,
+  canRotate,
 }: ThumbnailCellProps) {
   const { id } = cell;
   const setButton = useCallback(
@@ -146,6 +158,7 @@ const ThumbnailCell = memo(function ThumbnailCell({
         <LazyThumbnail
           key={cell.thumbnailUrl}
           url={cell.thumbnailUrl}
+          rotation={cell.rotation}
           observeVisibility={observeVisibility}
           loadQueue={loadQueue}
         />
@@ -176,6 +189,27 @@ const ThumbnailCell = memo(function ThumbnailCell({
           ) : null}
         </span>
       </button>
+      {/* Siblings of the cell's button, since buttons cannot be nested; they sit over its top corners. */}
+      <button
+        type="button"
+        className="thumbnail-rotate thumbnail-rotate--left"
+        aria-label={`Rotate ${cell.imageLabel} left`}
+        title="Rotate left"
+        disabled={!canRotate}
+        onClick={() => onRotate(id, -90)}
+      >
+        <span aria-hidden="true">↺</span>
+      </button>
+      <button
+        type="button"
+        className="thumbnail-rotate thumbnail-rotate--right"
+        aria-label={`Rotate ${cell.imageLabel} right`}
+        title="Rotate right"
+        disabled={!canRotate}
+        onClick={() => onRotate(id, 90)}
+      >
+        <span aria-hidden="true">↻</span>
+      </button>
     </li>
   );
 });
@@ -189,6 +223,8 @@ export const ThumbnailGrid = ({
   focusCellId,
   emptyMessage,
   onOpen,
+  onRotate,
+  canRotate,
 }: ThumbnailGridProps) => {
   const [loadQueue] = useState(createThumbnailLoadQueue);
   const observerRef = useRef<IntersectionObserver | null>(null);
@@ -263,6 +299,8 @@ export const ThumbnailGrid = ({
           loadQueue={loadQueue}
           registerButton={registerButton}
           onOpen={onOpen}
+          onRotate={onRotate}
+          canRotate={canRotate}
         />
       ))}
     </ul>
