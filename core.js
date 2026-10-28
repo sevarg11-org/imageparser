@@ -24,6 +24,19 @@ const allowedExtensions = new Set([
 ]);
 
 /**
+ * Matches the `_a`/`_b` (or front/back) side suffix at the end of a file stem.
+ * @type {RegExp}
+ */
+const sideSuffixPattern = /[_-](?:a|b|front|back)$/i;
+
+/**
+ * The file name marker for image groups flagged "Do not upload". It is placed before the
+ * side suffix (img001_exclude_a.jpg), so the fixed immich-go ban patterns skip the files.
+ * @type {string}
+ */
+const excludeMarker = "_exclude";
+
+/**
  * The default sort field and direction for directory listings.
  * @type {string}
  */
@@ -237,6 +250,11 @@ const buildImmichUploadArguments = (
     String(settings.albumName),
     "--ban-file",
     "**_b.**",
+    // Groups flagged "Do not upload" carry the _exclude marker in their file names.
+    "--ban-file",
+    "**_exclude_**",
+    "--ban-file",
+    "**_exclude.**",
   ];
 
   if (settings.adminApiKey) {
@@ -721,7 +739,10 @@ const getStem = (fileName) => fileName.replace(/\.[^.]+$/, "");
  */
 const getGroupKey = (fileName) => {
   const stem = getStem(fileName);
-  const normalizedStem = stem.replace(/[_-](?:a|b|front|back)$/i, "");
+  // The exclude marker is ignored so a group still pairs when only one side was renamed.
+  const normalizedStem = stem
+    .replace(sideSuffixPattern, "")
+    .replace(/[_-]exclude$/i, "");
   return normalizedStem.toLowerCase();
 };
 
@@ -742,6 +763,59 @@ const getSideFromFileName = (fileName) => {
   const side = match[1].toLowerCase();
   return side === "front" || side === "a" ? "a" : "b";
 };
+
+/**
+ * Rewrites the part of an image or sidecar file name that sits before the side suffix.
+ * Sidecars named `name.ext.xmp` are rewritten through the image name they wrap; legacy
+ * `name.xmp` sidecars and images are rewritten directly.
+ * @param {string} fileName - The image or sidecar file name.
+ * @param {(base: string) => string} transform - Maps the stem without its side suffix.
+ * @returns {string} The rewritten file name.
+ */
+const transformImageBaseName = (fileName, transform) => {
+  const sidecarMatch = fileName.match(/^(.+)(\.xmp)$/i);
+  if (
+    sidecarMatch &&
+    allowedExtensions.has(path.extname(sidecarMatch[1]).toLowerCase())
+  ) {
+    return transformImageBaseName(sidecarMatch[1], transform) + sidecarMatch[2];
+  }
+
+  const extension = path.extname(fileName);
+  const stem = fileName.slice(0, fileName.length - extension.length);
+  const sideSuffix = stem.match(sideSuffixPattern)?.[0] ?? "";
+  const base = stem.slice(0, stem.length - sideSuffix.length);
+  return `${transform(base)}${sideSuffix}${extension}`;
+};
+
+/**
+ * Adds the exclude marker before the side suffix (or before the extension for singles).
+ * @param {string} fileName - The image or sidecar file name.
+ * @returns {string} The flagged file name; unchanged if it is already flagged.
+ */
+const toExcludedName = (fileName) =>
+  transformImageBaseName(fileName, (base) =>
+    base.endsWith(excludeMarker) ? base : `${base}${excludeMarker}`,
+  );
+
+/**
+ * Removes the exclude marker from before the side suffix.
+ * @param {string} fileName - The image or sidecar file name.
+ * @returns {string} The unflagged file name; unchanged if it is not flagged.
+ */
+const toIncludedName = (fileName) =>
+  transformImageBaseName(fileName, (base) =>
+    base.endsWith(excludeMarker)
+      ? base.slice(0, base.length - excludeMarker.length)
+      : base,
+  );
+
+/**
+ * Checks whether a file name carries the exclude marker before its side suffix.
+ * @param {string} fileName - The image or sidecar file name.
+ * @returns {boolean} True when the file is flagged "Do not upload".
+ */
+const isExcludedName = (fileName) => toIncludedName(fileName) !== fileName;
 
 /**
  * Normalizes a sort-by value into a field and direction object.
@@ -844,11 +918,33 @@ const readDateTakenTimestamp = async (frontPath, backPath) => {
 };
 
 /**
+ * Builds the identity and "Do not upload" state of a pair from its file paths.
+ * The flag is read from the A file name; a B file that disagrees marks the group as mixed.
+ * @param {string} frontPath - The path to the front (A) image.
+ * @param {string|null} backPath - The path to the back (B) image, if any.
+ * @returns {{id: string, imageLabel: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
+ */
+const describePair = (frontPath, backPath) => {
+  const frontName = path.basename(frontPath);
+  const doNotUpload = isExcludedName(frontName);
+  return {
+    id: `${getGroupKey(frontName)}-${frontName}`,
+    imageLabel: frontName,
+    frontPath,
+    backPath,
+    doNotUpload,
+    excludeMismatch: backPath
+      ? isExcludedName(path.basename(backPath)) !== doNotUpload
+      : false,
+  };
+};
+
+/**
  * Groups image files by their base name and creates front/back pairs.
  * Supports date-taken sorting when available, falling back to file creation time.
  * @param {string[]} filePaths - The array of image file paths in the directory.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null}>>}
+ * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean}>>}
  */
 const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
@@ -877,10 +973,10 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
       ]);
 
       return {
-        id: `${getGroupKey(frontCandidate.fileName)}-${frontCandidate.fileName}`,
-        imageLabel: frontCandidate.fileName,
-        frontPath: frontCandidate.filePath,
-        backPath: backCandidate ? backCandidate.filePath : null,
+        ...describePair(
+          frontCandidate.filePath,
+          backCandidate ? backCandidate.filePath : null,
+        ),
         frontVersion: buildImageVersion(frontStats),
         backVersion: backStats ? buildImageVersion(backStats) : null,
         createdAt:
@@ -891,6 +987,8 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
               backCandidate?.filePath,
             )
           : null,
+        hasSidecar:
+          (await resolveExistingSidecarPath(frontCandidate.filePath)) !== null,
       };
     }),
   );
@@ -1684,12 +1782,192 @@ const applyImageRotationsQueued = (request) =>
   );
 
 /**
+ * Checks whether a path exists without following symlinks.
+ * @param {string} filePath - The path to check.
+ * @returns {Promise<boolean>} True if something exists at the path.
+ */
+const pathExists = async (filePath) => {
+  try {
+    await fs.lstat(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+};
+
+/**
+ * Lists the renames that set or clear the exclude marker on a group's images and sidecars.
+ * Sidecars are looked up under both the flagged and unflagged image names, so a group that
+ * was partly renamed by hand is brought back in line. Every target stays in its source folder.
+ * @param {string[]} imagePaths - The group's image paths.
+ * @param {boolean} value - True to flag the group, false to clear the flag.
+ * @returns {Promise<Array<{from: string, to: string}>>} The renames still needed.
+ */
+const planDoNotUploadRenames = async (imagePaths, value) => {
+  const renameFileName = value ? toExcludedName : toIncludedName;
+  const plannedSources = new Set();
+  const plan = [];
+  const addRename = (from) => {
+    if (plannedSources.has(from)) {
+      return;
+    }
+    plannedSources.add(from);
+    const to = path.join(
+      path.dirname(from),
+      renameFileName(path.basename(from)),
+    );
+    if (to !== from) {
+      plan.push({ from, to });
+    }
+  };
+
+  for (const imagePath of imagePaths) {
+    addRename(imagePath);
+    const directory = path.dirname(imagePath);
+    const imageName = path.basename(imagePath);
+    for (const name of new Set([
+      toIncludedName(imageName),
+      toExcludedName(imageName),
+    ])) {
+      for (const sidecarPath of getSidecarCandidatePaths(
+        path.join(directory, name),
+      )) {
+        if (await pathExists(sidecarPath)) {
+          addRename(sidecarPath);
+        }
+      }
+    }
+  }
+
+  return plan;
+};
+
+/**
+ * Flags an image group "Do not upload" by renaming its images and sidecars to carry the
+ * exclude marker, or clears the flag by removing it. Nothing is renamed when a target name
+ * already exists, and renames already done are undone if a later one fails.
+ * @param {{frontPath: string, backPath: string|null, value: boolean}} request - The group and the flag value.
+ * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
+ * @returns {Promise<{ok: boolean, id: string, imageLabel: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
+ * @throws {Error} If the request is invalid, a target exists, or a rename fails.
+ */
+const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
+  const frontPath = String(request?.frontPath ?? "");
+  const backPath = request?.backPath ? String(request.backPath) : null;
+  const value = request?.value;
+  if (!frontPath) {
+    throw new Error("No image selected to flag.");
+  }
+  if (typeof value !== "boolean") {
+    throw new Error("Choose whether the image group should be uploaded.");
+  }
+
+  const imagePaths = [frontPath, backPath].filter(Boolean);
+  for (const imagePath of imagePaths) {
+    if (!allowedExtensions.has(path.extname(imagePath).toLowerCase())) {
+      throw new Error(`${path.basename(imagePath)} is not a supported image.`);
+    }
+  }
+  if (
+    backPath &&
+    (path.dirname(backPath) !== path.dirname(frontPath) ||
+      getGroupKey(path.basename(backPath)) !==
+        getGroupKey(path.basename(frontPath)))
+  ) {
+    throw new Error("The front and back images must belong to the same group.");
+  }
+  for (const imagePath of imagePaths) {
+    if (!(await pathExists(imagePath))) {
+      throw new Error(
+        `${path.basename(imagePath)} no longer exists. Reload the folder.`,
+      );
+    }
+  }
+
+  const plan = await planDoNotUploadRenames(imagePaths, value);
+  const action = value ? "flag" : "clear the flag on";
+  const plannedTargets = new Set();
+  for (const { to } of plan) {
+    if (plannedTargets.has(to) || (await pathExists(to))) {
+      throw new Error(
+        `Unable to ${action} this image group because ${path.basename(to)} already exists. No files were renamed.`,
+      );
+    }
+    plannedTargets.add(to);
+  }
+
+  const renamed = [];
+  for (const operation of plan) {
+    try {
+      await rename(operation.from, operation.to);
+      renamed.push(operation);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Unknown error";
+      const notRolledBack = new Set();
+      for (const done of [...renamed].reverse()) {
+        try {
+          await rename(done.to, done.from);
+        } catch {
+          notRolledBack.add(done);
+        }
+      }
+
+      if (!notRolledBack.size) {
+        throw new Error(
+          `Unable to rename ${path.basename(operation.from)}: ${reason} No files were renamed.`,
+        );
+      }
+
+      const currentNames = plan
+        .map(
+          (planned) =>
+            `${path.basename(planned.from)} is now ${path.basename(
+              notRolledBack.has(planned) ? planned.to : planned.from,
+            )}`,
+        )
+        .join("; ");
+      throw new Error(
+        `Unable to rename ${path.basename(operation.from)}: ${reason} Some renames could not be undone. Current names: ${currentNames}.`,
+      );
+    }
+  }
+
+  // Preview URLs carry the path and the file version, so report the renamed files' versions.
+  const renamedPath = (filePath) =>
+    renamed.find(({ from }) => from === filePath)?.to ?? filePath;
+  const nextFrontPath = renamedPath(frontPath);
+  const nextBackPath = backPath && renamedPath(backPath);
+  return {
+    ok: true,
+    ...describePair(nextFrontPath, nextBackPath),
+    frontVersion: await getImageVersion(nextFrontPath),
+    backVersion: nextBackPath ? await getImageVersion(nextBackPath) : null,
+    renamed,
+  };
+};
+
+/**
+ * Queues a "Do not upload" rename so it never overlaps metadata writes, rotations, or previews.
+ * @param {{frontPath: string, backPath: string|null, value: boolean}} request - The group and the flag value.
+ * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
+ * @returns {ReturnType<typeof setDoNotUpload>} The renamed group.
+ */
+const setDoNotUploadQueued = (request, options) =>
+  runImageFileOperation([request?.frontPath, request?.backPath], () =>
+    setDoNotUpload(request, options),
+  );
+
+/**
  * Sets the date on every image pair in a directory that does not already have
  * an XMP sidecar file. Pairs with an existing sidecar are skipped so their
- * previously saved metadata is preserved.
+ * previously saved metadata is preserved, and pairs flagged "Do not upload"
+ * are skipped as well.
  * @param {string} directoryPath - The path to the directory.
  * @param {string} date - The ISO date string to apply (e.g. "1991-12-31").
- * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, errors: string[]}>}
+ * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, excludedPairs: number, errors: string[]}>}
  */
 const setFolderDate = async (directoryPath, date) => {
   const { files: pairs } = await readDirectory(directoryPath);
@@ -1697,8 +1975,14 @@ const setFolderDate = async (directoryPath, date) => {
   const errors = [];
   let updatedPairs = 0;
   let skippedPairs = 0;
+  let excludedPairs = 0;
 
   for (const pair of pairs) {
+    if (pair.doNotUpload) {
+      excludedPairs += 1;
+      continue;
+    }
+
     try {
       const existingSidecar = await resolveExistingSidecarPath(pair.frontPath);
       if (existingSidecar) {
@@ -1729,7 +2013,13 @@ const setFolderDate = async (directoryPath, date) => {
     }
   }
 
-  return { ok: errors.length === 0, updatedPairs, skippedPairs, errors };
+  return {
+    ok: errors.length === 0,
+    updatedPairs,
+    skippedPairs,
+    excludedPairs,
+    errors,
+  };
 };
 
 /**
@@ -1750,6 +2040,7 @@ export {
   buildImmichUploadArguments,
   configurePreviewCache,
   defaultSortBy,
+  getGroupKey,
   getImagePreview,
   getImageVersion,
   getImmichFailureHints,
@@ -1763,7 +2054,10 @@ export {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setDoNotUploadQueued as setDoNotUpload,
   setFolderDate,
   shutdownCore,
+  toExcludedName,
+  toIncludedName,
   whenImageFileOperationsIdle,
 };

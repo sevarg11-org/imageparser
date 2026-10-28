@@ -29,6 +29,14 @@ import {
   type PairRotationState,
   type RotationField,
 } from "./pairPersistence";
+import {
+  countImageFilterMatches,
+  filterImagePairs,
+  getEmptyFilterMessage,
+  imageFilterOptions,
+  isImageFilter,
+  type ImageFilter,
+} from "./imageFilters";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
 
@@ -40,6 +48,24 @@ type ImagePair = {
   frontVersion: string;
   backVersion: string | null;
   createdAt: number;
+  doNotUpload: boolean;
+  excludeMismatch: boolean;
+  hasSidecar: boolean;
+};
+
+type SetDoNotUploadResult = Pick<
+  ImagePair,
+  | "id"
+  | "imageLabel"
+  | "frontPath"
+  | "backPath"
+  | "frontVersion"
+  | "backVersion"
+  | "doNotUpload"
+  | "excludeMismatch"
+> & {
+  ok: boolean;
+  renamed: Array<{ from: string; to: string }>;
 };
 
 type SidecarValues = {
@@ -80,6 +106,7 @@ type SetFolderDateResult = {
   ok: boolean;
   updatedPairs: number;
   skippedPairs: number;
+  excludedPairs: number;
   errors: string[];
 };
 
@@ -149,6 +176,11 @@ declare global {
         directoryPath: string,
         date: string,
       ) => Promise<SetFolderDateResult>;
+      setDoNotUpload: (request: {
+        frontPath: string;
+        backPath: string | null;
+        value: boolean;
+      }) => Promise<SetDoNotUploadResult>;
       loadImmichSettings: () => Promise<ImmichSettings>;
       saveImmichSettings: (settings: ImmichSettings) => Promise<ImmichSettings>;
       uploadToImmich: (
@@ -572,7 +604,14 @@ function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
   const [pairs, setPairs] = useState<ImagePair[]>([]);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
+  const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  // Saved IDs as they were when the filter was chosen or the folder loaded.
+  const [filterSnapshotPairIds, setFilterSnapshotPairIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -591,7 +630,7 @@ function App() {
   });
   const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
-  const [filterOnlyPairs, setFilterOnlyPairs] = useState(false);
+  const [imageFilter, setImageFilter] = useState<ImageFilter>("all");
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
   );
@@ -624,7 +663,13 @@ function App() {
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
-  const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] = useState(false);
+  const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] =
+    useState(false);
+  const [isTogglingDoNotUpload, setIsTogglingDoNotUpload] = useState(false);
+  const [doNotUploadError, setDoNotUploadError] = useState<{
+    pairId: string;
+    message: string;
+  } | null>(null);
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0);
   // Versions of files rewritten since the directory was listed, so their previews are reloaded.
   const [imageVersions, setImageVersions] = useState<Record<string, string>>(
@@ -658,16 +703,59 @@ function App() {
   const isImmichOutputFollowingRef = useRef(true);
   const saveTimeoutRef = useRef<number | null>(null);
 
+  // Mirrors savedPairIds synchronously, so a filter change can snapshot a save
+  // that finished in the same callback before React re-renders.
+  const savedPairIdsRef = useRef<ReadonlySet<string>>(new Set());
+
+  /**
+   * Records that the given groups now have a sidecar. The filtered list keeps
+   * its snapshot; only the option counts update.
+   * @param ids - IDs of the groups that were saved.
+   */
+  const markPairsSaved = useCallback((ids: readonly string[]) => {
+    const current = savedPairIdsRef.current;
+    if (ids.every((id) => current.has(id))) {
+      return;
+    }
+    const next = new Set(current);
+    for (const id of ids) {
+      next.add(id);
+    }
+    savedPairIdsRef.current = next;
+    setSavedPairIds(next);
+  }, []);
+
+  /**
+   * Clears the saved IDs and the filter snapshot when a folder is (re)loaded.
+   */
+  const resetSavedPairs = useCallback(() => {
+    const empty = new Set<string>();
+    savedPairIdsRef.current = empty;
+    setSavedPairIds(empty);
+    setFilterSnapshotPairIds(empty);
+  }, []);
+
   const displayPairs = useMemo(
-    () => (filterOnlyPairs ? pairs.filter((p) => !!p.backPath) : pairs),
-    [pairs, filterOnlyPairs],
+    () => filterImagePairs(pairs, imageFilter, filterSnapshotPairIds),
+    [pairs, imageFilter, filterSnapshotPairIds],
+  );
+
+  const filterCounts = useMemo(
+    () => countImageFilterMatches(pairs, savedPairIds),
+    [pairs, savedPairIds],
+  );
+
+  const selectedIndex = useMemo(
+    () =>
+      Math.max(
+        displayPairs.findIndex((pair) => pair.id === selectedPairId),
+        0,
+      ),
+    [displayPairs, selectedPairId],
   );
 
   const selectedPair = useMemo(
-    () =>
-      displayPairs.length > 0 && selectedIndex < displayPairs.length
-        ? displayPairs[selectedIndex]
-        : null,
+    () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
 
@@ -863,6 +951,9 @@ function App() {
             pairRotations,
             result.results,
           );
+          if (!pair.hasSidecar) {
+            markPairsSaved([pair.id]);
+          }
           if (selectedPairIdRef.current === pair.id) {
             pairHasSidecarRef.current = true;
             if (appliesRotation) {
@@ -917,7 +1008,7 @@ function App() {
       });
       return operation;
     },
-    [],
+    [markPairsSaved],
   );
 
   /**
@@ -1022,21 +1113,17 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair(formValues, { wait: false }))) {
+      // The save runs in the background; only an invalid date blocks moving on.
+      const nextPair = displayPairs[boundedIndex];
+      if (!nextPair || !(await persistCurrentPair(formValues, { wait: false }))) {
         return;
       }
 
       setImageNumberInput(String(boundedIndex + 1));
       setIsHydrated(false);
-      setSelectedIndex(boundedIndex);
+      setSelectedPairId(nextPair.id);
     },
-    [
-      displayPairs.length,
-      isHydrated,
-      isUploading,
-      persistCurrentPair,
-      selectedIndex,
-    ],
+    [displayPairs, isHydrated, isUploading, persistCurrentPair, selectedIndex],
   );
 
   /**
@@ -1054,7 +1141,7 @@ function App() {
     const pair = selectedPair;
     const imageStatus = formatImageStatus(
       selectedIndex,
-      pairs.length,
+      displayPairs.length,
       pair.imageLabel,
     );
 
@@ -1154,7 +1241,7 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [pairReloadToken, pairs.length, selectedIndex, selectedPair]);
+  }, [displayPairs.length, pairReloadToken, selectedIndex, selectedPair]);
 
   /**
    * Prefetches the neighbouring pairs' images and sidecar metadata once the current pair is shown.
@@ -1325,6 +1412,95 @@ function App() {
   );
 
   /**
+   * Flags the selected group "Do not upload", or clears the flag, by renaming its files.
+   * Unsaved metadata edits and rotations are saved first, so they land on the old file names
+   * before the rename. The pair is then replaced in place with its new paths, keeping it selected.
+   */
+  const toggleDoNotUpload = useCallback(async () => {
+    const electronApi = window.electronAPI;
+    if (
+      !electronApi ||
+      !selectedPair ||
+      isTogglingDoNotUpload ||
+      isPersistingRotation ||
+      isUploading ||
+      !isHydrated
+    ) {
+      return;
+    }
+
+    const pair = selectedPair;
+    setIsTogglingDoNotUpload(true);
+    setDoNotUploadError(null);
+
+    try {
+      const hasPendingChanges =
+        hasUserChangedRef.current || rotations.front !== 0 || rotations.back !== 0;
+      if (hasPendingChanges && !(await persistCurrentPair())) {
+        setDoNotUploadError({
+          pairId: pair.id,
+          message:
+            "The flag was not changed because unsaved changes could not be saved.",
+        });
+        return;
+      }
+
+      // Renaming must not race a background save that still targets the old file names.
+      if (!(await (pendingSavesRef.current.get(pair.id) ?? true))) {
+        setDoNotUploadError({
+          pairId: pair.id,
+          message:
+            "The flag was not changed because unsaved changes could not be saved.",
+        });
+        return;
+      }
+
+      const result = await electronApi.setDoNotUpload({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        value: !pair.doNotUpload,
+      });
+      setPairs((current) =>
+        current.map((candidate) =>
+          candidate.id === pair.id
+            ? {
+                ...candidate,
+                id: result.id,
+                imageLabel: result.imageLabel,
+                frontPath: result.frontPath,
+                backPath: result.backPath,
+                frontVersion: result.frontVersion,
+                backVersion: result.backVersion,
+                doNotUpload: result.doNotUpload,
+                excludeMismatch: result.excludeMismatch,
+              }
+            : candidate,
+        ),
+      );
+      // The pair id comes from the file name, so follow the renamed pair.
+      setSelectedPairId(result.id);
+    } catch (error) {
+      setDoNotUploadError({
+        pairId: pair.id,
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to change the Do not upload flag.",
+      });
+    } finally {
+      setIsTogglingDoNotUpload(false);
+    }
+  }, [
+    isHydrated,
+    isPersistingRotation,
+    isTogglingDoNotUpload,
+    isUploading,
+    persistCurrentPair,
+    rotations,
+    selectedPair,
+  ]);
+
+  /**
    * Handles keyboard events for navigation and image rotation hotkeys (q, w, e, r, arrow keys).
    * Rotates images on Q/W/E/R or navigates with arrow keys when inputs are not focused.
    */
@@ -1343,6 +1519,25 @@ function App() {
         Boolean(target?.closest(".immich-content input"));
 
       if (isPersistingRotation || isUploading || !isHydrated) {
+        return;
+      }
+
+      // Space toggles "Do not upload" except where it types text or activates a control.
+      const isDoNotUploadHotkeyBlocked =
+        isRotationHotkeyBlocked ||
+        event.repeat ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey ||
+        ["BUTTON", "SELECT", "TEXTAREA", "SUMMARY", "A"].includes(tagName) ||
+        (tagName === "INPUT" &&
+          ["checkbox", "radio", "range"].includes(
+            (target as HTMLInputElement).type,
+          )) ||
+        Boolean(target?.closest("dialog"));
+      if (key === " " && !isDoNotUploadHotkeyBlocked) {
+        event.preventDefault();
+        void toggleDoNotUpload();
         return;
       }
 
@@ -1399,6 +1594,7 @@ function App() {
     rotateImage,
     selectedIndex,
     selectedPair?.backPath,
+    toggleDoNotUpload,
   ]);
 
   /**
@@ -1530,9 +1726,9 @@ function App() {
     if (
       !Number.isInteger(imageNumber) ||
       imageNumber < 1 ||
-      imageNumber > pairs.length
+      imageNumber > displayPairs.length
     ) {
-      setStatus(`Enter an image number from 1 to ${pairs.length}.`);
+      setStatus(`Enter an image number from 1 to ${displayPairs.length}.`);
       return;
     }
 
@@ -1569,7 +1765,7 @@ function App() {
     }
 
     event.preventDefault();
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         try {
           if (await persistCurrentPair()) {
@@ -1620,7 +1816,7 @@ function App() {
     const formValues =
       nextDate === metadata.date ? metadata : { ...metadata, date: nextDate };
 
-    if (selectedIndex + 1 >= pairs.length) {
+    if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
         if (await persistCurrentPair(formValues)) {
           setStatus(formatSavedStatus(selectedPair.imageLabel));
@@ -1685,9 +1881,11 @@ function App() {
       setDirectoryPath(result.directoryPath);
       setIsHydrated(false);
       setPairs(result.files);
+      resetSavedPairs();
+      setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
-      setSelectedIndex(0);
+      setSelectedPairId(result.files[0]?.id ?? null);
 
       if (!result.files.length) {
         setStatus("No supported images were found in that directory.");
@@ -1738,9 +1936,13 @@ function App() {
         setSortBy(nextSortBy);
         setIsHydrated(false);
         setPairs(result.files);
+        resetSavedPairs();
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
-        setSelectedIndex(0);
+        setSelectedPairId(
+          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ??
+            null,
+        );
         setStatus(
           `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
         );
@@ -1754,25 +1956,46 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, persistCurrentPair, waitForPendingSaves],
+    [
+      directoryPath,
+      imageFilter,
+      persistCurrentPair,
+      resetSavedPairs,
+      waitForPendingSaves,
+    ],
   );
 
   /**
-   * Turns the "Only pairs" filter on or off after the current pair and all pending saves are written.
-   * @param checked - Whether only pairs with a back image are shown.
+   * Switches the image filter after persisting pending changes to the current
+   * pair, then selects the first image in the newly filtered list.
+   * @param nextFilter - The filter to apply.
    */
-  const handleFilterOnlyPairsChange = async (checked: boolean) => {
-    if (!(await persistCurrentPair())) {
-      return;
-    }
+  const changeImageFilter = useCallback(
+    async (nextFilter: ImageFilter) => {
+      if (nextFilter === imageFilter) {
+        return;
+      }
 
-    await waitForPendingSaves();
-    const nextPairs = checked ? pairs.filter((pair) => !!pair.backPath) : pairs;
-    if (nextPairs[selectedIndex]?.id !== selectedPair?.id) {
-      setIsHydrated(false);
-    }
-    setFilterOnlyPairs(checked);
-  };
+      if (!(await persistCurrentPair())) {
+        return;
+      }
+
+      await waitForPendingSaves();
+      // Take the snapshot now: images saved later stay in this list until the
+      // filter is changed again or the folder is reloaded.
+      const snapshot = savedPairIdsRef.current;
+      const firstPairId =
+        filterImagePairs(pairs, nextFilter, snapshot)[0]?.id ?? null;
+      if (firstPairId !== selectedPairId) {
+        setIsHydrated(false);
+      }
+      setFilterSnapshotPairIds(snapshot);
+      setImageFilter(nextFilter);
+      setSelectedPairId(firstPairId);
+      setImageNumberInput("1");
+    },
+    [imageFilter, pairs, persistCurrentPair, selectedPairId, waitForPendingSaves],
+  );
 
   /**
    * Updates an Immich setting field with a new value and persists it to storage.
@@ -1869,6 +2092,12 @@ function App() {
 
       await waitForPendingSaves();
       const result = await electronApi.setFolderDate(directoryPath, date);
+      const failedLabels = result.errors.map((error) => error.split(": ")[0]);
+      markPairsSaved(
+        pairs
+          .filter((pair) => !failedLabels.includes(pair.imageLabel))
+          .map((pair) => pair.id),
+      );
 
       if (result.ok) {
         const parts: string[] = [];
@@ -1880,6 +2109,11 @@ function App() {
         if (result.skippedPairs > 0) {
           parts.push(
             `Skipped ${result.skippedPairs} group${result.skippedPairs === 1 ? "" : "s"} with existing metadata.`,
+          );
+        }
+        if (result.excludedPairs > 0) {
+          parts.push(
+            `Skipped ${result.excludedPairs} group${result.excludedPairs === 1 ? "" : "s"} flagged Do not upload.`,
           );
         }
         if (parts.length === 0) {
@@ -1912,7 +2146,17 @@ function App() {
     Boolean(directoryPath) &&
     Boolean(immichSettings.serverUrl.trim()) &&
     Boolean(immichSettings.userApiKey.trim());
-  const isTransitionLocked = isBusy || isPersistingRotation || isUploading || isSettingFolderDate;
+  const isTransitionLocked =
+    isBusy ||
+    isPersistingRotation ||
+    isUploading ||
+    isSettingFolderDate ||
+    isTogglingDoNotUpload;
+  const flaggedPairCount = pairs.filter((pair) => pair.doNotUpload).length;
+  const selectedDoNotUploadError =
+    doNotUploadError && doNotUploadError.pairId === selectedPair?.id
+      ? doNotUploadError.message
+      : "";
   const isImageControlLocked = isTransitionLocked || !isHydrated;
   const getDisplayedVersion = (
     filePath: string | null,
@@ -2142,7 +2386,49 @@ function App() {
                   </fieldset>
                 </div>
               </details>
+
+              <div className="do-not-upload">
+                <button
+                  type="button"
+                  className={`secondary-button do-not-upload-toggle${
+                    selectedPair?.doNotUpload
+                      ? " do-not-upload-toggle--active"
+                      : ""
+                  }`}
+                  aria-label="Do not upload"
+                  aria-pressed={selectedPair?.doNotUpload ?? false}
+                  aria-describedby="do-not-upload-help"
+                  title="Do not upload (Space)"
+                  onClick={() => void toggleDoNotUpload()}
+                  disabled={!selectedPair || isImageControlLocked}
+                >
+                  <svg
+                    className="do-not-upload-icon"
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
+                  </svg>
+                </button>
+                <span id="do-not-upload-help" className="visually-hidden">
+                  Press Space to toggle. Flagged files are renamed with
+                  &ldquo;_exclude&rdquo; and skipped by Immich uploads.
+                </span>
+              </div>
             </div>
+
+            {selectedPair?.excludeMismatch ? (
+              <p className="do-not-upload-warning" role="status">
+                Only one side of this group is flagged Do not upload. Toggle the
+                flag to rename both sides to match.
+              </p>
+            ) : null}
+            {selectedDoNotUploadError ? (
+              <p className="do-not-upload-error" role="alert">
+                {selectedDoNotUploadError}
+              </p>
+            ) : null}
           </aside>
 
           <section className="viewer-panel">
@@ -2173,16 +2459,25 @@ function App() {
                   <option value="fileName-desc">File name (Z-A)</option>
                 </select>
               </label>
-              <label className="filter-control">
-                <input
-                  type="checkbox"
-                  checked={filterOnlyPairs}
-                  disabled={isTransitionLocked}
-                  onChange={(event) =>
-                    void handleFilterOnlyPairsChange(event.target.checked)
+              <label className="sort-control filter-control">
+                <span>Show</span>
+                <select
+                  value={imageFilter}
+                  onChange={(event) => {
+                    if (isImageFilter(event.target.value)) {
+                      void changeImageFilter(event.target.value);
+                    }
+                  }}
+                  disabled={
+                    isTransitionLocked || (!isHydrated && selectedPair !== null)
                   }
-                />
-                <span>Only pairs</span>
+                >
+                  {imageFilterOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} ({filterCounts[option.value]})
+                    </option>
+                  ))}
+                </select>
               </label>
               <label
                 className="size-control"
@@ -2222,20 +2517,21 @@ function App() {
                 <input
                   type="number"
                   min={1}
-                  max={pairs.length}
+                  max={displayPairs.length}
                   value={imageNumberInput}
                   onChange={(event) => setImageNumberInput(event.target.value)}
                   onKeyDown={handleImageNumberKeyDown}
                   disabled={isImageControlLocked}
-                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${pairs.length}`}
+                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
                 />
-                <span aria-hidden="true">/ {pairs.length}</span>
+                <span aria-hidden="true">/ {displayPairs.length}</span>
               </label>
               <button
                 type="button"
                 onClick={() => void navigateToIndex(selectedIndex + 1)}
                 disabled={
-                  selectedIndex === pairs.length - 1 || isImageControlLocked
+                  selectedIndex >= displayPairs.length - 1 ||
+                  isImageControlLocked
                 }
               >
                 Next
@@ -2254,7 +2550,14 @@ function App() {
                 <>
                   <div className="image-card">
                     <div className="image-card-header">
-                      <div className="image-label">Front image</div>
+                      <div className="image-label">
+                        Front image
+                        {selectedPair?.doNotUpload ? (
+                          <span className="do-not-upload-badge">
+                            Do not upload
+                          </span>
+                        ) : null}
+                      </div>
                       <div className="image-actions">
                         <button
                           type="button"
@@ -2343,7 +2646,9 @@ function App() {
                   ) : null}
                 </>
               ) : (
-                <p>No Pairs Available</p>
+                <p role="status">
+                  {getEmptyFilterMessage(imageFilter, pairs.length)}
+                </p>
               )}
             </div>
           </section>
@@ -2361,6 +2666,12 @@ function App() {
 
             <div className="immich-content">
               <span className="immich-directory">Uploads: {directoryPath}</span>
+              {flaggedPairCount > 0 ? (
+                <span className="immich-skipped">
+                  {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
+                  flagged Do not upload will be skipped.
+                </span>
+              ) : null}
 
               <div className="immich-grid">
                 <label>

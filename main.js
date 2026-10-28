@@ -13,6 +13,7 @@ import {
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  setDoNotUpload,
   setFolderDate,
   shutdownCore,
   whenImageFileOperationsIdle,
@@ -385,6 +386,21 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
  */
 ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
   setFolderDate(directoryPath, date),
+);
+
+/**
+ * IPC handler for flagging an image group "Do not upload" or clearing the flag.
+ * Renames the group's images and sidecars to add or remove the exclude marker.
+ * @param {*} _event - The IPC event object.
+ * @param {{frontPath: string, backPath: string|null, value: boolean}} request - The group and the flag value.
+ * @returns {Promise<Object>} The group with its new paths.
+ */
+ipcMain.handle("set-do-not-upload", (_event, request) =>
+  setDoNotUpload({
+    frontPath: request?.frontPath,
+    backPath: request?.backPath,
+    value: request?.value,
+  }),
 );
 
 ipcMain.handle("upload-to-immich", async (_event, settings, directoryPath) => {

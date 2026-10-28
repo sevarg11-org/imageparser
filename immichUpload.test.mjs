@@ -37,6 +37,17 @@ test("passes API keys and values as separate arguments", () => {
   assert.equal(uploadArguments.includes("--log-level"), false);
 });
 
+test("always bans B sides and groups flagged Do not upload", () => {
+  const uploadArguments = buildImmichUploadArguments(settings, "/data/scans");
+
+  assert.deepEqual(
+    uploadArguments.filter(
+      (_value, index, all) => all[index - 1] === "--ban-file",
+    ),
+    ["**_b.**", "**_exclude_**", "**_exclude.**"],
+  );
+});
+
 test("requests debug logging from immich-go when debug is enabled", () => {
   const uploadArguments = buildImmichUploadArguments(settings, "/data/scans", {
     debug: true,
