@@ -1407,6 +1407,69 @@ const saveImmichSettings = async (settingsDirectory, secretCodec, settings) => {
 };
 
 /**
+ * Compares folder names the way the folder browser displays them, with numbers in natural order.
+ * @param {{name: string}} left - The first folder.
+ * @param {{name: string}} right - The second folder.
+ * @returns {number} The sort order.
+ */
+const compareFolderNames = (left, right) =>
+  left.name.localeCompare(right.name, undefined, { numeric: true });
+
+/**
+ * Lists the visible subfolders of a directory and counts its supported images.
+ * Callers are responsible for confining the path; the web server resolves it for the user first.
+ * @param {string} directoryPath - The directory to list.
+ * @returns {Promise<{directories: {name: string, path: string}[], imageCount: number}>} The sorted
+ *   subfolders, skipping hidden ones, and the number of supported images directly inside the directory.
+ * @throws {Error} If the path does not exist or is not a directory.
+ */
+const listDirectory = async (directoryPath) => {
+  const stats = await fs.stat(directoryPath);
+  if (!stats.isDirectory()) {
+    throw new Error("The requested path is not a directory.");
+  }
+
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+  const directories = entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .map((entry) => ({
+      name: entry.name,
+      path: path.join(directoryPath, entry.name),
+    }))
+    .sort(compareFolderNames);
+  const imageCount = entries.filter(
+    (entry) =>
+      entry.isFile() &&
+      allowedExtensions.has(path.extname(entry.name).toLowerCase()),
+  ).length;
+
+  return { directories, imageCount };
+};
+
+/**
+ * Lists the drive roots that are currently readable, such as C:\ and mapped network drives.
+ * Only meaningful on Windows; other platforms have a single filesystem root.
+ * @returns {Promise<{name: string, path: string}[]>} The available drives in letter order.
+ */
+const listDrives = async () => {
+  const letters = Array.from({ length: 26 }, (_, index) =>
+    String.fromCharCode(65 + index),
+  );
+  const drives = await Promise.all(
+    letters.map(async (letter) => {
+      const drivePath = `${letter}:\\`;
+      try {
+        await fs.access(drivePath);
+        return { name: `${letter}:`, path: drivePath };
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return drives.filter(Boolean);
+};
+
+/**
  * Reads all image files from a directory and groups them into pairs.
  * Returns file listings with pairing information, creation dates, and date-taken if sorting by date.
  * Also collects tag suggestions from existing sidecar metadata files.
@@ -1800,6 +1863,8 @@ export {
   getImageRevision,
   getImmichFailureHints,
   getImmichGoDiagnostics,
+  listDirectory,
+  listDrives,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,

@@ -1,7 +1,8 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAPI", {
-  chooseDirectory: () => ipcRenderer.invoke("choose-directory"),
+  browseDirectory: (directoryPath) =>
+    ipcRenderer.invoke("browse-directory", directoryPath),
   readDirectory: (directoryPath, sortBy) =>
     ipcRenderer.invoke("read-directory", directoryPath, sortBy),
   readSidecarMetadata: (filePath) =>

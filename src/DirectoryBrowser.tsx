@@ -3,8 +3,10 @@ import './DirectoryBrowser.css'
 
 export type DirectoryListing = {
   path: string
-  rootPath: string
-  // "" means the virtual root that lists the user's shared folders; null means there is nothing above.
+  // The web share root that paths are shown relative to; null in the desktop app, which shows full paths.
+  rootPath: string | null
+  // "" means the virtual root (the user's shared folders on the web, the drive list on Windows desktop);
+  // null means there is nothing above.
   parent: string | null
   // False for the virtual root, which is not a real folder and cannot be opened.
   selectable?: boolean
@@ -20,9 +22,15 @@ type DirectoryBrowserProps = {
 
 const isSelectable = (listing: DirectoryListing) => listing.selectable !== false
 
+const isDesktopListing = (listing: DirectoryListing) => listing.rootPath === null
+
 const toDisplayPath = (listing: DirectoryListing) => {
   if (!isSelectable(listing)) {
-    return 'Your folders'
+    return isDesktopListing(listing) ? 'Drives' : 'Your folders'
+  }
+
+  if (listing.rootPath === null) {
+    return listing.path
   }
 
   if (listing.path === listing.rootPath) {
@@ -60,7 +68,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
       try {
         setListing(await loadListing(initialPath))
       } catch {
-        // The remembered folder may have been removed; fall back to the share root.
+        // The remembered folder may have been removed; fall back to the default starting folder.
         try {
           setListing(await loadListing(null))
         } catch (loadError) {
@@ -94,7 +102,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
         <ul className="directory-browser-list">
           {listing && listing.parent !== null ? (
             <li>
-              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent || null)}>
+              <button type="button" disabled={isLoading} onClick={() => void navigate(listing.parent)}>
                 <span aria-hidden="true">↑</span> Parent folder
               </button>
             </li>
@@ -108,7 +116,11 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
           ))}
           {listing && !listing.directories.length ? (
             <li className="directory-browser-empty">
-              {isSelectable(listing) ? 'No subfolders' : 'No folders are shared with your account.'}
+              {isSelectable(listing)
+                ? 'No subfolders'
+                : isDesktopListing(listing)
+                  ? 'No drives are available.'
+                  : 'No folders are shared with your account.'}
             </li>
           ) : null}
         </ul>

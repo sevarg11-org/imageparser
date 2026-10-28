@@ -10,12 +10,14 @@
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import "./App.css";
+import { chooseDirectory } from "./chooseDirectory";
 import {
   completeDateSegment,
   parseDateSegments,
   toIsoDate,
   type DateSegments,
 } from "./dateEntry";
+import type { DirectoryListing } from "./DirectoryBrowser";
 import {
   countImageFilterMatches,
   filterImagePairs,
@@ -113,7 +115,9 @@ type ApplyImageRotationsResult = {
 declare global {
   interface Window {
     electronAPI?: {
-      chooseDirectory: () => Promise<string | null>;
+      browseDirectory: (
+        directoryPath: string | null,
+      ) => Promise<DirectoryListing>;
       readDirectory: (
         directoryPath: string,
         sortBy: SortOption,
@@ -1465,7 +1469,9 @@ function App() {
     setStatus("Scanning directory for photos...");
 
     try {
-      const selectedDirectory = await window.electronAPI.chooseDirectory();
+      const selectedDirectory = await chooseDirectory(
+        window.electronAPI.browseDirectory,
+      );
       if (!selectedDirectory) {
         setStatus("No directory selected.");
         return;

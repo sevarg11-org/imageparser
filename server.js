@@ -24,6 +24,7 @@ import {
   defaultSortBy,
   getImageRevision,
   getImmichGoDiagnostics,
+  listDirectory,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeSortBy,
@@ -661,21 +662,7 @@ const handleBrowse = async (user, url) => {
     throw new HttpError(400, "The requested path is not a directory.");
   }
 
-  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const directories = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => ({
-      name: entry.name,
-      path: path.join(directoryPath, entry.name),
-    }))
-    .sort((left, right) =>
-      left.name.localeCompare(right.name, undefined, { numeric: true }),
-    );
-  const imageCount = entries.filter(
-    (entry) =>
-      entry.isFile() &&
-      allowedExtensions.has(path.extname(entry.name).toLowerCase()),
-  ).length;
+  const { directories, imageCount } = await listDirectory(directoryPath);
 
   let parent = path.dirname(directoryPath);
   if (allowedRoots.includes(directoryPath)) {
