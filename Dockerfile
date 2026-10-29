@@ -50,7 +50,7 @@ RUN immich-go version
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY package.json server.js serverLogger.js core.js imageFileQueue.js previewCache.js auth.js pathAccess.js docker-entrypoint.sh ./
+COPY package.json server.js serverLogger.js core.js imageFileQueue.js previewCache.js auth.js pathAccess.js managedImmichSettings.js docker-entrypoint.sh ./
 RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
     && chmod 755 /app/docker-entrypoint.sh
 

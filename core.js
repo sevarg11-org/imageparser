@@ -1618,16 +1618,29 @@ const loadImmichSettings = async (settingsDirectory, secretCodec) => {
  * @param {string} settingsDirectory - The path to the user's application data directory.
  * @param {{encrypt: (value: string) => string, decrypt: (value: string) => string}} secretCodec - An object with encrypt and decrypt functions for secure storage.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The normalized settings to save (may contain unencrypted keys).
+ * @param {{managedFields?: Array<"serverUrl"|"userApiKey"|"adminApiKey">}} [options] - Fields provided by the server
+ *   (environment or sign-in session). They are validated with the rest but always stored empty, so a managed key is
+ *   never written to disk, not even encrypted.
+ * @returns {Promise<Object>} The normalized settings, including any managed values.
  */
-const saveImmichSettings = async (settingsDirectory, secretCodec, settings) => {
+const saveImmichSettings = async (
+  settingsDirectory,
+  secretCodec,
+  settings,
+  { managedFields = [] } = {},
+) => {
   const normalizedSettings = normalizeImmichSettings(settings);
+  const unmanagedSettings = { ...normalizedSettings };
+  for (const field of managedFields) {
+    unmanagedSettings[field] = "";
+  }
   const storedSettings = {
-    ...normalizedSettings,
-    userApiKey: normalizedSettings.userApiKey
-      ? secretCodec.encrypt(normalizedSettings.userApiKey)
+    ...unmanagedSettings,
+    userApiKey: unmanagedSettings.userApiKey
+      ? secretCodec.encrypt(unmanagedSettings.userApiKey)
       : "",
-    adminApiKey: normalizedSettings.adminApiKey
-      ? secretCodec.encrypt(normalizedSettings.adminApiKey)
+    adminApiKey: unmanagedSettings.adminApiKey
+      ? secretCodec.encrypt(unmanagedSettings.adminApiKey)
       : "",
   };
 

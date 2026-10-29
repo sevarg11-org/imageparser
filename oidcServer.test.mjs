@@ -656,3 +656,113 @@ test("OIDC_DISABLED without backup credentials opens access and warns", async ()
   assert.equal((await me.json()).authMode, "none");
   assert.match(open.output(), /AUTHENTICATION IS OFF/);
 });
+
+test("Immich settings managed by the environment and Authentik are never exposed or saved", async () => {
+  const adminKeyFile = path.join(workspace, "immich-admin-key");
+  await fs.writeFile(adminKeyFile, "env-admin-key\n");
+  const managed = await startServer((url) => ({
+    OIDC_ISSUER_URL: provider.issuer,
+    OIDC_CLIENT_ID: clientId,
+    OIDC_CLIENT_SECRET: clientSecret,
+    OIDC_REDIRECT_URI: `${url}auth/callback`,
+    OIDC_ALLOW_INSECURE_REQUESTS: "true",
+    IMMICH_URL: "https://managed-immich.example.test/",
+    IMMICH_ADMIN_API_KEY: "ignored-admin-key",
+    IMMICH_ADMIN_API_KEY_FILE: adminKeyFile,
+  }));
+  const previousAppUrl = appUrl;
+  appUrl = managed.url;
+  try {
+    const daveCookie = await signIn({
+      sub: "dave-subject",
+      preferred_username: "dave",
+      imageparser_folders: ["family"],
+      immich_api_key: "dave-claim-key",
+    });
+    const erinCookie = await signIn({
+      sub: "erin-subject",
+      preferred_username: "erin",
+      imageparser_folders: ["family"],
+    });
+    assert.doesNotMatch(daveCookie, /dave-claim-key/);
+
+    const daveSettings = await getJson("api/immich-settings", daveCookie);
+    assert.equal(daveSettings.status, 200, JSON.stringify(daveSettings.body));
+    assert.deepEqual(daveSettings.body.managed, {
+      serverUrl: true,
+      userApiKey: true,
+      adminApiKey: true,
+    });
+    assert.equal(
+      daveSettings.body.serverUrl,
+      "https://managed-immich.example.test",
+    );
+
+    // Managed fields sent by the browser are ignored.
+    const saved = await postJson("api/immich-settings", daveCookie, {
+      serverUrl: "https://attacker.example.test",
+      userApiKey: "browser-key",
+      adminApiKey: "browser-admin-key",
+      albumName: "Family",
+      tags: "",
+      pauseImmichJobs: true,
+      concurrentTasks: 2,
+    });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.equal(saved.body.serverUrl, "https://managed-immich.example.test");
+    assert.equal(saved.body.albumName, "Family");
+    for (const body of [daveSettings.body, saved.body]) {
+      assert.doesNotMatch(
+        JSON.stringify(body),
+        /dave-claim-key|env-admin-key|browser-key|browser-admin-key/,
+      );
+    }
+
+    // A user without the claim still enters and saves their own key.
+    const erinSettings = await getJson("api/immich-settings", erinCookie);
+    assert.equal(erinSettings.body.managed.userApiKey, false);
+    assert.equal(erinSettings.body.managed.adminApiKey, true);
+    const erinSaved = await postJson("api/immich-settings", erinCookie, {
+      userApiKey: "erin-own-key",
+      albumName: "Erin",
+      tags: "",
+      pauseImmichJobs: true,
+      concurrentTasks: 2,
+    });
+    assert.equal(erinSaved.status, 200, JSON.stringify(erinSaved.body));
+    assert.equal(
+      (await getJson("api/immich-settings", erinCookie)).body.userApiKey,
+      "erin-own-key",
+    );
+
+    const usersDirectory = path.join(configDirectory, "users");
+    for (const user of await fs.readdir(usersDirectory)) {
+      const stored = await fs
+        .readFile(
+          path.join(usersDirectory, user, "immich-settings.json"),
+          "utf8",
+        )
+        .catch(() => "");
+      assert.doesNotMatch(
+        stored,
+        /dave-claim-key|env-admin-key|browser-key|managed-immich|attacker/,
+      );
+    }
+    assert.doesNotMatch(managed.output(), /dave-claim-key|env-admin-key/);
+  } finally {
+    appUrl = previousAppUrl;
+  }
+});
+
+test("an invalid IMMICH_URL or unreadable admin key file stops startup", async () => {
+  await assert.rejects(
+    startServer({ IMMICH_URL: "immich.example.test" }),
+    /IMMICH_URL must be an absolute http/,
+  );
+  await assert.rejects(
+    startServer({
+      IMMICH_ADMIN_API_KEY_FILE: path.join(workspace, "missing-admin-key"),
+    }),
+    /IMMICH_ADMIN_API_KEY_FILE .* could not be read/,
+  );
+});

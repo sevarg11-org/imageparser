@@ -45,6 +45,13 @@ import {
   whenImageFileOperationsIdle,
 } from "./core.js";
 import {
+  applyManagedImmichSettings,
+  getManagedImmichFields,
+  listManagedFields,
+  readManagedImmichConfig,
+  toClientImmichSettings,
+} from "./managedImmichSettings.js";
+import {
   createAllowedRootsCache,
   isInsideDirectory,
   isPathAllowed,
@@ -82,6 +89,8 @@ const oidcAdminGroup = process.env.OIDC_ADMIN_GROUP || "imageparser-admin";
 const oidcAdminClaim = process.env.OIDC_ADMIN_CLAIM || "imageparser_admin";
 const oidcFoldersClaim =
   process.env.OIDC_FOLDERS_CLAIM || "imageparser_folders";
+const oidcImmichApiKeyClaim =
+  process.env.OIDC_IMMICH_API_KEY_CLAIM || "immich_api_key";
 const oidcAllowInsecureRequests = /^(1|true|yes|on)$/i.test(
   process.env.OIDC_ALLOW_INSECURE_REQUESTS ?? "",
 );
@@ -379,6 +388,8 @@ const authenticateRequest = (request, sessionCodec) => {
   const session = sessionCodec.open(
     parseCookies(request.headers.cookie).get(cookieNames.session),
   );
+  // The session restores the user's Immich key after a restart, so it is registered for redaction here.
+  logger.addSecret(session?.user?.immichApiKey);
   return session?.user ?? null;
 };
 
@@ -817,9 +828,10 @@ const validateMetadataPaths = async (user, payload) => ({
  * Creates an API routes object with handlers for all endpoints.
  * Every handler reads the authenticated user from `request.user`.
  * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {{serverUrl: string, adminApiKey: string}} immichConfig - Immich settings managed by the environment.
  * @returns {Object} Object mapping route strings to async handler functions.
  */
-const createApiRoutes = (secretCodec) => ({
+const createApiRoutes = (secretCodec, immichConfig) => ({
   "GET /api/config": async (request) => ({
     rootPath: rootDirectory,
     debug: debugEnabled && request.user.isAdmin,
@@ -857,20 +869,31 @@ const createApiRoutes = (secretCodec) => ({
     applyImageRotations(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
+  // Managed values (environment and sign-in session) are never sent to the browser or saved.
   "GET /api/immich-settings": async (request) =>
-    registerImmichSecrets(
-      await loadImmichSettings(
-        await getUserSettingsDirectory(request.user),
-        secretCodec,
+    toClientImmichSettings(
+      registerImmichSecrets(
+        await loadImmichSettings(
+          await getUserSettingsDirectory(request.user),
+          secretCodec,
+        ),
       ),
+      immichConfig,
+      request.user,
     ),
   "POST /api/immich-settings": async (request) => {
     const body = registerImmichSecrets(await readJsonBody(request));
-    return saveImmichSettings(
+    const savedSettings = await saveImmichSettings(
       await getUserSettingsDirectory(request.user, { create: true }),
       secretCodec,
-      body,
+      applyManagedImmichSettings(body, immichConfig, request.user),
+      {
+        managedFields: listManagedFields(
+          getManagedImmichFields(immichConfig, request.user),
+        ),
+      },
     );
+    return toClientImmichSettings(savedSettings, immichConfig, request.user);
   },
   "POST /api/do-not-upload": async (request) => {
     // Both images are confined to the user's folders; core renames only within their folder.
@@ -913,10 +936,10 @@ const createApiRoutes = (secretCodec) => ({
       request.user,
       body.directoryPath,
     );
-    // The settings come from the user's own form (loaded from their own settings file), so
-    // each upload runs with the signed-in user's Immich credentials.
+    // The settings come from the user's own form (loaded from their own settings file), with the
+    // managed URL and keys applied here, so each upload runs with the signed-in user's Immich credentials.
     return runImmichUpload(
-      body.settings,
+      applyManagedImmichSettings(body.settings, immichConfig, request.user),
       directoryPath,
       createProgressReporter(request.user.userKey),
       {
@@ -987,6 +1010,7 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
             foldersClaim: oidcFoldersClaim,
             adminGroup: oidcAdminGroup,
             adminClaim: oidcAdminClaim,
+            immichApiKeyClaim: oidcImmichApiKeyClaim,
           },
         );
       } catch (error) {
@@ -1016,10 +1040,12 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
         return;
       }
 
+      logger.addSecret(user.immichApiKey);
       logger.info("User signed in.", {
         username: user.username,
         isAdmin: user.isAdmin,
         folders: user.folders.length,
+        immichApiKey: Boolean(user.immichApiKey),
       });
       sendRedirect(response, appLocation, [
         serializeCookie(cookieNames.session, session, {
@@ -1111,16 +1137,17 @@ const rejectUnauthenticated = (request, response, url) => {
 
 /**
  * Creates an HTTP request handler with authentication, routing, and error handling.
- * @param {{secretCodec: Object, sessionCodec: Object|null, loginCodec: Object|null, oidcClient: Object|null}} context - Settings codec, and the OpenID Connect client and cookie codecs when enabled.
+ * @param {{secretCodec: Object, immichConfig: Object, sessionCodec: Object|null, loginCodec: Object|null, oidcClient: Object|null}} context - Settings codec, managed Immich settings, and the OpenID Connect client and cookie codecs when enabled.
  * @returns {Function} An async function that handles HTTP requests and responses.
  */
 const createRequestHandler = ({
   secretCodec,
+  immichConfig,
   sessionCodec,
   loginCodec,
   oidcClient,
 }) => {
-  const apiRoutes = createApiRoutes(secretCodec);
+  const apiRoutes = createApiRoutes(secretCodec, immichConfig);
   const authRoutes = oidcEnabled
     ? createAuthRoutes({ oidcClient, sessionCodec, loginCodec })
     : {};
@@ -1268,6 +1295,10 @@ const start = async () => {
     );
   }
 
+  const immichConfig = await readManagedImmichConfig(process.env);
+  // The admin key lives only in the environment (or secret file) and memory, never in /config.
+  logger.addSecret(immichConfig.adminApiKey);
+
   rootDirectory = await fs.realpath(configuredRoot);
   const masterKey = await loadSecretKey();
   const realConfigDirectory = await fs
@@ -1291,6 +1322,7 @@ const start = async () => {
   const server = http.createServer(
     createRequestHandler({
       secretCodec: createAesGcmCodec(masterKey),
+      immichConfig,
       ...createOidcContext(masterKey),
     }),
   );
@@ -1346,6 +1378,12 @@ const start = async () => {
       logger.warn(
         "Authentication is disabled. Set OIDC_ISSUER_URL, or IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD, to enable it.",
       );
+    }
+    if (immichConfig.serverUrl || immichConfig.adminApiKey) {
+      logger.info("Immich settings are managed by the environment.", {
+        serverUrl: immichConfig.serverUrl || null,
+        adminApiKey: Boolean(immichConfig.adminApiKey),
+      });
     }
     if (debugEnabled) {
       logger.warn(
