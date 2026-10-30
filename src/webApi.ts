@@ -165,6 +165,24 @@ export const fetchCurrentUser = async (): Promise<CurrentUser | null> => {
   }
 };
 
+export type ImmichAlbum = {
+  id: string;
+  albumName: string;
+  assetCount: number;
+  shared: boolean;
+};
+
+/**
+ * Loads the Immich albums the signed-in user may upload into (web app only).
+ * @param refresh - Skips the server's short-lived cache.
+ */
+export const loadImmichAlbums = async (refresh = false) =>
+  (
+    await requestJson<{ albums: ImmichAlbum[] }>(
+      `api/immich-albums${refresh ? "?refresh=1" : ""}`,
+    )
+  ).albums;
+
 export const installWebApi = () => {
   if (!window.electronAPI) {
     window.electronAPI = createWebApi();

@@ -58,6 +58,11 @@ import {
   isInsideDirectory,
   isPathAllowed,
 } from "./pathAccess.js";
+import {
+  createLookupCache,
+  fetchImmichAlbums,
+  ImmichLookupError,
+} from "./immichLookup.js";
 import { createServerLogger } from "./serverLogger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -826,6 +831,38 @@ const validateMetadataPaths = async (user, payload) => ({
   backPath: await resolveOptionalPathForUser(user, payload?.backPath),
 });
 
+const albumCache = createLookupCache();
+
+/**
+ * Runs an Immich lookup with the signed-in user's stored settings and managed values. Lookup failures become
+ * an explicit 502, so the browser can fall back to free-text entry.
+ * @param {Object} user - The request's user context.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {(settings: Object) => Promise<any>} lookup - The lookup to run.
+ * @returns {Promise<any>} The lookup result.
+ */
+const runImmichLookup = async (user, secretCodec, immichConfig, lookup) => {
+  const settings = registerImmichSecrets(
+    applyManagedImmichSettings(
+      await loadImmichSettings(
+        await getUserSettingsDirectory(user),
+        secretCodec,
+      ),
+      immichConfig,
+      user,
+    ),
+  );
+  try {
+    return await lookup(settings);
+  } catch (error) {
+    if (error instanceof ImmichLookupError) {
+      throw new HttpError(502, error.message);
+    }
+    throw error;
+  }
+};
+
 /**
  * Creates an API routes object with handlers for all endpoints.
  * Every handler reads the authenticated user from `request.user`.
@@ -844,6 +881,24 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     authMode: oidcEnabled ? "oidc" : authPassword ? "basic" : "none",
   }),
   "GET /api/browse": async (request, url) => handleBrowse(request.user, url),
+  "GET /api/immich-albums": async (request, url) => {
+    const cacheKey = request.user.userKey || "default";
+    if (url.searchParams.get("refresh") === "1") {
+      albumCache.delete(cacheKey);
+    }
+    const cached = albumCache.get(cacheKey);
+    if (cached) {
+      return { albums: cached };
+    }
+    const albums = await runImmichLookup(
+      request.user,
+      secretCodec,
+      immichConfig,
+      fetchImmichAlbums,
+    );
+    albumCache.set(cacheKey, albums);
+    return { albums };
+  },
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);
     const directoryPath = await resolvePathForUser(
