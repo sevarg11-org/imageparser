@@ -1,0 +1,58 @@
+.location-picker {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.location-picker-current {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.location-picker-search {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.location-picker-search input {
+  flex: 1;
+}
+
+.location-picker ul {
+  margin: 0;
+  padding: 0;
+  max-height: 12rem;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid GrayText;
+  border-radius: 6px;
+}
+
+.location-picker li {
+  display: grid;
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+}
+
+.location-picker li:hover,
+.location-picker li:focus {
+  background: Highlight;
+  color: HighlightText;
+}
+
+.location-picker-detail {
+  opacity: 0.75;
+  font-size: 0.85em;
+}
+
+.location-picker-recent h4 {
+  margin: 0 0 0.25rem;
+  font-size: 0.9rem;
+}
+
+.location-picker-error {
+  margin: 0;
+  color: #b00020;
+}

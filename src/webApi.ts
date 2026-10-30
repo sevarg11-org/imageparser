@@ -1,4 +1,5 @@
 import type { DirectoryListing } from "./DirectoryBrowser";
+import type { Place } from "./placeTypes";
 
 type ImageParserApi = NonNullable<Window["electronAPI"]>;
 
@@ -63,6 +64,21 @@ const createWebApi = (): ImageParserApi => ({
     postJson("api/set-folder-date", { directoryPath, date, recursive }),
   setPairsDate: (pairs, date) =>
     postJson("api/set-pairs-date", { pairs, date }),
+  searchPlaces: async (query) =>
+    (
+      await requestJson<{ places: Place[] }>(
+        `api/geocode?${new URLSearchParams({ q: query }).toString()}`,
+      )
+    ).places,
+  getRecentPlaces: async () =>
+    (await requestJson<{ places: Place[] }>("api/recent-places")).places,
+  rememberPlace: async (place) =>
+    (await postJson<{ place: Place }>("api/recent-places", place)).place,
+  countPairsWithLocation: async (pairs) =>
+    (await postJson<{ count: number }>("api/count-pairs-location", { pairs }))
+      .count,
+  setPairsLocation: (pairs, location) =>
+    postJson("api/set-pairs-location", { pairs, location }),
   addTagsToPairs: (pairs, tags) =>
     postJson("api/add-tags-to-pairs", { pairs, tags }),
   resetFolderMetadata: (directoryPath, recursive) =>
