@@ -61,6 +61,7 @@ import {
 import {
   createLookupCache,
   fetchImmichAlbums,
+  fetchImmichTags,
   ImmichLookupError,
 } from "./immichLookup.js";
 import { createServerLogger } from "./serverLogger.js";
@@ -832,6 +833,7 @@ const validateMetadataPaths = async (user, payload) => ({
 });
 
 const albumCache = createLookupCache();
+const tagCache = createLookupCache();
 
 /**
  * Runs an Immich lookup with the signed-in user's stored settings and managed values. Lookup failures become
@@ -898,6 +900,24 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     );
     albumCache.set(cacheKey, albums);
     return { albums };
+  },
+  "GET /api/immich-tags": async (request, url) => {
+    const cacheKey = request.user.userKey || "default";
+    if (url.searchParams.get("refresh") === "1") {
+      tagCache.delete(cacheKey);
+    }
+    const cached = tagCache.get(cacheKey);
+    if (cached) {
+      return { tags: cached };
+    }
+    const tags = await runImmichLookup(
+      request.user,
+      secretCodec,
+      immichConfig,
+      fetchImmichTags,
+    );
+    tagCache.set(cacheKey, tags);
+    return { tags };
   },
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);

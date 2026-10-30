@@ -1,0 +1,45 @@
+.tag-input {
+  position: relative;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.tag-input ul {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  max-height: 14rem;
+  margin: 0;
+  padding: 0.25rem 0;
+  overflow-y: auto;
+  list-style: none;
+  background: Canvas;
+  color: CanvasText;
+  border: 1px solid GrayText;
+  border-radius: 6px;
+}
+
+.tag-input li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+}
+
+.tag-input li.active {
+  background: Highlight;
+  color: HighlightText;
+}
+
+.tag-input-new {
+  font-size: 0.85em;
+  font-weight: 600;
+}
+
+.tag-input-error {
+  margin: 0;
+  color: #b00020;
+}

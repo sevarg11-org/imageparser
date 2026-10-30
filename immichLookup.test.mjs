@@ -3,8 +3,10 @@ import test from "node:test";
 import {
   createLookupCache,
   fetchImmichAlbums,
+  fetchImmichTags,
   findAlbumByName,
   mapPermittedAlbums,
+  mapTagValues,
 } from "./immichLookup.js";
 
 const albums = [
@@ -82,6 +84,24 @@ test("lookup failures carry a safe message without the key", async () => {
     fetchImmichAlbums({ serverUrl: "", userApiKey: "" }),
     /Enter the Immich/,
   );
+});
+
+test("tags map to unique full paths and drop everything else", async () => {
+  const raw = [
+    { id: "a", name: "Parents", value: "Family/Parents", parentId: "p", color: "#fff" },
+    { id: "b", name: "family", value: "family/parents" },
+    { id: "c", name: "Zoo", value: "Zoo" },
+    { id: "d", name: "", value: "" },
+  ];
+  assert.deepEqual(mapTagValues(raw), ["Family/Parents", "Zoo"]);
+  const result = await fetchImmichTags(
+    { serverUrl: "https://i.test", userApiKey: "k" },
+    async (url) => {
+      assert.equal(url, "https://i.test/api/tags");
+      return { ok: true, status: 200, json: async () => raw };
+    },
+  );
+  assert.deepEqual(result, ["Family/Parents", "Zoo"]);
 });
 
 test("the cache expires entries after a minute", () => {

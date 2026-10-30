@@ -183,6 +183,17 @@ export const loadImmichAlbums = async (refresh = false) =>
     )
   ).albums;
 
+/**
+ * Loads the user's existing Immich tags as full hierarchical paths (web app only).
+ * @param refresh - Skips the server's short-lived cache.
+ */
+export const loadImmichTags = async (refresh = false) =>
+  (
+    await requestJson<{ tags: string[] }>(
+      `api/immich-tags${refresh ? "?refresh=1" : ""}`,
+    )
+  ).tags;
+
 export const installWebApi = () => {
   if (!window.electronAPI) {
     window.electronAPI = createWebApi();

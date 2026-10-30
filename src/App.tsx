@@ -54,7 +54,14 @@ import {
   GRID_THUMBNAIL_SIZE,
   type ThumbnailGridCell,
 } from "./thumbnailGridModel";
-import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
+import TagInput from "./TagInput";
+import { mergeTagSources } from "./tagSuggestions";
+import {
+  fetchCurrentUser,
+  isWebApp,
+  loadImmichTags,
+  type CurrentUser,
+} from "./webApi";
 
 type ImagePair = {
   id: string;
@@ -851,8 +858,9 @@ function App() {
     }
     return window.sessionStorage.getItem(METADATA_ENTRY_SESSION_KEY) === "true";
   });
-  const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
+  const [immichTags, setImmichTags] = useState<string[]>([]);
+  const [immichTagError, setImmichTagError] = useState("");
   const [imageFilter, setImageFilter] = useState<ImageFilter>("all");
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
@@ -1015,6 +1023,35 @@ function App() {
       rotation: gridRotations.get(pair.id) ?? 0,
     }));
   }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
+
+  /**
+   * Loads the user's existing Immich tags for the tag typeahead (web app only). A failed lookup leaves the
+   * recent-tag suggestions and free entry in place, with the reason shown.
+   */
+  useEffect(() => {
+    if (!isWebApp()) {
+      return;
+    }
+    let isMounted = true;
+    loadImmichTags().then(
+      (tags) => {
+        if (isMounted) {
+          setImmichTags(tags);
+          setImmichTagError("");
+        }
+      },
+      (error) => {
+        if (isMounted) {
+          setImmichTagError(
+            error instanceof Error ? error.message : "Tags could not be loaded.",
+          );
+        }
+      },
+    );
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -1530,7 +1567,6 @@ function App() {
       const loadedSegments = parseDateSegments(values.date);
       dateSegmentsRef.current = loadedSegments;
       setDateSegments(loadedSegments);
-      setTagInput("");
       setRotations(pairRotations);
       setIsHydrated(true);
       setStatus(statusMessage);
@@ -1969,8 +2005,8 @@ function App() {
    * Adds a new tag from user input to the current pair's metadata if it doesn't already exist.
    * Moves the added tag to the front of recent tags and clears the input field.
    */
-  const addTag = () => {
-    const tag = tagInput.trim();
+  const addTag = (newTag: string) => {
+    const tag = newTag.trim();
     if (!tag) {
       return;
     }
@@ -1990,7 +2026,6 @@ function App() {
           recentTag.toLocaleLowerCase() !== tag.toLocaleLowerCase(),
       ),
     ]);
-    setTagInput("");
   };
 
   /**
@@ -2769,6 +2804,11 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
       setIsSettingFolderProcessed(false);
     }
   };
+  const tagSuggestions = mergeTagSources(immichTags, recentTags);
+  const uploadTags = immichSettings.tags
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
   const managedImmichFields = immichSettings.managed;
   const canUploadToImmich =
     Boolean(directoryPath) &&
@@ -3117,37 +3157,16 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                     <div className="metadata-details-content">
                       <div className="metadata-tags">
                         <label htmlFor="new-tag">Tags</label>
-                        <div className="tag-entry">
-                          <input
-                            id="new-tag"
-                            ref={tagInputRef}
-                            type="text"
-                            value={tagInput}
-                            onChange={(event) =>
-                              setTagInput(event.target.value)
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === ",") {
-                                event.preventDefault();
-                                addTag();
-                              }
-                            }}
-                            placeholder="Type a new tag"
-                            disabled={isPersistingRotation || isUploading}
-                          />
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            onClick={addTag}
-                            disabled={
-                              !tagInput.trim() ||
-                              isPersistingRotation ||
-                              isUploading
-                            }
-                          >
-                            Add
-                          </button>
-                        </div>
+                        <TagInput
+                          id="new-tag"
+                          inputRef={tagInputRef}
+                          suggestions={tagSuggestions}
+                          selectedTags={metadata.tags}
+                          onAdd={addTag}
+                          placeholder="Type a new tag"
+                          disabled={isPersistingRotation || isUploading}
+                          lookupError={immichTagError}
+                        />
                       </div>
 
                       {metadata.tags.length ? (
@@ -3548,22 +3567,45 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   </label>
                 )}
 
-                <label className="immich-tags">
-                  Tags
-                  <input
-                    type="text"
-                    value={immichSettings.tags}
-                    onChange={(event) =>
-                      updateImmichSetting("tags", event.target.value)
+                <div className="immich-tags">
+                  <label htmlFor="immich-upload-tag">Tags</label>
+                  <TagInput
+                    id="immich-upload-tag"
+                    suggestions={tagSuggestions}
+                    selectedTags={uploadTags}
+                    onAdd={(tag) =>
+                      updateImmichSetting(
+                        "tags",
+                        [...uploadTags, tag].join(", "),
+                      )
                     }
                     placeholder="family, archive, scanned"
                     disabled={isUploading}
-                    aria-describedby="immich-tags-help"
+                    lookupError={immichTagError}
                   />
-                  <span id="immich-tags-help" className="field-help">
-                    Separate multiple tags with commas.
-                  </span>
-                </label>
+                  {uploadTags.length ? (
+                    <div className="selected-tags" aria-label="Upload tags">
+                      {uploadTags.map((tag) => (
+                        <button
+                          key={tag.toLocaleLowerCase()}
+                          type="button"
+                          onClick={() =>
+                            updateImmichSetting(
+                              "tags",
+                              uploadTags
+                                .filter((current) => current !== tag)
+                                .join(", "),
+                            )
+                          }
+                          disabled={isUploading}
+                          aria-label={`Remove ${tag}`}
+                        >
+                          {tag} <span aria-hidden="true">&times;</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
 
                 <label>
                   Concurrent tasks
