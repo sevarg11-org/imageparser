@@ -1,6 +1,7 @@
 ﻿import {
   createCipheriv,
   createDecipheriv,
+  createHash,
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
@@ -41,6 +42,9 @@ import {
   setDoNotUpload,
   setFolderDate,
   resetFolderMetadata,
+  addTagsToPairs,
+  countPairsWithLocation,
+  setLocationForPairs,
   setPairsDate,
   setFolderProcessed,
   shutdownCore,
@@ -48,6 +52,7 @@ import {
 } from "./core.js";
 import {
   applyManagedImmichSettings,
+  resolveImmichLookupSettings,
   getManagedImmichFields,
   listManagedFields,
   readManagedImmichConfig,
@@ -58,6 +63,13 @@ import {
   isInsideDirectory,
   isPathAllowed,
 } from "./pathAccess.js";
+import { createGeocoder, GeocoderError } from "./geocoder.js";
+import {
+  createLookupCache,
+  fetchImmichAlbums,
+  fetchImmichTags,
+  ImmichLookupError,
+} from "./immichLookup.js";
 import { createServerLogger } from "./serverLogger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -826,6 +838,135 @@ const validateMetadataPaths = async (user, payload) => ({
   backPath: await resolveOptionalPathForUser(user, payload?.backPath),
 });
 
+const geocoderUrl = process.env.IMAGEPARSER_GEOCODER_URL || "";
+const geocoder = createGeocoder({
+  baseUrl: geocoderUrl || undefined,
+  cacheFile: path.join(configDirectory, "geocode-cache.json"),
+});
+
+/**
+ * Runs a geocoder call, turning its errors into HTTP errors the browser can show.
+ * @param {() => Promise<any>} call - The geocoder call.
+ * @returns {Promise<any>} The call's result.
+ */
+const runGeocoder = async (call) => {
+  try {
+    return await call();
+  } catch (error) {
+    if (error instanceof GeocoderError) {
+      throw new HttpError(error.statusCode, error.message);
+    }
+    throw error;
+  }
+};
+
+const albumCache = createLookupCache();
+const tagCache = createLookupCache();
+
+/**
+ * Runs an Immich lookup with the signed-in user's stored settings and managed values. Lookup failures become
+ * an explicit 502, so the browser can fall back to free-text entry.
+ * @param {Object} user - The request's user context.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {(settings: Object) => Promise<any>} lookup - The lookup to run.
+ * @returns {Promise<any>} The lookup result.
+ */
+const runImmichLookup = async (
+  user,
+  secretCodec,
+  immichConfig,
+  lookup,
+  formSettings = {},
+) => {
+  const settings = await resolveLookupSettings(
+    user,
+    secretCodec,
+    immichConfig,
+    formSettings,
+  );
+  try {
+    return await lookup(settings);
+  } catch (error) {
+    if (error instanceof ImmichLookupError) {
+      throw new HttpError(502, error.message);
+    }
+    throw error;
+  }
+};
+
+/**
+ * Works out the Immich URL and key for a lookup: the values typed in the form win over the saved ones (the
+ * form is only saved when an upload starts), and managed values from the environment or sign-in win over both.
+ * @param {Object} user - The request's user context.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {{serverUrl?: string, userApiKey?: string}} formSettings - The values currently in the form.
+ * @returns {Promise<{serverUrl: string, userApiKey: string}>} The settings to look up with.
+ */
+const resolveLookupSettings = async (
+  user,
+  secretCodec,
+  immichConfig,
+  formSettings,
+) => {
+  const saved = await loadImmichSettings(
+    await getUserSettingsDirectory(user),
+    secretCodec,
+  );
+  // The Authentik claim's key wins; the form's key is only the fallback when the provider gives none.
+  return registerImmichSecrets(
+    resolveImmichLookupSettings(saved, formSettings, immichConfig, user),
+  );
+};
+
+/**
+ * Answers an Immich lookup from the short-lived cache. The cache is keyed by user, server and a hash of the key,
+ * so changing either in the form never shows another account's or a stale list.
+ * @param {Object} request - The HTTP request (POST body: {refresh, settings: {serverUrl, userApiKey}}).
+ * @param {{get: Function, set: Function, delete: Function}} cache - The lookup cache.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {(settings: Object) => Promise<any>} lookup - The lookup to run on a cache miss.
+ * @returns {Promise<any>} The lookup result.
+ */
+const cachedImmichLookup = async (
+  request,
+  cache,
+  secretCodec,
+  immichConfig,
+  lookup,
+) => {
+  const body = await readJsonBody(request);
+  const settings = await resolveLookupSettings(
+    request.user,
+    secretCodec,
+    immichConfig,
+    body?.settings,
+  );
+  const cacheKey = [
+    request.user.userKey || "default",
+    settings.serverUrl,
+    createHash("sha256").update(settings.userApiKey).digest("hex"),
+  ].join("|");
+  if (body?.refresh === true) {
+    cache.delete(cacheKey);
+  }
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const result = await runImmichLookup(
+    request.user,
+    secretCodec,
+    immichConfig,
+    lookup,
+    body?.settings,
+  );
+  cache.set(cacheKey, result);
+  return result;
+};
+
 /**
  * Creates an API routes object with handlers for all endpoints.
  * Every handler reads the authenticated user from `request.user`.
@@ -844,6 +985,40 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     authMode: oidcEnabled ? "oidc" : authPassword ? "basic" : "none",
   }),
   "GET /api/browse": async (request, url) => handleBrowse(request.user, url),
+  // The browser calls this only on an explicit search; the geocoder adds the cache and rate limits.
+  "GET /api/geocode": async (_request, url) => ({
+    places: await runGeocoder(() => geocoder.search(url.searchParams.get("q"))),
+  }),
+  // Recent places come from the local store and never reach the network.
+  "GET /api/recent-places": async () => ({
+    places: await geocoder.getRecentPlaces(),
+  }),
+  "POST /api/recent-places": async (request) => ({
+    place: await runGeocoder(async () =>
+      geocoder.rememberPlace(await readJsonBody(request)),
+    ),
+  }),
+  // POST, because the form's (possibly unsaved) URL and key travel in the body, never in a logged URL.
+  "POST /api/immich-albums": async (request) => ({
+    albums: await cachedImmichLookup(
+      request,
+      albumCache,
+      secretCodec,
+      immichConfig,
+      fetchImmichAlbums,
+    ),
+  }),
+  "POST /api/immich-tags": async (request) => {
+    return {
+      tags: await cachedImmichLookup(
+        request,
+        tagCache,
+        secretCodec,
+        immichConfig,
+        fetchImmichTags,
+      ),
+    };
+  },
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);
     const directoryPath = await resolvePathForUser(
@@ -879,6 +1054,48 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     return setPairsDate(
       pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
       body.date,
+    );
+  },
+  "POST /api/add-tags-to-pairs": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs) || !Array.isArray(body.tags)) {
+      throw new HttpError(400, "No images or tags selected.");
+    }
+    // Every path is confined to the user's folders before anything is written.
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return addTagsToPairs(
+      pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      body.tags,
+    );
+  },
+  "POST /api/count-pairs-location": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs)) {
+      throw new HttpError(400, "No images selected.");
+    }
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return {
+      count: await countPairsWithLocation(
+        pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      ),
+    };
+  },
+  "POST /api/set-pairs-location": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs)) {
+      throw new HttpError(400, "No images selected.");
+    }
+    // Every path is confined to the user's folders before anything is written.
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return setLocationForPairs(
+      pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      body.location,
     );
   },
   "POST /api/apply-image-rotations": async (request) =>
@@ -1333,6 +1550,11 @@ const createOidcContext = (masterKey) => {
  * Starts the Image Parser server on the configured port and host.
  */
 const start = async () => {
+  if (geocoderUrl && !/^https?:\/\//i.test(geocoderUrl)) {
+    throw new Error(
+      "IMAGEPARSER_GEOCODER_URL must be an http:// or https:// URL.",
+    );
+  }
   if (authPassword && !authUsername) {
     throw new Error(
       "IMAGEPARSER_USERNAME must be set when IMAGEPARSER_PASSWORD is set.",

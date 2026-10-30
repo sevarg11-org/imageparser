@@ -1,0 +1,120 @@
+.album-combobox {
+  position: relative;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.album-combobox ul {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  max-height: 14rem;
+  margin: 0;
+  padding: 0.25rem 0;
+  overflow-y: auto;
+  list-style: none;
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid #334155;
+  border-radius: 6px;
+}
+
+.album-combobox li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.4rem 0.75rem;
+  cursor: pointer;
+}
+
+.album-combobox li.active {
+  box-shadow: inset 3px 0 0 #38bdf8;
+  background: rgba(56, 189, 248, 0.28);
+  color: #f8fafc;
+}
+
+.album-combobox-meta {
+  opacity: 0.75;
+  font-size: 0.85em;
+}
+
+.album-combobox-refresh {
+  justify-self: start;
+}
+
+.album-combobox-error {
+  margin: 0;
+  color: #b00020;
+}
+
+/* The input and the refresh icon read as one control; the dropdown anchors to this row. */
+.album-combobox {
+  gap: 8px;
+}
+
+.album-combobox-field {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.album-combobox-field input {
+  flex: 1;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.album-combobox .album-combobox-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  justify-self: auto;
+  width: 2.8rem;
+  padding: 0;
+  border: 1px solid #334155;
+  border-left: none;
+  border-radius: 0 10px 10px 0;
+  background: rgba(15, 23, 42, 0.95);
+  color: #7dd3fc;
+  cursor: pointer;
+}
+
+.album-combobox-refresh:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.18);
+}
+
+.album-combobox-refresh:focus-visible {
+  outline: 2px solid #7dd3fc;
+  outline-offset: -2px;
+}
+
+.album-combobox-refresh:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.album-combobox-refresh svg {
+  width: 1.3rem;
+  height: 1.3rem;
+  fill: currentColor;
+}
+
+.album-combobox-refresh--loading svg {
+  animation: album-refresh-spin 1s linear infinite;
+}
+
+@keyframes album-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .album-combobox-refresh--loading svg {
+    animation: none;
+  }
+}

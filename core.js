@@ -671,6 +671,105 @@ const readTagsFromXmp = (rawXml) => {
 };
 
 /**
+ * A place saved in a sidecar.
+ * @typedef {{latitude: number, longitude: number, name: string}} SidecarLocation
+ */
+
+/**
+ * Formats a coordinate in XMP's GPS form, DDD,MM.mmmmN|S|E|W (degrees, decimal minutes, hemisphere).
+ * @param {number} value - Decimal degrees.
+ * @param {"latitude"|"longitude"} axis - Which coordinate this is, which sets the range and the hemispheres.
+ * @returns {string} For example "41,52.6860N".
+ * @throws {Error} If the value is not a number or is outside -90..90 (latitude) or -180..180 (longitude).
+ */
+const formatXmpCoordinate = (value, axis) => {
+  const limit = axis === "latitude" ? 90 : 180;
+  const number = typeof value === "string" ? Number(value) : value;
+  if (
+    typeof number !== "number" ||
+    !Number.isFinite(number) ||
+    Math.abs(number) > limit
+  ) {
+    throw new Error(`The ${axis} must be a number from -${limit} to ${limit}.`);
+  }
+
+  const absolute = Math.abs(number);
+  let degrees = Math.floor(absolute);
+  let minutes = Number(((absolute - degrees) * 60).toFixed(4));
+  if (minutes >= 60) {
+    degrees += 1;
+    minutes = 0;
+  }
+  const hemisphere =
+    axis === "latitude" ? (number < 0 ? "S" : "N") : number < 0 ? "W" : "E";
+  return `${degrees},${minutes.toFixed(4)}${hemisphere}`;
+};
+
+/**
+ * Parses an XMP GPS coordinate (DDD,MM.mmmmN|S|E|W) into decimal degrees.
+ * @param {string} text - The coordinate text.
+ * @returns {number|null} Decimal degrees, or null when the text is not a valid coordinate.
+ */
+const parseXmpCoordinate = (text) => {
+  const match = String(text ?? "")
+    .trim()
+    .match(/^(\d{1,3}),(\d{1,2}(?:\.\d+)?)([NSEW])$/i);
+  if (!match) {
+    return null;
+  }
+  const hemisphere = match[3].toUpperCase();
+  const limit = "NS".includes(hemisphere) ? 90 : 180;
+  const degrees = Number(match[1]) + Number(match[2]) / 60;
+  if (Number(match[2]) >= 60 || degrees > limit) {
+    return null;
+  }
+  const signed = "SW".includes(hemisphere) ? -degrees : degrees;
+  return Number(signed.toFixed(6));
+};
+
+/**
+ * Validates a location before it is written, so a bad place never reaches a sidecar.
+ * @param {*} location - The location to check, or null/undefined for none.
+ * @returns {SidecarLocation|null} The cleaned location, or null for none.
+ * @throws {Error} If the coordinates are missing or out of range.
+ */
+const normalizeLocation = (location) => {
+  if (location === null || location === undefined) {
+    return null;
+  }
+  // Formatting validates both coordinates.
+  formatXmpCoordinate(location.latitude, "latitude");
+  formatXmpCoordinate(location.longitude, "longitude");
+  return {
+    latitude: Number(location.latitude),
+    longitude: Number(location.longitude),
+    name: String(location.name ?? "").trim(),
+  };
+};
+
+/**
+ * Reads the saved place from XMP metadata.
+ * @param {string} rawXml - The raw XMP XML content string.
+ * @returns {SidecarLocation|null} The place, or null when the sidecar has no valid GPS position.
+ */
+const readLocationFromXmp = (rawXml) => {
+  const readElement = (name) =>
+    String(rawXml).match(
+      new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, "i"),
+    )?.[1] ?? "";
+  const latitude = parseXmpCoordinate(readElement("exif:GPSLatitude"));
+  const longitude = parseXmpCoordinate(readElement("exif:GPSLongitude"));
+  if (latitude === null || longitude === null) {
+    return null;
+  }
+  return {
+    latitude,
+    longitude,
+    name: unescapeXml(readElement("imageparser:LocationName").trim()),
+  };
+};
+
+/**
  * Normalizes a rotation value to one of the four cardinal rotations (0°, 90°, 180°, 270°).
  * Rounds arbitrary angles to the nearest quarter-turn and normalizes modulo 360°.
  * @param {*} value - The rotation angle in degrees (number, string, or null/undefined).
@@ -1123,10 +1222,12 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
 /**
  * Builds an XMP metadata XML document with embedded date, description, and tags.
  * Creates properly formatted XMP blocks for each metadata type when provided.
- * @param {{dateValue: string, description: string, tags: string[]}} options - The metadata options.
+ * @param {{dateValue: string, description: string, tags: string[], location?: SidecarLocation|null}} options - The
+ *   metadata options; a location adds the GPS position (and the place name) when given.
  * @returns {string} A complete XMP metadata XML document ready to be written to a sidecar file.
  */
-const buildSidecarDocument = ({ dateValue, description, tags }) => {
+const buildSidecarDocument = ({ dateValue, description, tags, location }) => {
+  const safeLocation = normalizeLocation(location);
   const xmpDate =
     normalizeXmpDate(dateValue) || new Date().toISOString().slice(0, 19);
   const safeDescription = String(description ?? "").trim();
@@ -1159,6 +1260,21 @@ ${safeTags.map((tag) => `    <rdf:li>${escapeXml(tag)}</rdf:li>`).join("\n")}
   <exif:DateTimeOriginal>${escapeXml(xmpDate)}</exif:DateTimeOriginal>
  </rdf:Description>`;
 
+  const gpsBlock = safeLocation
+    ? ` <rdf:Description rdf:about=''
+  xmlns:exif='http://ns.adobe.com/exif/1.0/'
+  xmlns:imageparser='https://github.com/sevarg11-org/imageparser/ns/1.0/'>
+  <exif:GPSVersionID>2.3.0.0</exif:GPSVersionID>
+  <exif:GPSLatitude>${formatXmpCoordinate(safeLocation.latitude, "latitude")}</exif:GPSLatitude>
+  <exif:GPSLongitude>${formatXmpCoordinate(safeLocation.longitude, "longitude")}</exif:GPSLongitude>${
+    safeLocation.name
+      ? `
+  <imageparser:LocationName>${escapeXml(safeLocation.name)}</imageparser:LocationName>`
+      : ""
+  }
+ </rdf:Description>`
+    : "";
+
   const photoshopBlock = ` <rdf:Description rdf:about=''
   xmlns:photoshop='http://ns.adobe.com/photoshop/1.0/'>
   <photoshop:DateCreated>${escapeXml(xmpDate)}</photoshop:DateCreated>
@@ -1175,6 +1291,7 @@ ${safeTags.map((tag) => `    <rdf:li>${escapeXml(tag)}</rdf:li>`).join("\n")}
     descriptionBlock,
     tagsBlock,
     exifBlock,
+    gpsBlock,
     photoshopBlock,
     xmpBlock,
   ]
@@ -1359,6 +1476,7 @@ const readSidecarMetadata = async (filePath) => {
       date,
       description,
       tags: readTagsFromXmp(rawXml),
+      location: readLocationFromXmp(rawXml),
       rotation: 0,
       hasSidecar: true,
     };
@@ -1375,21 +1493,33 @@ const readSidecarMetadata = async (filePath) => {
  * @param {string} dateValue - The date value to normalize and store.
  * @param {string} description - The description text to store (can be empty).
  * @param {string[]} [tags=[]] - An optional array of tag strings.
+ * @param {SidecarLocation|null} [location] - The place to save: omit it to keep the place already in the
+ *   sidecar, or pass null to remove it.
  * @returns {Promise<{sidecarPath: string, written: boolean}>} The sidecar path and whether it changed.
  */
-const writeSidecarFile = async (filePath, dateValue, description, tags) => {
+const writeSidecarFile = async (
+  filePath,
+  dateValue,
+  description,
+  tags,
+  location,
+) => {
   const existingSidecarPath = await resolveExistingSidecarPath(filePath);
   const sidecarPath = existingSidecarPath ?? buildSidecarPath(filePath);
+  const currentXml = existingSidecarPath
+    ? await fs.readFile(existingSidecarPath, "utf8").catch(() => null)
+    : null;
   const xml = buildSidecarDocument({
     dateValue,
     description,
     tags,
+    location:
+      location === undefined
+        ? (readLocationFromXmp(currentXml ?? "") ?? null)
+        : location,
   });
 
   if (existingSidecarPath) {
-    const currentXml = await fs
-      .readFile(existingSidecarPath, "utf8")
-      .catch(() => null);
     if (currentXml === xml) {
       return { sidecarPath, written: false };
     }
@@ -1706,6 +1836,7 @@ const emptySidecarMetadata = () => ({
   date: "",
   description: "",
   tags: [],
+  location: null,
   rotation: 0,
   hasSidecar: false,
 });
@@ -2360,6 +2491,7 @@ const saveMetadata = (metadata) =>
       dateValue,
       metadata.description,
       metadata.tags,
+      metadata.location,
     );
 
     const images = [
@@ -3083,6 +3215,153 @@ const setPairsDate = async (pairs, date) => {
 };
 
 /**
+ * Adds tags to an existing tag list without removing or replacing any, skipping duplicates ignoring case.
+ * @param {string[]} existingTags - The tags already saved.
+ * @param {string[]} addedTags - The tags to add.
+ * @returns {string[]} The existing tags in their original order and spelling, then the new ones.
+ */
+const mergeTags = (existingTags, addedTags) =>
+  normalizeTags([...normalizeTags(existingTags), ...normalizeTags(addedTags)]);
+
+/**
+ * Adds tags to the chosen image groups. Each group's A-file sidecar is read, the tags are merged in (existing
+ * tags are never removed), and the sidecar is rewritten through saveMetadata, so writes stay serialized by the
+ * image file queue and the group's date and description are kept. One group failing does not stop the rest.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to tag.
+ * @param {string[]} tags - The tags to add.
+ * @param {{readMetadata?: typeof readSidecarMetadata, save?: typeof saveMetadata}} [dependencies] - Replaceable
+ *   read and save steps, for tests.
+ * @returns {Promise<{ok: boolean, updatedPairs: number, failedFrontPaths: string[], errors: string[]}>}
+ */
+const addTagsToPairs = async (
+  pairs,
+  tags,
+  { readMetadata = readSidecarMetadata, save = saveMetadata } = {},
+) => {
+  const tagsToAdd = normalizeTags(tags);
+  if (!tagsToAdd.length) {
+    throw new Error("Enter at least one tag.");
+  }
+
+  const errors = [];
+  const failedFrontPaths = [];
+  let updatedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const {
+        date,
+        description,
+        tags: existingTags,
+      } = await readMetadata(pair.frontPath);
+      const result = await save({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description,
+        tags: mergeTags(existingTags, tagsToAdd),
+      });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
+      updatedPairs += 1;
+    } catch (error) {
+      failedFrontPaths.push(pair.frontPath);
+      errors.push(
+        `${path.basename(pair.frontPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, failedFrontPaths, errors };
+};
+
+/**
+ * Counts how many of the chosen image groups already have a saved location, so replacing them can be confirmed.
+ * Groups whose sidecar cannot be read count as having none.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to check.
+ * @param {{readMetadata?: typeof readSidecarMetadata}} [dependencies] - A replaceable read step, for tests.
+ * @returns {Promise<number>} The number of groups with a location.
+ */
+const countPairsWithLocation = async (
+  pairs,
+  { readMetadata = readSidecarMetadata } = {},
+) => {
+  let count = 0;
+  for (const pair of pairs) {
+    try {
+      if ((await readMetadata(pair.frontPath)).location) {
+        count += 1;
+      }
+    } catch {
+      // An unreadable sidecar has no location to replace.
+    }
+  }
+  return count;
+};
+
+/**
+ * Applies one place to the chosen image groups. Each group's A-file sidecar is read and rewritten through
+ * saveMetadata, so writes stay serialized by the image file queue and the group's date, description and tags are
+ * kept. One group failing does not stop the rest.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to update.
+ * @param {SidecarLocation} location - The place to save.
+ * @param {{readMetadata?: typeof readSidecarMetadata, save?: typeof saveMetadata}} [dependencies] - Replaceable
+ *   read and save steps, for tests.
+ * @returns {Promise<{ok: boolean, updatedPairs: number, failedFrontPaths: string[], errors: string[]}>}
+ * @throws {Error} If the location is missing or its coordinates are out of range.
+ */
+const setLocationForPairs = async (
+  pairs,
+  location,
+  { readMetadata = readSidecarMetadata, save = saveMetadata } = {},
+) => {
+  const safeLocation = normalizeLocation(location);
+  if (!safeLocation) {
+    throw new Error("Choose a place first.");
+  }
+
+  const errors = [];
+  const failedFrontPaths = [];
+  let updatedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const { date, description, tags } = await readMetadata(pair.frontPath);
+      const result = await save({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description,
+        tags,
+        location: safeLocation,
+      });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
+      updatedPairs += 1;
+    } catch (error) {
+      failedFrontPaths.push(pair.frontPath);
+      errors.push(
+        `${path.basename(pair.frontPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, failedFrontPaths, errors };
+};
+
+/**
  * Resets the processing state of every image in a directory by deleting its XMP sidecar files.
  * Only sidecars belonging to the folder's images are deleted (both naming conventions, for the A and B
  * images), never other .xmp files. Images and the folder's own processed marker are left untouched.
@@ -3182,6 +3461,15 @@ export {
   saveMetadata,
   scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
+  addTagsToPairs,
+  countPairsWithLocation,
+  setLocationForPairs,
+  formatXmpCoordinate,
+  parseXmpCoordinate,
+  buildSidecarDocument,
+  writeSidecarFile,
+  readLocationFromXmp,
+  mergeTags,
   setFolderDate,
   resetFolderMetadata,
   setPairsDate,

@@ -47,13 +47,25 @@ import {
   isPairProcessed,
   type ImageFilter,
 } from "./imageFilters";
+import { AddTagsModal } from "./AddTagsModal";
+import AlbumCombobox from "./AlbumCombobox";
+import LocationPicker from "./LocationPicker";
+import type { Place, PlaceLocation } from "./placeTypes";
+import { SetLocationModal } from "./SetLocationModal";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { ThumbnailGrid } from "./ThumbnailGrid";
 import {
   GRID_THUMBNAIL_SIZE,
   type ThumbnailGridCell,
 } from "./thumbnailGridModel";
-import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
+import TagInput from "./TagInput";
+import { mergeTagSources } from "./tagSuggestions";
+import {
+  fetchCurrentUser,
+  isWebApp,
+  loadImmichTags,
+  type CurrentUser,
+} from "./webApi";
 
 type ImagePair = {
   id: string;
@@ -94,6 +106,7 @@ type SidecarValues = {
   date: string;
   description: string;
   tags: string[];
+  location?: PlaceLocation | null;
   rotation: number;
   hasSidecar: boolean;
 };
@@ -112,6 +125,7 @@ type MetadataForm = {
   date: string;
   description: string;
   tags: string[];
+  location: PlaceLocation | null;
 };
 
 /** Immich settings the web server provides (environment or sign-in), which the user cannot edit. */
@@ -202,9 +216,25 @@ declare global {
         date: string;
         description: string;
         tags: string[];
+        location: PlaceLocation | null;
         frontRotation: number;
         backRotation: number;
       }) => Promise<SaveMetadataResult>;
+      searchPlaces: (query: string) => Promise<Place[]>;
+      getRecentPlaces: () => Promise<Place[]>;
+      rememberPlace: (place: Place) => Promise<Place>;
+      countPairsWithLocation: (
+        pairs: { frontPath: string; backPath: string | null }[],
+      ) => Promise<number>;
+      setPairsLocation: (
+        pairs: { frontPath: string; backPath: string | null }[],
+        location: PlaceLocation,
+      ) => Promise<{
+        ok: boolean;
+        updatedPairs: number;
+        failedFrontPaths: string[];
+        errors: string[];
+      }>;
       getPreviewDataUrl: (filePath: string, version: string) => Promise<string>;
       getThumbnailUrl: (
         filePath: string,
@@ -225,6 +255,15 @@ declare global {
       setPairsDate: (
         pairs: { frontPath: string; backPath: string | null }[],
         date: string,
+      ) => Promise<{
+        ok: boolean;
+        updatedPairs: number;
+        failedFrontPaths: string[];
+        errors: string[];
+      }>;
+      addTagsToPairs: (
+        pairs: { frontPath: string; backPath: string | null }[],
+        tags: string[],
       ) => Promise<{
         ok: boolean;
         updatedPairs: number;
@@ -840,6 +879,7 @@ function App() {
     date: defaultDate,
     description: "",
     tags: [],
+    location: null,
   });
   const [dateSegments, setDateSegments] = useState(() =>
     parseDateSegments(defaultDate),
@@ -850,8 +890,9 @@ function App() {
     }
     return window.sessionStorage.getItem(METADATA_ENTRY_SESSION_KEY) === "true";
   });
-  const [tagInput, setTagInput] = useState("");
   const [recentTags, setRecentTags] = useState<string[]>([]);
+  const [immichTags, setImmichTags] = useState<string[]>([]);
+  const [immichTagError, setImmichTagError] = useState("");
   const [imageFilter, setImageFilter] = useState<ImageFilter>("all");
   const [status, setStatus] = useState(
     "Choose a directory to begin reviewing images.",
@@ -889,6 +930,12 @@ function App() {
     () => new Set(),
   );
   const [isSelectedDateModalOpen, setIsSelectedDateModalOpen] = useState(false);
+  const [isSetLocationModalOpen, setIsSetLocationModalOpen] = useState(false);
+  const [isSettingLocation, setIsSettingLocation] = useState(false);
+  const [setLocationFailures, setSetLocationFailures] = useState<string[]>([]);
+  const [isAddTagsModalOpen, setIsAddTagsModalOpen] = useState(false);
+  const [isAddingTags, setIsAddingTags] = useState(false);
+  const [addTagsFailures, setAddTagsFailures] = useState<string[]>([]);
   const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] =
     useState(false);
   const [isTogglingDoNotUpload, setIsTogglingDoNotUpload] = useState(false);
@@ -1014,6 +1061,44 @@ function App() {
       rotation: gridRotations.get(pair.id) ?? 0,
     }));
   }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
+
+  /**
+   * Loads the user's existing Immich tags for the tag typeahead (web app only). A failed lookup leaves the
+   * recent-tag suggestions and free entry in place, with the reason shown.
+   */
+  useEffect(() => {
+    if (!isWebApp()) {
+      return;
+    }
+    let isMounted = true;
+    // Uses the form's URL and key, which are only saved when an upload starts, so wait for typing to settle.
+    const timer = window.setTimeout(() => {
+      loadImmichTags({
+        serverUrl: immichSettings.serverUrl,
+        userApiKey: immichSettings.userApiKey,
+      }).then(
+        (tags) => {
+          if (isMounted) {
+            setImmichTags(tags);
+            setImmichTagError("");
+          }
+        },
+        (error) => {
+          if (isMounted) {
+            setImmichTagError(
+              error instanceof Error
+                ? error.message
+                : "Tags could not be loaded.",
+            );
+          }
+        },
+      );
+    }, 600);
+    return () => {
+      isMounted = false;
+      window.clearTimeout(timer);
+    };
+  }, [immichSettings.serverUrl, immichSettings.userApiKey]);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -1208,6 +1293,7 @@ function App() {
             date: formValues.date,
             description: formValues.description,
             tags: formValues.tags,
+            location: formValues.location,
             frontRotation: pairRotations.front,
             backRotation: pairRotations.back,
           });
@@ -1529,7 +1615,6 @@ function App() {
       const loadedSegments = parseDateSegments(values.date);
       dateSegmentsRef.current = loadedSegments;
       setDateSegments(loadedSegments);
-      setTagInput("");
       setRotations(pairRotations);
       setIsHydrated(true);
       setStatus(statusMessage);
@@ -1581,6 +1666,7 @@ function App() {
               : defaultDate,
             description: frontXmpValues.description ?? "",
             tags: loadedTags,
+            location: frontXmpValues.location ?? null,
           },
           unsavedEdits?.rotations ?? {
             front: normalizeRotation(frontXmpValues.rotation ?? 0),
@@ -1601,6 +1687,7 @@ function App() {
             date: defaultDate,
             description: "",
             tags: [],
+            location: null,
           },
           unsavedEdits?.rotations ?? { front: 0, back: 0 },
           Boolean(unsavedEdits),
@@ -1855,7 +1942,12 @@ function App() {
       const isRotationHotkeyBlocked =
         target === descriptionInputRef.current ||
         target === tagInputRef.current ||
-        Boolean(target?.closest(".immich-content input"));
+        // Text fields in the Additional Details row (tag typeahead, location search) keep their keystrokes.
+        Boolean(
+          target?.closest(
+            ".immich-content input, .additional-details input[type='text'], .additional-details textarea",
+          ),
+        );
 
       // Review shortcuts act on the selected image, which the grid does not show.
       if (
@@ -1965,11 +2057,20 @@ function App() {
   };
 
   /**
+   * Sets or clears the current pair's location, which is saved with the rest of its metadata.
+   * @param location - The chosen place, or null to remove it.
+   */
+  const updateLocation = (location: PlaceLocation | null) => {
+    markUserChanged();
+    setMetadata((current) => ({ ...current, location }));
+  };
+
+  /**
    * Adds a new tag from user input to the current pair's metadata if it doesn't already exist.
    * Moves the added tag to the front of recent tags and clears the input field.
    */
-  const addTag = () => {
-    const tag = tagInput.trim();
+  const addTag = (newTag: string) => {
+    const tag = newTag.trim();
     if (!tag) {
       return;
     }
@@ -1989,7 +2090,6 @@ function App() {
           recentTag.toLocaleLowerCase() !== tag.toLocaleLowerCase(),
       ),
     ]);
-    setTagInput("");
   };
 
   /**
@@ -2726,6 +2826,153 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
     }
   };
   /**
+   * Counts the selected groups that already have a location, for the replace confirmation.
+   */
+  const countSelectedLocations = async () => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      throw new Error("API is not available.");
+    }
+    await waitForPendingSaves();
+    return electronApi.countPairsWithLocation(
+      pairs
+        .filter((pair) => selectedGridIds.has(pair.id))
+        .map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+    );
+  };
+
+  /**
+   * Applies one place to the groups selected in the grid. Groups that fail stay selected and are listed in the
+   * dialog so the place can be applied again.
+   * @param location - The place chosen in the modal.
+   */
+  const handleConfirmSetLocation = async (location: PlaceLocation) => {
+    const chosenPairs = pairs.filter((pair) => selectedGridIds.has(pair.id));
+    if (!chosenPairs.length) {
+      setIsSetLocationModalOpen(false);
+      return;
+    }
+
+    setIsSettingLocation(true);
+    setSetLocationFailures([]);
+    setStatus(`Setting location for ${chosenPairs.length} selected groups...`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      const result = await electronApi.setPairsLocation(
+        chosenPairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+        location,
+      );
+      const failedPaths = new Set(result.failedFrontPaths);
+      markPairsSaved(
+        chosenPairs
+          .filter((pair) => !failedPaths.has(pair.frontPath))
+          .map((pair) => pair.id),
+      );
+      setSelectedGridIds(
+        new Set(
+          chosenPairs
+            .filter((pair) => failedPaths.has(pair.frontPath))
+            .map((pair) => pair.id),
+        ),
+      );
+      setStatus(
+        result.ok
+          ? `Set location to ${location.name || "the chosen place"} for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`
+          : `Location set for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}; ${result.errors.length} failed.`,
+      );
+      if (result.ok) {
+        setIsSetLocationModalOpen(false);
+      } else {
+        setSetLocationFailures(result.errors);
+      }
+      sidecarPrefetchRef.current.clear();
+      setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to set the location for the selected images.";
+      setStatus(message);
+      setSetLocationFailures([message]);
+    } finally {
+      setIsSettingLocation(false);
+    }
+  };
+
+  /**
+   * Adds tags to the groups selected in the grid. Existing tags are kept; groups that fail stay selected and
+   * are listed in the dialog so the tags can be added again.
+   * @param tags - The tags chosen in the modal.
+   */
+  const handleConfirmAddTags = async (tags: string[]) => {
+    const chosenPairs = pairs.filter((pair) => selectedGridIds.has(pair.id));
+    if (!chosenPairs.length || !tags.length) {
+      setIsAddTagsModalOpen(false);
+      return;
+    }
+
+    setIsAddingTags(true);
+    setAddTagsFailures([]);
+    setStatus(`Adding tags to ${chosenPairs.length} selected groups...`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      const result = await electronApi.addTagsToPairs(
+        chosenPairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+        tags,
+      );
+      const failedPaths = new Set(result.failedFrontPaths);
+      markPairsSaved(
+        chosenPairs
+          .filter((pair) => !failedPaths.has(pair.frontPath))
+          .map((pair) => pair.id),
+      );
+      setRecentTags((current) => mergeTagSources(tags, current));
+      setSelectedGridIds(
+        new Set(
+          chosenPairs
+            .filter((pair) => failedPaths.has(pair.frontPath))
+            .map((pair) => pair.id),
+        ),
+      );
+      setStatus(
+        result.ok
+          ? `Added ${tags.length} tag${tags.length === 1 ? "" : "s"} to ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`
+          : `Tags added to ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}; ${result.errors.length} failed.`,
+      );
+      if (result.ok) {
+        setIsAddTagsModalOpen(false);
+      } else {
+        setAddTagsFailures(result.errors);
+      }
+      sidecarPrefetchRef.current.clear();
+      setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to add tags to the selected images.";
+      setStatus(message);
+      setAddTagsFailures([message]);
+    } finally {
+      setIsAddingTags(false);
+    }
+  };
+
+  /**
    * Marks the open folder, and optionally every subfolder, as processed or not processed.
    * @param value - Whether the folder is processed.
    * @param includeSubfolders - Whether to mark every subfolder the same way.
@@ -2768,6 +3015,11 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
       setIsSettingFolderProcessed(false);
     }
   };
+  const tagSuggestions = mergeTagSources(immichTags, recentTags);
+  const uploadTags = immichSettings.tags
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter(Boolean);
   const managedImmichFields = immichSettings.managed;
   const canUploadToImmich =
     Boolean(directoryPath) &&
@@ -2815,27 +3067,6 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
               </a>
             </>
           ) : null}
-          {directoryPath && viewMode === "grid" && selectedGridIds.size > 0 ? (
-            <>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setSelectedGridIds(new Set())}
-                disabled={isTransitionLocked}
-              >
-                Clear selection
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => setIsSelectedDateModalOpen(true)}
-                disabled={isTransitionLocked}
-                title="Set a date for the selected images, replacing any date already saved"
-              >
-                Set date for selected ({selectedGridIds.size})
-              </button>
-            </>
-          ) : null}
           {directoryPath ? (
             <button
               type="button"
@@ -2879,6 +3110,58 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
           <span className="save-indicator" role="status">
             Saving {pendingSaveCount} image{pendingSaveCount === 1 ? "" : "s"}…
           </span>
+        ) : null}
+        {directoryPath && viewMode === "grid" && selectedGridIds.size > 0 ? (
+          <div
+            className="selection-actions"
+            role="group"
+            aria-label="Actions for the selected images"
+          >
+            <span className="selection-count">
+              {selectedGridIds.size} selected
+            </span>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setSelectedGridIds(new Set())}
+              disabled={isTransitionLocked}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => setIsSelectedDateModalOpen(true)}
+              disabled={isTransitionLocked}
+              title="Set a date for the selected images, replacing any date already saved"
+            >
+              Set date
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                setAddTagsFailures([]);
+                setIsAddTagsModalOpen(true);
+              }}
+              disabled={isTransitionLocked}
+              title="Add tags to the selected images, keeping the tags they already have"
+            >
+              Add tags
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                setSetLocationFailures([]);
+                setIsSetLocationModalOpen(true);
+              }}
+              disabled={isTransitionLocked}
+              title="Set one location for the selected images"
+            >
+              Set location
+            </button>
+          </div>
         ) : null}
         {directoryPath ? (
           <div className="folder-processed">
@@ -3100,102 +3383,109 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                     />
                   </label>
 
-                  <details
-                    className="metadata-details"
-                    open={isMetadataEntryExpanded}
-                    onToggle={(event) =>
-                      setIsMetadataEntryExpanded(event.currentTarget.open)
+                  <button
+                    type="button"
+                    className="metadata-details-toggle"
+                    aria-expanded={isMetadataEntryExpanded}
+                    aria-controls="additional-details"
+                    onClick={() =>
+                      setIsMetadataEntryExpanded((current) => !current)
                     }
                   >
-                    <summary className="metadata-details-summary">
-                      <span>Tags</span>
-                      <span className="metadata-details-action">
-                        {isMetadataEntryExpanded ? "Collapse" : "Expand"}
-                      </span>
-                    </summary>
-                    <div className="metadata-details-content">
-                      <div className="metadata-tags">
-                        <label htmlFor="new-tag">Tags</label>
-                        <div className="tag-entry">
-                          <input
+                    <span>Additional Details</span>
+                    <span className="metadata-details-action">
+                      {isMetadataEntryExpanded ? "Collapse" : "Expand"}
+                    </span>
+                  </button>
+
+                  {isMetadataEntryExpanded ? (
+                    <div id="additional-details" className="additional-details">
+                      <section
+                        className="detail-box metadata-tags"
+                        aria-labelledby="tags-heading"
+                      >
+                        <h3 id="tags-heading">
+                          <label htmlFor="new-tag">Tags</label>
+                        </h3>
+                        <div className="detail-box-row">
+                          <TagInput
                             id="new-tag"
-                            ref={tagInputRef}
-                            type="text"
-                            value={tagInput}
-                            onChange={(event) =>
-                              setTagInput(event.target.value)
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === ",") {
-                                event.preventDefault();
-                                addTag();
-                              }
-                            }}
+                            inputRef={tagInputRef}
+                            suggestions={tagSuggestions}
+                            selectedTags={metadata.tags}
+                            onAdd={addTag}
                             placeholder="Type a new tag"
                             disabled={isPersistingRotation || isUploading}
+                            lookupError={immichTagError}
                           />
-                          <button
-                            type="button"
-                            className="secondary-button"
-                            onClick={addTag}
-                            disabled={
-                              !tagInput.trim() ||
-                              isPersistingRotation ||
-                              isUploading
-                            }
-                          >
-                            Add
-                          </button>
-                        </div>
-                      </div>
-
-                      {metadata.tags.length ? (
-                        <div
-                          className="selected-tags"
-                          aria-label="Selected tags"
-                        >
-                          {metadata.tags.map((tag) => (
-                            <button
-                              key={tag.toLocaleLowerCase()}
-                              type="button"
-                              onClick={() => toggleTag(tag)}
-                              disabled={isPersistingRotation || isUploading}
-                              aria-label={`Remove ${tag}`}
+                          {metadata.tags.length ? (
+                            <div
+                              className="selected-tags"
+                              aria-label="Selected tags"
                             >
-                              {tag} <span aria-hidden="true">&times;</span>
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      <fieldset className="recent-tags">
-                        <legend>Recent tags</legend>
-                        {recentTags.length ? (
-                          <div className="recent-tag-options">
-                            {recentTags.map((tag) => (
-                              <label key={tag.toLocaleLowerCase()}>
-                                <input
-                                  type="checkbox"
-                                  checked={metadata.tags.some(
-                                    (selectedTag) =>
-                                      selectedTag.toLocaleLowerCase() ===
-                                      tag.toLocaleLowerCase(),
-                                  )}
-                                  onChange={() => toggleTag(tag)}
+                              {metadata.tags.map((tag) => (
+                                <button
+                                  key={tag.toLocaleLowerCase()}
+                                  type="button"
+                                  onClick={() => toggleTag(tag)}
                                   disabled={isPersistingRotation || isUploading}
-                                />
-                                <span>{tag}</span>
-                              </label>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="field-help">
-                            Tags from recently modified XMP files appear here.
-                          </span>
-                        )}
-                      </fieldset>
+                                  aria-label={`Remove ${tag}`}
+                                >
+                                  {tag} <span aria-hidden="true">&times;</span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="field-help">No tags yet.</p>
+                          )}
+                        </div>
+
+                        <fieldset className="recent-tags">
+                          <legend>Recent tags</legend>
+                          {recentTags.length ? (
+                            <div className="recent-tag-options">
+                              {recentTags.map((tag) => (
+                                <label key={tag.toLocaleLowerCase()}>
+                                  <input
+                                    type="checkbox"
+                                    checked={metadata.tags.some(
+                                      (selectedTag) =>
+                                        selectedTag.toLocaleLowerCase() ===
+                                        tag.toLocaleLowerCase(),
+                                    )}
+                                    onChange={() => toggleTag(tag)}
+                                    disabled={
+                                      isPersistingRotation || isUploading
+                                    }
+                                  />
+                                  <span>{tag}</span>
+                                </label>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="field-help">
+                              Tags from recently modified XMP files appear here.
+                            </span>
+                          )}
+                        </fieldset>
+                      </section>
+
+                      <section
+                        className="detail-box metadata-location"
+                        aria-labelledby="location-heading"
+                      >
+                        <h3 id="location-heading">
+                          <label htmlFor="image-location">Location</label>
+                        </h3>
+                        <LocationPicker
+                          id="image-location"
+                          value={metadata.location}
+                          onChange={updateLocation}
+                          disabled={isPersistingRotation || isUploading}
+                        />
+                      </section>
                     </div>
-                  </details>
+                  ) : null}
 
                   <div className="do-not-upload">
                     <button
@@ -3523,35 +3813,72 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   </label>
                 )}
 
-                <label>
-                  Target album
-                  <input
-                    type="text"
+                {isWebApp() ? (
+                  <AlbumCombobox
                     value={immichSettings.albumName}
-                    onChange={(event) =>
-                      updateImmichSetting("albumName", event.target.value)
+                    onChange={(albumName) =>
+                      updateImmichSetting("albumName", albumName)
                     }
-                    required
                     disabled={isUploading}
+                    settings={{
+                      serverUrl: immichSettings.serverUrl,
+                      userApiKey: immichSettings.userApiKey,
+                    }}
                   />
-                </label>
+                ) : (
+                  <label>
+                    Target album
+                    <input
+                      type="text"
+                      value={immichSettings.albumName}
+                      onChange={(event) =>
+                        updateImmichSetting("albumName", event.target.value)
+                      }
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
-                <label className="immich-tags">
-                  Tags
-                  <input
-                    type="text"
-                    value={immichSettings.tags}
-                    onChange={(event) =>
-                      updateImmichSetting("tags", event.target.value)
+                <div className="immich-tags">
+                  <label htmlFor="immich-upload-tag">Tags</label>
+                  <TagInput
+                    id="immich-upload-tag"
+                    suggestions={tagSuggestions}
+                    selectedTags={uploadTags}
+                    onAdd={(tag) =>
+                      updateImmichSetting(
+                        "tags",
+                        [...uploadTags, tag].join(", "),
+                      )
                     }
                     placeholder="family, archive, scanned"
                     disabled={isUploading}
-                    aria-describedby="immich-tags-help"
+                    lookupError={immichTagError}
                   />
-                  <span id="immich-tags-help" className="field-help">
-                    Separate multiple tags with commas.
-                  </span>
-                </label>
+                  {uploadTags.length ? (
+                    <div className="selected-tags" aria-label="Upload tags">
+                      {uploadTags.map((tag) => (
+                        <button
+                          key={tag.toLocaleLowerCase()}
+                          type="button"
+                          onClick={() =>
+                            updateImmichSetting(
+                              "tags",
+                              uploadTags
+                                .filter((current) => current !== tag)
+                                .join(", "),
+                            )
+                          }
+                          disabled={isUploading}
+                          aria-label={`Remove ${tag}`}
+                        >
+                          {tag} <span aria-hidden="true">&times;</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
 
                 <label>
                   Concurrent tasks
@@ -3669,6 +3996,25 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}
+      />
+      <SetLocationModal
+        isOpen={isSetLocationModalOpen}
+        selectedCount={selectedGridIds.size}
+        isSubmitting={isSettingLocation}
+        failures={setLocationFailures}
+        countExisting={countSelectedLocations}
+        onConfirm={(location) => void handleConfirmSetLocation(location)}
+        onClose={() => setIsSetLocationModalOpen(false)}
+      />
+      <AddTagsModal
+        isOpen={isAddTagsModalOpen}
+        selectedCount={selectedGridIds.size}
+        suggestions={tagSuggestions}
+        lookupError={immichTagError}
+        isSubmitting={isAddingTags}
+        failures={addTagsFailures}
+        onConfirm={(tags) => void handleConfirmAddTags(tags)}
+        onClose={() => setIsAddTagsModalOpen(false)}
       />
       <SetFolderDateModal
         isOpen={isSelectedDateModalOpen}

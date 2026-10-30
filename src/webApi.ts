@@ -1,4 +1,5 @@
 import type { DirectoryListing } from "./DirectoryBrowser";
+import type { Place } from "./placeTypes";
 
 type ImageParserApi = NonNullable<Window["electronAPI"]>;
 
@@ -63,6 +64,23 @@ const createWebApi = (): ImageParserApi => ({
     postJson("api/set-folder-date", { directoryPath, date, recursive }),
   setPairsDate: (pairs, date) =>
     postJson("api/set-pairs-date", { pairs, date }),
+  searchPlaces: async (query) =>
+    (
+      await requestJson<{ places: Place[] }>(
+        `api/geocode?${new URLSearchParams({ q: query }).toString()}`,
+      )
+    ).places,
+  getRecentPlaces: async () =>
+    (await requestJson<{ places: Place[] }>("api/recent-places")).places,
+  rememberPlace: async (place) =>
+    (await postJson<{ place: Place }>("api/recent-places", place)).place,
+  countPairsWithLocation: async (pairs) =>
+    (await postJson<{ count: number }>("api/count-pairs-location", { pairs }))
+      .count,
+  setPairsLocation: (pairs, location) =>
+    postJson("api/set-pairs-location", { pairs, location }),
+  addTagsToPairs: (pairs, tags) =>
+    postJson("api/add-tags-to-pairs", { pairs, tags }),
   resetFolderMetadata: (directoryPath, recursive) =>
     postJson("api/reset-folder-metadata", { directoryPath, recursive }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
@@ -164,6 +182,48 @@ export const fetchCurrentUser = async (): Promise<CurrentUser | null> => {
     return null;
   }
 };
+
+export type ImmichAlbum = {
+  id: string;
+  albumName: string;
+  assetCount: number;
+  shared: boolean;
+};
+
+/** The Immich connection values currently in the form, which may not be saved yet. */
+export type ImmichLookupSettings = { serverUrl: string; userApiKey: string };
+
+/**
+ * Loads the Immich albums the signed-in user may upload into (web app only).
+ * @param settings - The URL and key in the form; blank values fall back to the saved or managed ones.
+ * @param refresh - Skips the server's short-lived cache.
+ */
+export const loadImmichAlbums = async (
+  settings: ImmichLookupSettings,
+  refresh = false,
+) =>
+  (
+    await postJson<{ albums: ImmichAlbum[] }>("api/immich-albums", {
+      settings,
+      refresh,
+    })
+  ).albums;
+
+/**
+ * Loads the user's existing Immich tags as full hierarchical paths (web app only).
+ * @param settings - The URL and key in the form; blank values fall back to the saved or managed ones.
+ * @param refresh - Skips the server's short-lived cache.
+ */
+export const loadImmichTags = async (
+  settings: ImmichLookupSettings,
+  refresh = false,
+) =>
+  (
+    await postJson<{ tags: string[] }>("api/immich-tags", {
+      settings,
+      refresh,
+    })
+  ).tags;
 
 export const installWebApi = () => {
   if (!window.electronAPI) {

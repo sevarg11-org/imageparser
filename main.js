@@ -21,12 +21,16 @@ import {
   setDoNotUpload,
   setFolderDate,
   resetFolderMetadata,
+  addTagsToPairs,
+  countPairsWithLocation,
+  setLocationForPairs,
   setPairsDate,
   setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
 } from "./core.js";
 import fs from "node:fs/promises";
+import { createGeocoder } from "./geocoder.js";
 
 /**
  * The absolute file path of the current module.
@@ -401,6 +405,24 @@ ipcMain.handle(
  */
 ipcMain.handle("set-pairs-date", (_event, { pairs, date }) =>
   setPairsDate(pairs, date),
+);
+const geocoder = createGeocoder({
+  baseUrl: process.env.IMAGEPARSER_GEOCODER_URL || undefined,
+  cacheFile: path.join(getSettingsDirectory(), "geocode-cache.json"),
+});
+ipcMain.handle("geocode-search", (_event, query) => geocoder.search(query));
+ipcMain.handle("get-recent-places", () => geocoder.getRecentPlaces());
+ipcMain.handle("remember-place", (_event, place) =>
+  geocoder.rememberPlace(place),
+);
+ipcMain.handle("count-pairs-location", (_event, { pairs }) =>
+  countPairsWithLocation(pairs),
+);
+ipcMain.handle("set-pairs-location", (_event, { pairs, location }) =>
+  setLocationForPairs(pairs, location),
+);
+ipcMain.handle("add-tags-to-pairs", (_event, { pairs, tags }) =>
+  addTagsToPairs(pairs, tags),
 );
 ipcMain.handle("save-metadata", (_event, metadata) => saveMetadata(metadata));
 

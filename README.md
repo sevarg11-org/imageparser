@@ -110,16 +110,17 @@ Desktop app uses Windows/macOS secure storage to encrypt Immich API keys. Keys a
 
 Create a stack from `docker-compose.yml`. Configure these environment variables:
 
-| Variable                 | Example                      | Purpose                             |
-| ------------------------ | ---------------------------- | ----------------------------------- |
-| `IMAGEPARSER_PHOTOS_DIR` | `/mnt/tank/photos/scans`     | Photo dataset (mounted at `/data`)  |
-| `IMAGEPARSER_CONFIG_DIR` | `/mnt/tank/apps/imageparser` | Settings + encryption key storage   |
-| `PUID` / `PGID`          | `568` / `568`                | Owner of the photo dataset          |
-| `IMAGEPARSER_PORT`       | `8080`                       | Host port for the web UI            |
-| `IMAGEPARSER_USERNAME`   | `admin`                      | Optional HTTP Basic auth user       |
-| `IMAGEPARSER_PASSWORD`   | _(strong password)_          | Enables auth when set (recommended) |
-| `IMAGEPARSER_DEBUG`      | `false`                      | Streams server logs to the browser  |
-| `IMAGEPARSER_TAG`        | `latest`                     | Image tag to run (default `latest`) |
+| Variable                   | Example                      | Purpose                                   |
+| -------------------------- | ---------------------------- | ----------------------------------------- |
+| `IMAGEPARSER_PHOTOS_DIR`   | `/mnt/tank/photos/scans`     | Photo dataset (mounted at `/data`)        |
+| `IMAGEPARSER_CONFIG_DIR`   | `/mnt/tank/apps/imageparser` | Settings + encryption key storage         |
+| `PUID` / `PGID`            | `568` / `568`                | Owner of the photo dataset                |
+| `IMAGEPARSER_PORT`         | `8080`                       | Host port for the web UI                  |
+| `IMAGEPARSER_USERNAME`     | `admin`                      | Optional HTTP Basic auth user             |
+| `IMAGEPARSER_PASSWORD`     | _(strong password)_          | Enables auth when set (recommended)       |
+| `IMAGEPARSER_DEBUG`        | `false`                      | Streams server logs to the browser        |
+| `IMAGEPARSER_TAG`          | `latest`                     | Image tag to run (default `latest`)       |
+| `IMAGEPARSER_GEOCODER_URL` | `https://photon.komoot.io`   | Optional place-search service (see below) |
 
 #### Immich settings for every user (optional)
 
@@ -141,6 +142,20 @@ An administrator can set the Immich server and admin key once for every user ins
 
 Resized previews are cached in `preview-cache/` inside the config directory and trimmed when the cache grows past
 1 GB. Set `IMAGEPARSER_PREVIEW_CACHE_MB` on the container to change the limit. The folder is safe to delete.
+
+#### Place search for photo locations (optional)
+
+Photos can be tagged with a place (a school, church or town). The place search uses
+[Photon](https://photon.komoot.io), which is built on OpenStreetMap data and has no per-call fees. By default the
+public `https://photon.komoot.io` server is used. Set `IMAGEPARSER_GEOCODER_URL` to the base URL of your own
+Photon-compatible server (`<url>/api?q=...`) to avoid the public one; the server refuses to start if the value is
+not an `http://` or `https://` URL.
+
+To keep the load on the service very low, a search runs only when the user presses Enter or the Search button, at
+least 3 characters are required, results are cached in memory and in `geocode-cache.json` in the config directory,
+requests are limited to one per second, and choosing a result never makes another call. The place is written to the
+photo's XMP sidecar as `exif:GPSLatitude` / `exif:GPSLongitude`, which Immich reads. Place data is © OpenStreetMap
+contributors.
 
 For single sign-on with per-user folders, set the `OIDC_*` variables instead of the Basic auth pair; see
 [Single sign-on with Authentik](#single-sign-on-with-authentik).

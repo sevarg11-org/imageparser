@@ -23,6 +23,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("set-folder-date", { directoryPath, date, recursive }),
   setPairsDate: (pairs, date) =>
     ipcRenderer.invoke("set-pairs-date", { pairs, date }),
+  searchPlaces: (query) => ipcRenderer.invoke("geocode-search", query),
+  getRecentPlaces: () => ipcRenderer.invoke("get-recent-places"),
+  rememberPlace: (place) => ipcRenderer.invoke("remember-place", place),
+  countPairsWithLocation: (pairs) =>
+    ipcRenderer.invoke("count-pairs-location", { pairs }),
+  setPairsLocation: (pairs, location) =>
+    ipcRenderer.invoke("set-pairs-location", { pairs, location }),
+  addTagsToPairs: (pairs, tags) =>
+    ipcRenderer.invoke("add-tags-to-pairs", { pairs, tags }),
   resetFolderMetadata: (directoryPath, recursive) =>
     ipcRenderer.invoke("reset-folder-metadata", { directoryPath, recursive }),
   setDoNotUpload: (request) => ipcRenderer.invoke("set-do-not-upload", request),
