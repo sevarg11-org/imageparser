@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
-  completeDateSegment,
-  toIsoDate,
-  type DateSegments,
-} from "./dateEntry";
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
+import { completeDateSegment, toIsoDate, type DateSegments } from "./dateEntry";
 import "./SetFolderDateModal.css";
 
 type SetFolderDateModalProps = {
@@ -11,6 +12,8 @@ type SetFolderDateModalProps = {
   totalCount: number;
   /** The number of folders covered in nested mode, or null when only the loaded folder is covered. */
   nestedFolderCount: number | null;
+  /** The number of chosen groups when dating a selection instead of the folder. */
+  selectedCount?: number;
   onConfirm: (date: string) => void;
   onClose: () => void;
   isSubmitting?: boolean;
@@ -19,6 +22,7 @@ type SetFolderDateModalProps = {
 const SetFolderDateDialogContent = ({
   totalCount,
   nestedFolderCount,
+  selectedCount,
   onConfirm,
   onClose,
   isSubmitting,
@@ -117,12 +121,20 @@ const SetFolderDateDialogContent = ({
       onKeyDown={handleKeyDown}
     >
       <header className="set-folder-date-header">
-        <h2 id="set-folder-date-title">Set Date for Folder</h2>
+        <h2 id="set-folder-date-title">
+          {selectedCount === undefined
+            ? "Set Date for Folder"
+            : "Set Date for Selected"}
+        </h2>
         <p className="set-folder-date-subtitle">
-          {nestedFolderCount === null
-            ? "Apply a date to all images in this folder without existing metadata"
-            : `Apply a date to all images in this folder and all its nested folders (${nestedFolderCount} folder${nestedFolderCount === 1 ? "" : "s"} in total) without existing metadata`}{" "}
-          ({totalCount} total photo group{totalCount === 1 ? "" : "s"}).
+          {selectedCount !== undefined
+            ? `Apply a date to the ${selectedCount} selected photo group${selectedCount === 1 ? "" : "s"}, replacing any date already saved for them.`
+            : nestedFolderCount === null
+              ? "Apply a date to all images in this folder without existing metadata"
+              : `Apply a date to all images in this folder and all its nested folders (${nestedFolderCount} folder${nestedFolderCount === 1 ? "" : "s"} in total) without existing metadata`}{" "}
+          {selectedCount === undefined
+            ? ` (${totalCount} total photo group${totalCount === 1 ? "" : "s"}).`
+            : null}
         </p>
       </header>
 
@@ -178,7 +190,9 @@ const SetFolderDateDialogContent = ({
         ) : null}
 
         <p className="set-folder-date-note">
-          Images that already have an XMP sidecar file will be skipped.
+          {selectedCount === undefined
+            ? "Images that already have an XMP sidecar file will be skipped."
+            : "Each photo keeps its description and tags. An XMP sidecar file is created for photos without one."}
         </p>
       </div>
 
@@ -197,7 +211,11 @@ const SetFolderDateDialogContent = ({
           onClick={handleSubmit}
           disabled={isSubmitting}
         >
-          {isSubmitting ? "Setting date…" : "Set Date for All"}
+          {isSubmitting
+            ? "Setting date…"
+            : selectedCount === undefined
+              ? "Set Date for All"
+              : "Set Date for Selected"}
         </button>
       </footer>
     </dialog>
@@ -208,6 +226,7 @@ export const SetFolderDateModal = ({
   isOpen,
   totalCount,
   nestedFolderCount,
+  selectedCount,
   onConfirm,
   onClose,
   isSubmitting = false,
@@ -220,6 +239,7 @@ export const SetFolderDateModal = ({
     <SetFolderDateDialogContent
       totalCount={totalCount}
       nestedFolderCount={nestedFolderCount}
+      selectedCount={selectedCount}
       onConfirm={onConfirm}
       onClose={onClose}
       isSubmitting={isSubmitting}

@@ -9,6 +9,7 @@
 
 .thumbnail-cell {
   position: relative;
+  display: flex;
   min-width: 0;
 }
 
@@ -57,6 +58,7 @@
 
 .thumbnail-button {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 8px;
   width: 100%;
@@ -135,6 +137,8 @@
 
 .thumbnail-caption {
   display: flex;
+  /* Leaves the bottom-right corner free for the selection checkbox. */
+  padding-right: 28px;
   flex-direction: column;
   gap: 6px;
 }
@@ -182,4 +186,20 @@
     grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     gap: 10px;
   }
+}
+
+.thumbnail-select {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  accent-color: #38bdf8;
+  cursor: pointer;
+}
+
+.thumbnail-cell--selected .thumbnail-button {
+  outline: 3px solid #38bdf8;
+  outline-offset: -3px;
 }

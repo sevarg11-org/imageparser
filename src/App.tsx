@@ -222,6 +222,24 @@ declare global {
         date: string,
         recursive: boolean,
       ) => Promise<SetFolderDateResult>;
+      setPairsDate: (
+        pairs: { frontPath: string; backPath: string | null }[],
+        date: string,
+      ) => Promise<{
+        ok: boolean;
+        updatedPairs: number;
+        failedFrontPaths: string[];
+        errors: string[];
+      }>;
+      resetFolderMetadata: (
+        directoryPath: string,
+        recursive: boolean,
+      ) => Promise<{
+        ok: boolean;
+        deletedFiles: number;
+        resetPairs: number;
+        errors: string[];
+      }>;
       setDoNotUpload: (request: {
         frontPath: string;
         backPath: string | null;
@@ -867,6 +885,10 @@ function App() {
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
+  const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [isSelectedDateModalOpen, setIsSelectedDateModalOpen] = useState(false);
   const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] =
     useState(false);
   const [isTogglingDoNotUpload, setIsTogglingDoNotUpload] = useState(false);
@@ -2220,6 +2242,7 @@ function App() {
       resetSavedPairs();
       setViewMode("grid");
       setGridFocusPairId(null);
+      setSelectedGridIds(new Set());
       setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
@@ -2557,6 +2580,151 @@ function App() {
       setIsSettingFolderDate(false);
     }
   };
+
+  /**
+   * Deletes the XMP sidecar files of every image in the folder after the user confirms, so every
+   * image goes back to unprocessed. The folder is read again afterwards to show the reset state.
+   */
+  const handleResetProcessing = async () => {
+    if (!directoryPath) {
+      return;
+    }
+    if (
+      !window.confirm(
+        `Reset processing for all images${includeNested ? " in this folder and its nested folders" : " in this folder"}?
+
+This permanently deletes their .xmp sidecar files, including the saved dates, descriptions and tags. The images themselves are not deleted. This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+
+    setIsSettingFolderDate(true);
+    setStatus("Resetting processing for all images...");
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      unsavedEditsRef.current.clear();
+      const result = await electronApi.resetFolderMetadata(
+        directoryPath,
+        includeNested,
+      );
+      const listing = await electronApi.readDirectory(
+        directoryPath,
+        sortBy,
+        includeNested,
+      );
+      sidecarPrefetchRef.current.clear();
+      setImageVersions({});
+      setFolderCount(listing.folderCount);
+      setFolderState(listing.folderState);
+      setHasSubfolders(listing.hasSubfolders);
+      setIsHydrated(false);
+      setPairs(listing.files);
+      resetSavedPairs();
+      setSelectedGridIds(new Set());
+      setRecentTags(listing.recentTags);
+      setSelectedPairId(
+        filterImagePairs(listing.files, imageFilter, new Set())[0]?.id ?? null,
+      );
+      setPairReloadToken((current) => current + 1);
+
+      setStatus(
+        result.ok
+          ? `Reset ${result.resetPairs} image group${result.resetPairs === 1 ? "" : "s"} (${result.deletedFiles} .xmp file${result.deletedFiles === 1 ? "" : "s"} deleted).`
+          : `Reset ${result.resetPairs} image group${result.resetPairs === 1 ? "" : "s"} with ${result.errors.length} error${result.errors.length === 1 ? "" : "s"}: ${result.errors.slice(0, 2).join("; ")}${result.errors.length > 2 ? "..." : ""}`,
+      );
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Unable to reset the processing state.",
+      );
+    } finally {
+      setIsSettingFolderDate(false);
+    }
+  };
+
+  const toggleGridSelection = useCallback((pairId: string) => {
+    setSelectedGridIds((current) => {
+      const next = new Set(current);
+      if (!next.delete(pairId)) {
+        next.add(pairId);
+      }
+      return next;
+    });
+  }, []);
+
+  /**
+   * Sets the chosen date on the groups selected in the grid, with the same rules as saving one image.
+   * @param date - The ISO date string chosen from the modal.
+   */
+  const handleConfirmSetSelectedDate = async (date: string) => {
+    const chosenPairs = pairs.filter((pair) => selectedGridIds.has(pair.id));
+    if (!chosenPairs.length) {
+      setIsSelectedDateModalOpen(false);
+      return;
+    }
+
+    setIsSettingFolderDate(true);
+    setStatus(`Setting date for ${chosenPairs.length} selected groups...`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      const result = await electronApi.setPairsDate(
+        chosenPairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+        date,
+      );
+      const failedPaths = new Set(result.failedFrontPaths);
+      const datedPairs = chosenPairs.filter(
+        (pair) => !failedPaths.has(pair.frontPath),
+      );
+      setSavedDates((current) => {
+        const next = new Map(current);
+        for (const pair of datedPairs) {
+          next.set(pair.id, date);
+        }
+        return next;
+      });
+      markPairsSaved(datedPairs.map((pair) => pair.id));
+      // Failed groups stay selected so the date can be retried.
+      setSelectedGridIds(
+        new Set(
+          chosenPairs
+            .filter((pair) => failedPaths.has(pair.frontPath))
+            .map((pair) => pair.id),
+        ),
+      );
+
+      setStatus(
+        result.ok
+          ? `Set date to ${date} for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`
+          : `Date set for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"} with ${result.errors.length} error${result.errors.length === 1 ? "" : "s"}: ${result.errors.slice(0, 2).join("; ")}${result.errors.length > 2 ? "..." : ""}`,
+      );
+      setIsSelectedDateModalOpen(false);
+      sidecarPrefetchRef.current.clear();
+      setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Unable to set the date for the selected images.",
+      );
+    } finally {
+      setIsSettingFolderDate(false);
+    }
+  };
   /**
    * Marks the open folder, and optionally every subfolder, as processed or not processed.
    * @param value - Whether the folder is processed.
@@ -2646,6 +2814,38 @@ function App() {
                 Sign out
               </a>
             </>
+          ) : null}
+          {directoryPath && viewMode === "grid" && selectedGridIds.size > 0 ? (
+            <>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setSelectedGridIds(new Set())}
+                disabled={isTransitionLocked}
+              >
+                Clear selection
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => setIsSelectedDateModalOpen(true)}
+                disabled={isTransitionLocked}
+                title="Set a date for the selected images, replacing any date already saved"
+              >
+                Set date for selected ({selectedGridIds.size})
+              </button>
+            </>
+          ) : null}
+          {directoryPath ? (
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void handleResetProcessing()}
+              disabled={isTransitionLocked}
+              title="Delete the .xmp files of all images in this folder so they are unprocessed again"
+            >
+              Reset processing
+            </button>
           ) : null}
           {directoryPath ? (
             <button
@@ -2815,6 +3015,8 @@ function App() {
                 onOpen={openPairInReview}
                 onRotate={rotateFromGrid}
                 canRotate={!isUploading}
+                selectedIds={selectedGridIds}
+                onToggleSelect={toggleGridSelection}
               />
             </section>
           ) : (
@@ -3466,6 +3668,15 @@ function App() {
         nestedFolderCount={includeNested ? folderCount : null}
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
+        isSubmitting={isSettingFolderDate}
+      />
+      <SetFolderDateModal
+        isOpen={isSelectedDateModalOpen}
+        totalCount={pairs.length}
+        nestedFolderCount={null}
+        selectedCount={selectedGridIds.size}
+        onConfirm={(date) => void handleConfirmSetSelectedDate(date)}
+        onClose={() => setIsSelectedDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}
       />
     </div>

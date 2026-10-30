@@ -40,6 +40,8 @@ import {
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  resetFolderMetadata,
+  setPairsDate,
   setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
@@ -865,6 +867,20 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     saveMetadata(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
+  "POST /api/set-pairs-date": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs)) {
+      throw new Error("No images selected.");
+    }
+    // Every path is confined to the user's folders before anything is written.
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return setPairsDate(
+      pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      body.date,
+    );
+  },
   "POST /api/apply-image-rotations": async (request) =>
     applyImageRotations(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
@@ -926,6 +942,17 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     return setFolderDate(
       directoryPath,
       body.date,
+      await getScanOptionsForUser(request.user, body.recursive),
+    );
+  },
+  "POST /api/reset-folder-metadata": async (request) => {
+    const body = await readJsonBody(request);
+    const directoryPath = await resolvePathForUser(
+      request.user,
+      body.directoryPath,
+    );
+    return resetFolderMetadata(
+      directoryPath,
       await getScanOptionsForUser(request.user, body.recursive),
     );
   },

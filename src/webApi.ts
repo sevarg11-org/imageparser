@@ -61,6 +61,10 @@ const createWebApi = (): ImageParserApi => ({
     postJson("api/apply-image-rotations", request),
   setFolderDate: (directoryPath, date, recursive) =>
     postJson("api/set-folder-date", { directoryPath, date, recursive }),
+  setPairsDate: (pairs, date) =>
+    postJson("api/set-pairs-date", { pairs, date }),
+  resetFolderMetadata: (directoryPath, recursive) =>
+    postJson("api/reset-folder-metadata", { directoryPath, recursive }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
   setFolderProcessed: (directoryPath, value, includeSubfolders) =>
     postJson("api/folder-processed", {

@@ -31,6 +31,9 @@ type ThumbnailGridProps = {
   onRotate: (id: string, delta: number) => void;
   /** False while rotating is unavailable, such as during an upload. */
   canRotate: boolean;
+  /** The IDs of the cells chosen for a bulk action. */
+  selectedIds: ReadonlySet<string>;
+  onToggleSelect: (id: string) => void;
 };
 
 type LazyThumbnailProps = {
@@ -128,6 +131,8 @@ type ThumbnailCellProps = {
   onOpen: (id: string) => void;
   onRotate: (id: string, delta: number) => void;
   canRotate: boolean;
+  isSelected: boolean;
+  onToggleSelect: (id: string) => void;
 };
 
 const ThumbnailCell = memo(function ThumbnailCell({
@@ -138,6 +143,8 @@ const ThumbnailCell = memo(function ThumbnailCell({
   onOpen,
   onRotate,
   canRotate,
+  isSelected,
+  onToggleSelect,
 }: ThumbnailCellProps) {
   const { id } = cell;
   const setButton = useCallback(
@@ -146,7 +153,9 @@ const ThumbnailCell = memo(function ThumbnailCell({
   );
 
   return (
-    <li className="thumbnail-cell">
+    <li
+      className={`thumbnail-cell${isSelected ? " thumbnail-cell--selected" : ""}`}
+    >
       <button
         ref={setButton}
         type="button"
@@ -189,7 +198,14 @@ const ThumbnailCell = memo(function ThumbnailCell({
           ) : null}
         </span>
       </button>
-      {/* Siblings of the cell's button, since buttons cannot be nested; they sit over its top corners. */}
+      {/* Siblings of the cell's button, since buttons cannot be nested; they sit over its corners. */}
+      <input
+        type="checkbox"
+        className="thumbnail-select"
+        aria-label={`Select ${cell.imageLabel}`}
+        checked={isSelected}
+        onChange={() => onToggleSelect(id)}
+      />
       <button
         type="button"
         className="thumbnail-rotate thumbnail-rotate--left"
@@ -225,6 +241,8 @@ export const ThumbnailGrid = ({
   onOpen,
   onRotate,
   canRotate,
+  selectedIds,
+  onToggleSelect,
 }: ThumbnailGridProps) => {
   const [loadQueue] = useState(createThumbnailLoadQueue);
   const observerRef = useRef<IntersectionObserver | null>(null);
@@ -301,6 +319,8 @@ export const ThumbnailGrid = ({
           onOpen={onOpen}
           onRotate={onRotate}
           canRotate={canRotate}
+          isSelected={selectedIds.has(cell.id)}
+          onToggleSelect={onToggleSelect}
         />
       ))}
     </ul>
