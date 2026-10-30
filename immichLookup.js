@@ -68,22 +68,24 @@ const getImmichJson = async (settings, endpoint, fetchImpl = fetch) => {
  */
 const mapPermittedAlbums = (albums, userId) =>
   (Array.isArray(albums) ? albums : [])
-    .filter((album) => {
-      if (album?.ownerId === userId) {
-        return true;
-      }
-      return (
-        Array.isArray(album?.albumUsers) &&
-        album.albumUsers.some(
-          (member) => member?.user?.id === userId && member?.role === "editor",
-        )
-      );
+    .map((album) => {
+      const myRole = (
+        Array.isArray(album?.albumUsers) ? album.albumUsers : []
+      ).find((member) => member?.user?.id === userId)?.role;
+      // Current Immich lists the owner in albumUsers with the "owner" role; older versions use ownerId
+      // (or owner.id) and list only the people the album is shared with.
+      const isOwner =
+        myRole === "owner" ||
+        album?.ownerId === userId ||
+        album?.owner?.id === userId;
+      return { album, isOwner, canAdd: isOwner || myRole === "editor" };
     })
-    .map((album) => ({
+    .filter(({ canAdd }) => canAdd)
+    .map(({ album, isOwner }) => ({
       id: String(album.id),
       albumName: String(album.albumName ?? ""),
       assetCount: Number(album.assetCount) || 0,
-      shared: album.ownerId !== userId || Boolean(album.shared),
+      shared: !isOwner || Boolean(album.shared),
     }))
     .filter((album) => album.albumName)
     .sort((left, right) =>
@@ -136,15 +138,9 @@ const createLookupCache = (now = Date.now) => {
  */
 const fetchImmichAlbums = async (settings, fetchImpl = fetch) => {
   const me = await getImmichJson(settings, "/users/me", fetchImpl);
-  const [owned, shared] = await Promise.all([
-    getImmichJson(settings, "/albums", fetchImpl),
-    getImmichJson(settings, "/albums?shared=true", fetchImpl),
-  ]);
-  const byId = new Map();
-  for (const album of [...owned, ...shared]) {
-    byId.set(album?.id, album);
-  }
-  return mapPermittedAlbums([...byId.values()], String(me?.id ?? ""));
+  // With no filter Immich returns every album the user owns or has been shared into.
+  const albums = await getImmichJson(settings, "/albums", fetchImpl);
+  return mapPermittedAlbums(albums, String(me?.id ?? ""));
 };
 
 /**
