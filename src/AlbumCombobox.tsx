@@ -28,6 +28,7 @@ function AlbumCombobox({
   const id = useId();
   const listboxId = `${id}-listbox`;
   const errorId = `${id}-error`;
+  const inputId = `${id}-input`;
   const [albums, setAlbums] = useState<ImmichAlbum[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -96,9 +97,10 @@ function AlbumCombobox({
 
   return (
     <div className="album-combobox">
-      <label>
-        Target album
+      <label htmlFor={inputId}>Target album</label>
+      <div className="album-combobox-field">
         <input
+          id={inputId}
           type="text"
           role="combobox"
           aria-expanded={showList}
@@ -138,15 +140,51 @@ function AlbumCombobox({
             }
           }}
         />
-      </label>
-      <button
-        type="button"
-        className="album-combobox-refresh"
-        onClick={refresh}
-        disabled={disabled || isLoading}
-      >
-        {isLoading ? "Loading albums…" : "Refresh albums"}
-      </button>
+        <button
+          type="button"
+          className={`album-combobox-refresh${isLoading ? " album-combobox-refresh--loading" : ""}`}
+          onClick={refresh}
+          disabled={disabled || isLoading}
+          aria-label={isLoading ? "Loading albums" : "Refresh albums"}
+          title={isLoading ? "Loading albums…" : "Refresh albums"}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+          </svg>
+        </button>
+        {showList ? (
+          <ul id={listboxId} role="listbox" aria-label="Immich albums">
+            {options.map((option, index) => (
+              <li
+                key={`${option.kind}-${option.albumName}`}
+                id={`${id}-option-${index}`}
+                role="option"
+                aria-selected={index === activeIndex}
+                className={index === activeIndex ? "active" : undefined}
+                // Pointer movement (not mere presence) moves the highlight, so keyboard scrolling is not hijacked.
+                onMouseMove={() => setActiveIndex(index)}
+                // mousedown keeps focus in the input so blur does not close the list before the click lands.
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  choose(option.albumName);
+                }}
+              >
+                {option.kind === "create" ? (
+                  <>Create new album “{option.albumName}”</>
+                ) : (
+                  <>
+                    {option.albumName}
+                    <span className="album-combobox-meta">
+                      {option.assetCount} items
+                      {option.shared ? " · shared" : ""}
+                    </span>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
       <span role="status" className="field-help">
         {hasLoaded && !errorMessage && !isLoading
           ? albums.length
@@ -154,38 +192,6 @@ function AlbumCombobox({
             : "No albums found. Type a name to create one."
           : ""}
       </span>
-      {showList ? (
-        <ul id={listboxId} role="listbox" aria-label="Immich albums">
-          {options.map((option, index) => (
-            <li
-              key={`${option.kind}-${option.albumName}`}
-              id={`${id}-option-${index}`}
-              role="option"
-              aria-selected={index === activeIndex}
-              className={index === activeIndex ? "active" : undefined}
-              // Pointer movement (not mere presence) moves the highlight, so keyboard scrolling is not hijacked.
-              onMouseMove={() => setActiveIndex(index)}
-              // mousedown keeps focus in the input so blur does not close the list before the click lands.
-              onMouseDown={(event) => {
-                event.preventDefault();
-                choose(option.albumName);
-              }}
-            >
-              {option.kind === "create" ? (
-                <>Create new album “{option.albumName}”</>
-              ) : (
-                <>
-                  {option.albumName}
-                  <span className="album-combobox-meta">
-                    {option.assetCount} items
-                    {option.shared ? " · shared" : ""}
-                  </span>
-                </>
-              )}
-            </li>
-          ))}
-        </ul>
-      ) : null}
       {errorMessage ? (
         <p id={errorId} role="alert" className="album-combobox-error">
           {errorMessage} Type the album name instead.
