@@ -41,6 +41,7 @@ import {
   setDoNotUpload,
   setFolderDate,
   resetFolderMetadata,
+  addTagsToPairs,
   setPairsDate,
   setFolderProcessed,
   shutdownCore,
@@ -954,6 +955,20 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     return setPairsDate(
       pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
       body.date,
+    );
+  },
+  "POST /api/add-tags-to-pairs": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs) || !Array.isArray(body.tags)) {
+      throw new HttpError(400, "No images or tags selected.");
+    }
+    // Every path is confined to the user's folders before anything is written.
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return addTagsToPairs(
+      pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      body.tags,
     );
   },
   "POST /api/apply-image-rotations": async (request) =>

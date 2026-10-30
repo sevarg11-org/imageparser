@@ -66,3 +66,11 @@
   gap: 0.75rem;
   border-top: 1px solid var(--border);
 }
+
+.add-tags-dialog {
+  overflow: visible;
+}
+
+.add-tags-dialog .set-folder-date-body {
+  min-height: 12rem;
+}

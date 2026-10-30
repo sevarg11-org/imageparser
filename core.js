@@ -3083,6 +3083,73 @@ const setPairsDate = async (pairs, date) => {
 };
 
 /**
+ * Adds tags to an existing tag list without removing or replacing any, skipping duplicates ignoring case.
+ * @param {string[]} existingTags - The tags already saved.
+ * @param {string[]} addedTags - The tags to add.
+ * @returns {string[]} The existing tags in their original order and spelling, then the new ones.
+ */
+const mergeTags = (existingTags, addedTags) =>
+  normalizeTags([...normalizeTags(existingTags), ...normalizeTags(addedTags)]);
+
+/**
+ * Adds tags to the chosen image groups. Each group's A-file sidecar is read, the tags are merged in (existing
+ * tags are never removed), and the sidecar is rewritten through saveMetadata, so writes stay serialized by the
+ * image file queue and the group's date and description are kept. One group failing does not stop the rest.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to tag.
+ * @param {string[]} tags - The tags to add.
+ * @param {{readMetadata?: typeof readSidecarMetadata, save?: typeof saveMetadata}} [dependencies] - Replaceable
+ *   read and save steps, for tests.
+ * @returns {Promise<{ok: boolean, updatedPairs: number, failedFrontPaths: string[], errors: string[]}>}
+ */
+const addTagsToPairs = async (
+  pairs,
+  tags,
+  { readMetadata = readSidecarMetadata, save = saveMetadata } = {},
+) => {
+  const tagsToAdd = normalizeTags(tags);
+  if (!tagsToAdd.length) {
+    throw new Error("Enter at least one tag.");
+  }
+
+  const errors = [];
+  const failedFrontPaths = [];
+  let updatedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const {
+        date,
+        description,
+        tags: existingTags,
+      } = await readMetadata(pair.frontPath);
+      const result = await save({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description,
+        tags: mergeTags(existingTags, tagsToAdd),
+      });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
+      updatedPairs += 1;
+    } catch (error) {
+      failedFrontPaths.push(pair.frontPath);
+      errors.push(
+        `${path.basename(pair.frontPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, failedFrontPaths, errors };
+};
+
+/**
  * Resets the processing state of every image in a directory by deleting its XMP sidecar files.
  * Only sidecars belonging to the folder's images are deleted (both naming conventions, for the A and B
  * images), never other .xmp files. Images and the folder's own processed marker are left untouched.
@@ -3182,6 +3249,8 @@ export {
   saveMetadata,
   scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
+  addTagsToPairs,
+  mergeTags,
   setFolderDate,
   resetFolderMetadata,
   setPairsDate,
