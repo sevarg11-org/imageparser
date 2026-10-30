@@ -1,4 +1,4 @@
-import { useId, useState, type Ref } from "react";
+import { useEffect, useId, useState, type Ref } from "react";
 import { buildTagOptions } from "./tagSuggestions";
 import "./TagInput.css";
 
@@ -39,6 +39,15 @@ function TagInput({
 
   const options = buildTagOptions(suggestions, text, selectedTags);
   const showList = isOpen && options.length > 0;
+
+  // Keeps the highlighted option visible when arrow keys move past the edge of a scrolling list.
+  useEffect(() => {
+    if (showList && activeIndex >= 0) {
+      document
+        .getElementById(`${generatedId}-option-${activeIndex}`)
+        ?.scrollIntoView({ block: "nearest" });
+    }
+  }, [showList, activeIndex, generatedId]);
 
   const add = (tag: string) => {
     const trimmed = tag.trim();
@@ -122,6 +131,8 @@ function TagInput({
               role="option"
               aria-selected={index === activeIndex}
               className={index === activeIndex ? "active" : undefined}
+              // Pointer movement (not mere presence) moves the highlight, so keyboard scrolling is not hijacked.
+              onMouseMove={() => setActiveIndex(index)}
               // mousedown keeps focus in the input so blur does not close the list before the click lands.
               onMouseDown={(event) => {
                 event.preventDefault();
