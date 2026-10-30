@@ -1071,27 +1071,34 @@ function App() {
       return;
     }
     let isMounted = true;
-    loadImmichTags().then(
-      (tags) => {
-        if (isMounted) {
-          setImmichTags(tags);
-          setImmichTagError("");
-        }
-      },
-      (error) => {
-        if (isMounted) {
-          setImmichTagError(
-            error instanceof Error
-              ? error.message
-              : "Tags could not be loaded.",
-          );
-        }
-      },
-    );
+    // Uses the form's URL and key, which are only saved when an upload starts, so wait for typing to settle.
+    const timer = window.setTimeout(() => {
+      loadImmichTags({
+        serverUrl: immichSettings.serverUrl,
+        userApiKey: immichSettings.userApiKey,
+      }).then(
+        (tags) => {
+          if (isMounted) {
+            setImmichTags(tags);
+            setImmichTagError("");
+          }
+        },
+        (error) => {
+          if (isMounted) {
+            setImmichTagError(
+              error instanceof Error
+                ? error.message
+                : "Tags could not be loaded.",
+            );
+          }
+        },
+      );
+    }, 600);
     return () => {
       isMounted = false;
+      window.clearTimeout(timer);
     };
-  }, []);
+  }, [immichSettings.serverUrl, immichSettings.userApiKey]);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -3813,7 +3820,10 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       updateImmichSetting("albumName", albumName)
                     }
                     disabled={isUploading}
-                    reloadKey={immichSettings.serverUrl}
+                    settings={{
+                      serverUrl: immichSettings.serverUrl,
+                      userApiKey: immichSettings.userApiKey,
+                    }}
                   />
                 ) : (
                   <label>
