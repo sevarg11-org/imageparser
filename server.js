@@ -52,6 +52,7 @@ import {
 } from "./core.js";
 import {
   applyManagedImmichSettings,
+  resolveImmichLookupSettings,
   getManagedImmichFields,
   listManagedFields,
   readManagedImmichConfig,
@@ -913,17 +914,9 @@ const resolveLookupSettings = async (
     await getUserSettingsDirectory(user),
     secretCodec,
   );
-  const typed = (value) => String(value ?? "").trim();
+  // The Authentik claim's key wins; the form's key is only the fallback when the provider gives none.
   return registerImmichSecrets(
-    applyManagedImmichSettings(
-      {
-        ...saved,
-        serverUrl: typed(formSettings?.serverUrl) || saved.serverUrl,
-        userApiKey: typed(formSettings?.userApiKey) || saved.userApiKey,
-      },
-      immichConfig,
-      user,
-    ),
+    resolveImmichLookupSettings(saved, formSettings, immichConfig, user),
   );
 };
 
