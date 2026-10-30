@@ -463,7 +463,10 @@ test("file routes enforce the user's folders", async () => {
   assert.equal(image.status, 403);
   for (const [route, body] of [
     ["api/read-sidecar-metadata", { filePath: hidden }],
-    ["api/preview-url", { filePath: hidden, rotation: 0 }],
+    [
+      "api/apply-image-rotations",
+      { frontPath: hidden, backPath: null, frontRotation: 90 },
+    ],
     ["api/read-directory", { directoryPath: path.join(root, "family-secret") }],
     ["api/save-metadata", { frontPath: hidden, backPath: null }],
     [
@@ -473,6 +476,61 @@ test("file routes enforce the user's folders", async () => {
   ]) {
     assert.equal((await postJson(route, cookie, body)).status, 403, route);
   }
+
+  // Image URLs are built in the browser, so the old URL-building round trip is gone.
+  assert.equal(
+    (await postJson("api/preview-url", cookie, { filePath: hidden })).status,
+    404,
+  );
+});
+
+test("folder processed marks are confined and shared between users", async () => {
+  const aliceCookie = await signIn(alice);
+  for (const forbidden of [
+    path.join(root, "family-secret"),
+    path.join(root, "vacations"),
+    root,
+  ]) {
+    const response = await postJson("api/folder-processed", aliceCookie, {
+      path: forbidden,
+      value: true,
+    });
+    assert.equal(response.status, 403, forbidden);
+  }
+  await assert.rejects(
+    fs.access(path.join(root, "family-secret", ".imageparser.json")),
+  );
+
+  const family2020 = path.join(root, "family", "2020");
+  const marked = await postJson("api/folder-processed", aliceCookie, {
+    path: family2020,
+    value: true,
+  });
+  assert.equal(marked.status, 200);
+  assert.equal(marked.body.state.processed, true);
+  assert.equal(marked.body.state.processedBy, "alice");
+
+  // Another user who can see the folder sees the same mark.
+  const adminCookie = await signIn(admin);
+  const listing = await getJson(
+    `api/browse?${new URLSearchParams({ path: path.join(root, "family") })}`,
+    adminCookie,
+  );
+  const entry = listing.body.directories.find((d) => d.name === "2020");
+  assert.equal(entry.processed, true);
+  assert.equal(entry.processedBy, "alice");
+
+  const opened = await getJson(
+    `api/browse?${new URLSearchParams({ path: family2020 })}`,
+    adminCookie,
+  );
+  assert.equal(opened.body.processed, true);
+
+  const cleared = await postJson("api/folder-processed", adminCookie, {
+    path: family2020,
+    value: false,
+  });
+  assert.equal(cleared.body.state.processed, false);
 });
 
 test("a user with one shared folder starts inside it", async () => {
@@ -597,4 +655,123 @@ test("OIDC_DISABLED without backup credentials opens access and warns", async ()
   assert.equal(me.status, 200);
   assert.equal((await me.json()).authMode, "none");
   assert.match(open.output(), /AUTHENTICATION IS OFF/);
+});
+
+test("Immich settings managed by the environment and Authentik are never exposed or saved", async () => {
+  const adminKeyFile = path.join(workspace, "immich-admin-key");
+  await fs.writeFile(adminKeyFile, "env-admin-key\n");
+  const managed = await startServer((url) => ({
+    OIDC_ISSUER_URL: provider.issuer,
+    OIDC_CLIENT_ID: clientId,
+    OIDC_CLIENT_SECRET: clientSecret,
+    OIDC_REDIRECT_URI: `${url}auth/callback`,
+    OIDC_ALLOW_INSECURE_REQUESTS: "true",
+    IMMICH_URL: "https://managed-immich.example.test/",
+    IMMICH_ADMIN_API_KEY: "ignored-admin-key",
+    IMMICH_ADMIN_API_KEY_FILE: adminKeyFile,
+  }));
+  const previousAppUrl = appUrl;
+  appUrl = managed.url;
+  try {
+    const daveCookie = await signIn({
+      sub: "dave-subject",
+      preferred_username: "dave",
+      imageparser_folders: ["family"],
+      immich_api_key: "dave-claim-key",
+    });
+    const erinCookie = await signIn({
+      sub: "erin-subject",
+      preferred_username: "erin",
+      imageparser_folders: ["family"],
+    });
+    assert.doesNotMatch(daveCookie, /dave-claim-key/);
+
+    const daveSettings = await getJson("api/immich-settings", daveCookie);
+    assert.equal(daveSettings.status, 200, JSON.stringify(daveSettings.body));
+    assert.deepEqual(daveSettings.body.managed, {
+      serverUrl: true,
+      userApiKey: true,
+      adminApiKey: true,
+    });
+    assert.equal(
+      daveSettings.body.serverUrl,
+      "https://managed-immich.example.test",
+    );
+
+    // Managed fields sent by the browser are ignored.
+    const saved = await postJson("api/immich-settings", daveCookie, {
+      serverUrl: "https://attacker.example.test",
+      userApiKey: "browser-key",
+      adminApiKey: "browser-admin-key",
+      albumName: "Family",
+      tags: "",
+      pauseImmichJobs: true,
+      concurrentTasks: 2,
+    });
+    assert.equal(saved.status, 200, JSON.stringify(saved.body));
+    assert.equal(saved.body.serverUrl, "https://managed-immich.example.test");
+    assert.equal(saved.body.albumName, "Family");
+    for (const body of [daveSettings.body, saved.body]) {
+      assert.doesNotMatch(
+        JSON.stringify(body),
+        /dave-claim-key|env-admin-key|browser-key|browser-admin-key/,
+      );
+    }
+
+    // A user without the claim still enters and saves their own key.
+    const erinSettings = await getJson("api/immich-settings", erinCookie);
+    assert.equal(erinSettings.body.managed.userApiKey, false);
+    assert.equal(erinSettings.body.managed.adminApiKey, true);
+    const erinSaved = await postJson("api/immich-settings", erinCookie, {
+      userApiKey: "erin-own-key",
+      albumName: "Erin",
+      tags: "",
+      pauseImmichJobs: true,
+      concurrentTasks: 2,
+    });
+    assert.equal(erinSaved.status, 200, JSON.stringify(erinSaved.body));
+    assert.equal(
+      (await getJson("api/immich-settings", erinCookie)).body.userApiKey,
+      "erin-own-key",
+    );
+
+    const usersDirectory = path.join(configDirectory, "users");
+    for (const user of await fs.readdir(usersDirectory)) {
+      const stored = await fs
+        .readFile(
+          path.join(usersDirectory, user, "immich-settings.json"),
+          "utf8",
+        )
+        .catch(() => "");
+      assert.doesNotMatch(
+        stored,
+        /dave-claim-key|env-admin-key|browser-key|managed-immich|attacker/,
+      );
+    }
+    assert.doesNotMatch(managed.output(), /dave-claim-key|env-admin-key/);
+    // A user without the key is logged with the claim names received, so a mapping problem can be diagnosed.
+    assert.match(
+      managed.output(),
+      /No Immich API key in the "immich_api_key" claim for erin[\s\S]*claim: 'missing'[\s\S]*receivedClaims/,
+    );
+    assert.doesNotMatch(
+      managed.output(),
+      /No Immich API key in the "immich_api_key" claim for dave/,
+    );
+  } finally {
+    appUrl = previousAppUrl;
+  }
+});
+
+test("an invalid IMMICH_URL or unreadable admin key file stops startup", async () => {
+  await assert.rejects(
+    startServer({ IMMICH_URL: "immich.example.test" }),
+    /IMMICH_URL must be an absolute http/,
+  );
+  await assert.rejects(
+    startServer({
+      IMMICH_ADMIN_API_KEY_FILE: path.join(workspace, "missing-admin-key"),
+    }),
+    /IMMICH_ADMIN_API_KEY_FILE .* could not be read/,
+  );
 });

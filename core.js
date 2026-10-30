@@ -4,7 +4,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { exiftool } from "exiftool-vendored";
 import sharp from "sharp";
-import { createSerialQueue } from "./imageFileQueue.js";
+import { createKeyedQueue } from "./imageFileQueue.js";
+import {
+  buildImageVersion,
+  buildPreviewCacheKey,
+  buildThumbnailCacheKey,
+  createPreviewCache,
+} from "./previewCache.js";
 
 /**
  * The set of supported image file extensions.
@@ -87,18 +93,80 @@ const metadataRotationExtensions = new Set([".jpg", ".jpeg", ".tif", ".tiff"]);
 const pixelRotationExtensions = new Set([".png", ".webp"]);
 
 /**
- * A Map tracking revision numbers for modified image files.
- * Used to detect changes between the original and processed images.
- * @type {Map<string, number>}
+ * Serializes operations per image file: reads and writes of the same file stay ordered,
+ * while previews and saves for unrelated files (or other users) run concurrently.
+ * @type {{run: Function, whenIdle: () => Promise<void>, size: () => number}}
  */
-const imageRevisionByPath = new Map();
+const imageFileLock = createKeyedQueue();
 
 /**
- * Creates a serial queue to prevent concurrent image file operations.
- * Ensures metadata writes and preview reads do not conflict.
- * @type {AsyncQueue}
+ * Runs an operation while holding the lock for each of the given image files.
+ * @param {Array<string|null|undefined>} filePaths - The image files the operation reads or writes.
+ * @param {() => Promise<*>} operation - The operation to run.
+ * @returns {Promise<*>} The operation's result.
  */
-const runImageFileOperation = createSerialQueue();
+const runImageFileOperation = (filePaths, operation) =>
+  imageFileLock.run(
+    filePaths.filter(Boolean).map((filePath) => path.resolve(filePath)),
+    operation,
+  );
+
+/**
+ * The longest side, in pixels, of a rendered preview.
+ * Large enough for the 2.5x magnifier on a typical display.
+ * @type {number}
+ */
+const previewMaxDimension = 2560;
+
+/**
+ * The number of previews rendered at the same time, to bound memory use on small servers.
+ * @type {number}
+ */
+const maxConcurrentPreviewRenders = 2;
+
+/**
+ * The number of thumbnails rendered at the same time. Thumbnails have their own slots, so a
+ * filling grid never delays the Review image.
+ * @type {number}
+ */
+const maxConcurrentThumbnailRenders = 2;
+
+/**
+ * The preview cache, or null until configurePreviewCache is called.
+ * @type {ReturnType<typeof createPreviewCache>|null}
+ */
+let previewCache = null;
+
+/**
+ * The default long-edge size, in pixels, of grid thumbnails.
+ * @type {number}
+ */
+const defaultThumbnailSize = 320;
+
+/**
+ * The smallest and largest thumbnail sizes a request may ask for.
+ * @type {number}
+ */
+const minThumbnailSize = 64;
+const maxThumbnailSize = 640;
+
+/**
+ * The memory limit for cached thumbnails (about 2,000 thumbnails at 320 px).
+ * @type {number}
+ */
+const maxThumbnailCacheBytes = 64 * 1024 * 1024;
+
+/**
+ * Rendered thumbnails by cache key, in least- to most-recently-used order.
+ * @type {Map<string, Buffer>}
+ */
+const thumbnailCache = new Map();
+
+/**
+ * The total size of the buffers in the thumbnail cache.
+ * @type {number}
+ */
+let thumbnailCacheBytes = 0;
 
 /**
  * The default Immich settings object with empty or default values.
@@ -196,13 +264,14 @@ const normalizeImmichSettings = (settings) => {
  * Constructs the full upload command with all required and optional flags.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
- * @param {{debug?: boolean}} [options] - Set debug to request verbose immich-go logging.
+ * @param {{debug?: boolean, recursive?: boolean}} [options] - Set debug to request verbose immich-go logging,
+ *   and recursive to upload every nested folder as well.
  * @returns {string[]} An array of command-line arguments for immich-go.
  */
 const buildImmichUploadArguments = (
   settings,
   directoryPath,
-  { debug = false } = {},
+  { debug = false, recursive = false } = {},
 ) => {
   const tags = normalizeImmichTags(settings.tags);
   const uploadArguments = [
@@ -213,7 +282,7 @@ const buildImmichUploadArguments = (
     "--no-ui",
     "--server",
     String(settings.serverUrl),
-    "--recursive=false",
+    `--recursive=${recursive === true}`,
     "--api-key",
     String(settings.userApiKey),
     `--pause-immich-jobs=${settings.pauseImmichJobs}`,
@@ -357,7 +426,7 @@ const getImmichGoDiagnostics = () =>
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
- * @param {{debug?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
+ * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
  * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
@@ -365,7 +434,7 @@ const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
-  { debug = false, log, lockKey = "default" } = {},
+  { debug = false, recursive = false, log, lockKey = "default" } = {},
 ) => {
   if (runningImmichUploads.has(lockKey)) {
     throw new Error("An Immich upload is already running.");
@@ -388,7 +457,7 @@ const runImmichUpload = async (
     const uploadArguments = buildImmichUploadArguments(
       normalizedSettings,
       normalizedDirectoryPath,
-      { debug },
+      { debug, recursive },
     );
     const redact = (text) => redactImmichSecrets(text, normalizedSettings);
 
@@ -817,11 +886,49 @@ const compareFileNames = (left, right) =>
     sensitivity: "base",
   });
 
+/**
+ * Orders folders relative to the scanned folder depth-first, in natural name order, with a folder
+ * before its subfolders. The scanned folder itself ("") comes first.
+ * @param {string} left - The first folder, as forward-slash separated segments.
+ * @param {string} right - The second folder, as forward-slash separated segments.
+ * @returns {number} The sort order.
+ */
+const compareRelativeDirectories = (left, right) => {
+  const leftSegments = left ? left.split("/") : [];
+  const rightSegments = right ? right.split("/") : [];
+  const sharedLength = Math.min(leftSegments.length, rightSegments.length);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const order = leftSegments[index].localeCompare(
+      rightSegments[index],
+      undefined,
+      { numeric: true },
+    );
+    if (order !== 0) {
+      return order;
+    }
+  }
+  return leftSegments.length - rightSegments.length;
+};
+
+/**
+ * Sorts pairs by folder (see compareRelativeDirectories), then by the chosen sort inside each folder.
+ * @param {Array} pairs - The pairs to sort in place.
+ * @param {*} sortBy - The sort field and direction.
+ * @returns {Array} The sorted pairs.
+ */
 const sortPairs = (pairs, sortBy) => {
   const { field, direction } = normalizeSortBy(sortBy);
   const directionFactor = direction === "desc" ? -1 : 1;
 
   return pairs.sort((left, right) => {
+    const folderOrder = compareRelativeDirectories(
+      left.relativeDirectory,
+      right.relativeDirectory,
+    );
+    if (folderOrder !== 0) {
+      return folderOrder;
+    }
+
     if (field === "fileName") {
       return compareFileNames(left, right) * directionFactor;
     }
@@ -844,12 +951,12 @@ const sortPairs = (pairs, sortBy) => {
   });
 };
 
-const readSidecarRawDate = async (filePath) => {
-  const sidecarPath = await resolveExistingSidecarPath(filePath);
-  if (!sidecarPath) {
-    return "";
-  }
-
+/**
+ * Reads the raw date value from a sidecar file.
+ * @param {string} sidecarPath - The path to the XMP sidecar file.
+ * @returns {Promise<string>} The raw date, or an empty string when the sidecar has none.
+ */
+const readRawDateFromSidecar = async (sidecarPath) => {
   try {
     const rawXml = String(await fs.readFile(sidecarPath, "utf8"));
     for (const pattern of sidecarDatePatterns) {
@@ -866,26 +973,43 @@ const readSidecarRawDate = async (filePath) => {
 };
 
 /**
- * Reads and compares date taken timestamps from front/back image pairs.
- * Returns the most valid timestamp found across both files in the pair.
- * @param {string|null} frontPath - The path to the front image file.
- * @param {string|null} backPath - The path to the back image file.
- * @returns {Promise<number|null>} A timestamp if a valid date is found, null otherwise.
+ * Reads an image's sidecar once, reporting whether it exists and its raw date.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<{hasSidecar: boolean, rawDate: string}>} The sidecar summary.
  */
-const readDateTakenTimestamp = async (frontPath, backPath) => {
-  for (const filePath of [frontPath, backPath]) {
-    if (!filePath) {
-      continue;
-    }
+const readSidecarSummary = async (filePath) => {
+  const sidecarPath = await resolveExistingSidecarPath(filePath);
+  return {
+    hasSidecar: sidecarPath !== null,
+    rawDate: sidecarPath ? await readRawDateFromSidecar(sidecarPath) : "",
+  };
+};
 
-    const normalizedDate = normalizeXmpDate(await readSidecarRawDate(filePath));
-    const timestamp = normalizedDate ? Date.parse(normalizedDate) : Number.NaN;
-    if (!Number.isNaN(timestamp)) {
-      return timestamp;
-    }
-  }
+const readSidecarRawDate = async (filePath) =>
+  (await readSidecarSummary(filePath)).rawDate;
 
-  return null;
+/**
+ * Converts a raw sidecar date to a timestamp for sorting by date taken.
+ * @param {string} rawDate - The raw date read from a sidecar file.
+ * @returns {number|null} The timestamp, or null when the date is missing or invalid.
+ */
+const toDateTakenTimestamp = (rawDate) => {
+  const normalizedDate = normalizeXmpDate(rawDate);
+  const timestamp = normalizedDate ? Date.parse(normalizedDate) : Number.NaN;
+  return Number.isNaN(timestamp) ? null : timestamp;
+};
+
+/**
+ * Converts a raw sidecar date to the calendar day shown in the thumbnail grid.
+ * Accepts ISO dates and the EXIF-style "YYYY:MM:DD" form some tools write into XMP.
+ * @param {string} rawDate - The raw date read from a sidecar file.
+ * @returns {string} The date as YYYY-MM-DD, or an empty string when there is no valid date.
+ */
+const toSidecarDay = (rawDate) => {
+  const match = normalizeXmpDate(rawDate).match(
+    /^(\d{4})[-:](\d{2})[-:](\d{2})/,
+  );
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : "";
 };
 
 /**
@@ -893,14 +1017,18 @@ const readDateTakenTimestamp = async (frontPath, backPath) => {
  * The flag is read from the A file name; a B file that disagrees marks the group as mixed.
  * @param {string} frontPath - The path to the front (A) image.
  * @param {string|null} backPath - The path to the back (B) image, if any.
- * @returns {{id: string, imageLabel: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
+ * @param {string} [relativeDirectory=""] - The pair's folder relative to the scanned folder, with forward
+ *   slashes; it scopes the id and prefixes the label so equal names in different folders stay apart.
+ * @returns {{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
  */
-const describePair = (frontPath, backPath) => {
+const describePair = (frontPath, backPath, relativeDirectory = "") => {
   const frontName = path.basename(frontPath);
   const doNotUpload = isExcludedName(frontName);
+  const folderPrefix = relativeDirectory ? `${relativeDirectory}/` : "";
   return {
-    id: `${getGroupKey(frontName)}-${frontName}`,
-    imageLabel: frontName,
+    id: `${folderPrefix}${getGroupKey(frontName)}-${frontName}`,
+    imageLabel: `${folderPrefix}${frontName}`,
+    relativeDirectory,
     frontPath,
     backPath,
     doNotUpload,
@@ -913,21 +1041,30 @@ const describePair = (frontPath, backPath) => {
 /**
  * Groups image files by their base name and creates front/back pairs.
  * Supports date-taken sorting when available, falling back to file creation time.
- * @param {string[]} filePaths - The array of image file paths in the directory.
+ * Files only pair with files in the same folder.
+ * @param {string[]} filePaths - The image file paths.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
- * @returns {Promise<Array<{id: string, imageLabel: string, frontPath: string, backPath: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean}>>}
+ * @param {string} [baseDirectory] - The scanned folder; when given, each pair records its folder relative to it.
+ * @returns {Promise<Array<{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
  */
-const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
+const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
   const grouped = new Map();
 
   for (const filePath of filePaths) {
     const fileName = path.basename(filePath);
-    const key = getGroupKey(fileName);
+    const relativeDirectory = baseDirectory
+      ? path
+          .relative(baseDirectory, path.dirname(filePath))
+          .split(path.sep)
+          .join("/")
+      : "";
+    const key = `${relativeDirectory}/${getGroupKey(fileName)}`;
     const group = grouped.get(key) ?? [];
     group.push({
       filePath,
       fileName,
+      relativeDirectory,
       side: getSideFromFileName(fileName),
     });
     grouped.set(key, group);
@@ -938,23 +1075,44 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy) => {
       const frontCandidate =
         items.find((item) => item.side === "a") ?? items[0];
       const backCandidate = items.find((item) => item.side === "b") ?? null;
-      const frontStats = await fs.stat(frontCandidate.filePath);
+      // The A sidecar is read once: it is the source of truth for the grid date and filters.
+      const [frontStats, backStats, frontSidecar] = await Promise.all([
+        fs.stat(frontCandidate.filePath),
+        backCandidate ? fs.stat(backCandidate.filePath) : null,
+        readSidecarSummary(frontCandidate.filePath),
+      ]);
+      const frontSidecarDateTaken = toDateTakenTimestamp(frontSidecar.rawDate);
+      const backSidecarDateTaken =
+        shouldReadDateTaken && frontSidecarDateTaken === null && backCandidate
+          ? toDateTakenTimestamp(
+              await readSidecarRawDate(backCandidate.filePath),
+            )
+          : null;
+      // Without a sidecar date, the date comes from the A image itself and is shown and sorted on instead.
+      const frontRawDate =
+        toSidecarDay(frontSidecar.rawDate) === ""
+          ? await resolveImageDateWithoutSidecar(frontCandidate.filePath, {
+              stats: frontStats,
+            })
+          : frontSidecar.rawDate;
+      const dateTaken =
+        frontSidecarDateTaken ??
+        backSidecarDateTaken ??
+        toDateTakenTimestamp(frontRawDate);
 
       return {
         ...describePair(
           frontCandidate.filePath,
           backCandidate ? backCandidate.filePath : null,
+          frontCandidate.relativeDirectory,
         ),
+        frontVersion: buildImageVersion(frontStats),
+        backVersion: backStats ? buildImageVersion(backStats) : null,
         createdAt:
           frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
-        dateTaken: shouldReadDateTaken
-          ? await readDateTakenTimestamp(
-              frontCandidate.filePath,
-              backCandidate?.filePath,
-            )
-          : null,
-        hasSidecar:
-          (await resolveExistingSidecarPath(frontCandidate.filePath)) !== null,
+        dateTaken: shouldReadDateTaken ? dateTaken : null,
+        hasSidecar: frontSidecar.hasSidecar,
+        sidecarDate: toSidecarDay(frontRawDate),
       };
     }),
   );
@@ -1034,19 +1192,143 @@ ${blocks}
 };
 
 /**
+ * Builds an ISO date-time from date and time parts, rejecting impossible dates and times.
+ * Years before 1800 or more than a year ahead are rejected, so EXIF's "0000:00:00" and stray digits in file
+ * names are not mistaken for dates.
+ * @param {string[]} parts - Year, month, day, and optionally hour, minute, and second, as digit strings.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss (midnight without a time), or an empty string when invalid.
+ */
+const buildIsoDateTime = ([year, month, day, hour, minute, second]) => {
+  const [y, m, d] = [year, month, day].map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (
+    y < 1800 ||
+    y > new Date().getFullYear() + 1 ||
+    date.getUTCMonth() !== m - 1 ||
+    date.getUTCDate() !== d
+  ) {
+    return "";
+  }
+  const hasValidTime =
+    hour !== undefined &&
+    Number(hour) < 24 &&
+    Number(minute) < 60 &&
+    Number(second) < 60;
+  return `${year}-${month}-${day}T${hasValidTime ? `${hour}:${minute}:${second}` : "00:00:00"}`;
+};
+
+/**
+ * Converts an embedded date ("YYYY:MM:DD HH:mm:ss", as ExifTool prints EXIF and XMP dates) to an ISO date-time.
+ * @param {*} value - The raw tag value.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss, or an empty string when it is not a real date.
+ */
+const toIsoEmbeddedDate = (value) => {
+  const match = String(value ?? "")
+    .trim()
+    .match(/^(\d{4})[-:](\d{2})[-:](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?/);
+  return match ? buildIsoDateTime(match.slice(1)) : "";
+};
+
+/**
+ * File name date formats, tried in order: "2007-07-03", "2007_07_03 17.27.14", "2007.07.03", and the compact
+ * camera and phone forms "20070703" and "IMG_20070703_172714". A date must not touch other digits.
+ * @type {Array<RegExp>}
+ */
+const fileNameDatePatterns = [
+  /(?<!\d)(\d{4})[-_.](\d{2})[-_.](\d{2})(?:[ T_.-](\d{2})[-_.:h]?(\d{2})[-_.:m]?(\d{2}))?(?!\d)/i,
+  /(?<!\d)(\d{4})(\d{2})(\d{2})(?:[ T_-]?(\d{2})(\d{2})(\d{2}))?(?!\d)/,
+];
+
+/**
+ * Parses the date (and time, when present) from an image file name.
+ * @param {string} filePath - The image file's path; only its name is parsed.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss, or an empty string when the name holds no valid date.
+ */
+const parseDateFromFileName = (filePath) => {
+  const fileName = path.basename(filePath, path.extname(filePath));
+  for (const pattern of fileNameDatePatterns) {
+    const match = fileName.match(pattern);
+    const isoDate = match ? buildIsoDateTime(match.slice(1)) : "";
+    if (isoDate) {
+      return isoDate;
+    }
+  }
+  return "";
+};
+
+/**
+ * Formats a file's created time as a local ISO date-time, the way cameras record the date taken.
+ * Falls back to the change and modified times on file systems that do not record a creation time.
+ * @param {import("node:fs").Stats} stats - The file's stats.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss in local time.
+ */
+const toFileCreatedDate = (stats) => {
+  const created = new Date(stats.birthtimeMs || stats.ctimeMs || stats.mtimeMs);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${created.getFullYear()}-${pad(created.getMonth() + 1)}-${pad(created.getDate())}T${pad(created.getHours())}:${pad(created.getMinutes())}:${pad(created.getSeconds())}`;
+};
+
+/**
+ * Reads the date an image was taken from its embedded metadata ("Date taken" in Windows Explorer), without
+ * taking the image file lock. Callers must already hold the lock, or use readEmbeddedDateTaken.
+ * Prefers DateTimeOriginal over CreateDate, and EXIF over embedded XMP, as ExifTool does.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<string>} The date as an ISO date-time, or an empty string when the image has no valid date.
+ */
+const readEmbeddedDateTakenUnlocked = async (filePath) => {
+  try {
+    const tags = await exiftool.readRaw(filePath, {
+      readArgs: ["-fast", "-DateTimeOriginal", "-CreateDate"],
+    });
+    return (
+      [tags?.DateTimeOriginal, tags?.CreateDate]
+        .map(toIsoEmbeddedDate)
+        .find(Boolean) ?? ""
+    );
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * Reads the embedded date taken in the image file queue, so it never reads an image while a save rewrites it.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<string>} The date as an ISO date-time, or an empty string when the image has no valid date.
+ */
+const readEmbeddedDateTaken = (filePath) =>
+  runImageFileOperation([filePath], () =>
+    readEmbeddedDateTakenUnlocked(filePath),
+  );
+
+/**
+ * Finds the date of an image whose sidecar has no date, in this order: the date taken embedded in the image,
+ * a date in the file name, then the file's created date. Always returns a date.
+ * @param {string} filePath - The path to the image file.
+ * @param {{stats?: import("node:fs").Stats, readEmbeddedDate?: (filePath: string) => Promise<string>}} [options] -
+ *   The file's stats when already known, and the embedded date reader (the unlocked one inside a save).
+ * @returns {Promise<string>} The date as YYYY-MM-DDTHH:mm:ss.
+ */
+const resolveImageDateWithoutSidecar = async (
+  filePath,
+  { stats, readEmbeddedDate = readEmbeddedDateTaken } = {},
+) =>
+  (await readEmbeddedDate(filePath)) ||
+  parseDateFromFileName(filePath) ||
+  toFileCreatedDate(stats ?? (await fs.stat(filePath)));
+
+/**
  * Reads image metadata (date, description, tags, rotation) from a sidecar file.
- * Falls back to EXIF tool if date is missing from XMP, returning empty metadata if not found.
+ * When the sidecar is missing or has no date, the date comes from the image itself (embedded date taken, then
+ * the file name, then the file's created date). The A-file sidecar stays the source of truth whenever it has one.
  * @param {string} filePath - The path to the image file whose sidecar metadata is being read.
- * @returns {Promise<Object>} An object with date, description, tags, and rotation (default: 0).
+ * @returns {Promise<Object>} An object with date, description, tags, rotation (default: 0), and whether a sidecar exists.
  */
 const readSidecarMetadata = async (filePath) => {
   const sidecarPath = await resolveExistingSidecarPath(filePath);
   if (!sidecarPath) {
     return {
-      date: "",
-      description: "",
-      tags: [],
-      rotation: 0,
+      ...emptySidecarMetadata(),
+      date: toSidecarDay(await resolveImageDateWithoutSidecar(filePath)),
     };
   }
 
@@ -1064,14 +1346,9 @@ const readSidecarMetadata = async (filePath) => {
       return "";
     };
 
-    let date = getTagValue(...sidecarDatePatterns) || "";
-
-    if (!date) {
-      const tags = await exiftool.read(filePath);
-      const dateTaken =
-        tags["EXIF:DateTimeOriginal"] || tags["EXIF:CreateDate"];
-      date = dateTaken || "";
-    }
+    const date =
+      toSidecarDay(getTagValue(...sidecarDatePatterns)) ||
+      toSidecarDay(await resolveImageDateWithoutSidecar(filePath));
 
     const description = getTagValue(
       /<rdf:li[^>]*xml:lang="x-default"[^>]*>([\s\S]*?)<\/rdf:li>/i,
@@ -1079,18 +1356,15 @@ const readSidecarMetadata = async (filePath) => {
     );
 
     return {
-      date: date ? date.slice(0, 10) : "",
+      date,
       description,
       tags: readTagsFromXmp(rawXml),
       rotation: 0,
+      hasSidecar: true,
     };
   } catch {
-    return {
-      date: "",
-      description: "",
-      tags: [],
-      rotation: 0,
-    };
+    // An unreadable sidecar still exists, so it is rewritten on the next save.
+    return { ...emptySidecarMetadata(), hasSidecar: true };
   }
 };
 
@@ -1101,45 +1375,58 @@ const readSidecarMetadata = async (filePath) => {
  * @param {string} dateValue - The date value to normalize and store.
  * @param {string} description - The description text to store (can be empty).
  * @param {string[]} [tags=[]] - An optional array of tag strings.
+ * @returns {Promise<{sidecarPath: string, written: boolean}>} The sidecar path and whether it changed.
  */
 const writeSidecarFile = async (filePath, dateValue, description, tags) => {
-  const sidecarPath =
-    (await resolveExistingSidecarPath(filePath)) ?? buildSidecarPath(filePath);
+  const existingSidecarPath = await resolveExistingSidecarPath(filePath);
+  const sidecarPath = existingSidecarPath ?? buildSidecarPath(filePath);
   const xml = buildSidecarDocument({
     dateValue,
     description,
     tags,
   });
 
+  if (existingSidecarPath) {
+    const currentXml = await fs
+      .readFile(existingSidecarPath, "utf8")
+      .catch(() => null);
+    if (currentXml === xml) {
+      return { sidecarPath, written: false };
+    }
+  }
+
   await fs.writeFile(sidecarPath, xml, "utf8");
+  return { sidecarPath, written: true };
 };
 
 /**
- * Reads tag suggestions from all .xmp sidecar files in the directory.
- * Collects tags from recently modified sidecars and returns deduplicated list.
- * @param {string} directoryPath - The path to the directory containing images and sidecars.
+ * The most sidecars read for tag suggestions, so a large nested scan does not read every sidecar.
+ * @type {number}
+ */
+const maxRecentTagSidecars = 500;
+
+/**
+ * Reads tag suggestions from .xmp sidecar files, most recently modified first.
+ * Only the newest maxRecentTagSidecars sidecars are read.
+ * @param {string[]} sidecarPaths - The sidecar files found by the directory scan.
  * @returns {Promise<string[]>} An array of unique tag strings found in sidecar files.
  */
-const readRecentTags = async (directoryPath) => {
-  const directoryEntries = await fs.readdir(directoryPath, {
-    withFileTypes: true,
-  });
-  const sidecarPaths = directoryEntries
-    .filter(
-      (entry) =>
-        entry.isFile() && path.extname(entry.name).toLowerCase() === ".xmp",
-    )
-    .map((entry) => path.join(directoryPath, entry.name));
-  const sidecarsByRecency = await Promise.all(
-    sidecarPaths.map(async (sidecarPath) => ({
+const readRecentTags = async (sidecarPaths) => {
+  const sidecarsByRecency = await mapWithConcurrency(
+    sidecarPaths,
+    folderListingConcurrency,
+    async (sidecarPath) => ({
       sidecarPath,
       modifiedAt: (await fs.stat(sidecarPath)).mtimeMs,
-    })),
+    }),
   );
   sidecarsByRecency.sort((left, right) => right.modifiedAt - left.modifiedAt);
 
   const recentTags = [];
-  for (const { sidecarPath } of sidecarsByRecency) {
+  for (const { sidecarPath } of sidecarsByRecency.slice(
+    0,
+    maxRecentTagSidecars,
+  )) {
     try {
       recentTags.push(
         ...readTagsFromXmp(await fs.readFile(sidecarPath, "utf8")),
@@ -1153,59 +1440,134 @@ const readRecentTags = async (directoryPath) => {
 };
 
 /**
- * Writes a normalized date value as embedded EXIF metadata into an image file.
- * Validates the file extension and ensures ExifTool successfully updates the created date field.
- * @param {string} filePath - The path to the image file whose metadata is being updated.
- * @param {string} dateValue - The date value to embed in EXIF fields.
- * @throws {Error} If the file type doesn't support embedded metadata or ExifTool fails to update the field.
+ * Asserts that embedded metadata can be written to an image file.
+ * @param {string} filePath - The path to the image file.
+ * @throws {Error} If the file type doesn't support embedded metadata.
  */
-const writeEmbeddedImageDate = async (filePath, dateValue) => {
+const assertEmbeddedMetadataSupported = (filePath) => {
   const extension = path.extname(filePath).toLowerCase();
   if (!allowedExtensions.has(extension)) {
     throw new Error(
       `Embedded metadata is not supported for ${extension || "this file type"}.`,
     );
   }
+};
 
-  const exifDate = normalizeExifDate(dateValue);
-  const result = await exiftool.write(
-    filePath,
-    {
-      "EXIF:CreateDate": exifDate,
-      "EXIF:DateTimeOriginal": exifDate,
-      SubSecTimeOriginal: 0,
-    },
-    { writeArgs: ["-overwrite_original"] },
-  );
+/**
+ * Reads the embedded tags that saving compares against: the EXIF dates and the orientation.
+ * Reads only these tags, so it does not scan or rewrite the whole image.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<{CreateDate?: string, DateTimeOriginal?: string, SubSecTimeOriginal?: number|string, Orientation?: number}>}
+ */
+const readEmbeddedImageTags = (filePath) =>
+  exiftool.readRaw(filePath, {
+    readArgs: [
+      "-fast",
+      "-n",
+      "-EXIF:CreateDate",
+      "-EXIF:DateTimeOriginal",
+      "-EXIF:SubSecTimeOriginal",
+      "-Orientation",
+    ],
+  });
+
+/**
+ * Checks whether an image already stores the given EXIF date, so writing it again can be skipped.
+ * @param {{CreateDate?: string, DateTimeOriginal?: string, SubSecTimeOriginal?: number|string}} tags - Tags from readEmbeddedImageTags.
+ * @param {string} exifDate - The date in EXIF format ("YYYY:MM:DD HH:mm:ss").
+ * @returns {boolean} True when the stored date matches.
+ */
+const hasEmbeddedImageDate = (tags, exifDate) =>
+  String(tags?.CreateDate ?? "") === exifDate &&
+  String(tags?.DateTimeOriginal ?? "") === exifDate &&
+  tags?.SubSecTimeOriginal !== undefined &&
+  Number(tags.SubSecTimeOriginal) === 0;
+
+/**
+ * Writes embedded EXIF tags with ExifTool, replacing the original file.
+ * @param {string} filePath - The path to the image file.
+ * @param {Object} tags - The tags to write.
+ * @param {string} description - What is being updated, for the error message.
+ * @throws {Error} If ExifTool fails to update the file.
+ */
+const writeEmbeddedTags = async (filePath, tags, description) => {
+  const result = await exiftool.write(filePath, tags, {
+    writeArgs: ["-overwrite_original"],
+  });
 
   if (result.updated !== 1 && result.unchanged !== 1) {
     throw new Error(
-      `ExifTool did not update the created date for ${path.basename(filePath)}.`,
+      `ExifTool did not update the ${description} for ${path.basename(filePath)}.`,
     );
   }
 };
 
 /**
- * Rotates an image by updating its EXIF Orientation metadata.
- * Uses ExifTool to modify the Orientation field without changing image pixels.
- * @param {string} filePath - The path to the image file whose orientation is being updated.
- * @param {number} rotation - The rotation angle in degrees.
- * @throws {Error} If ExifTool fails to update the orientation field.
+ * Builds the EXIF tags that store a date taken.
+ * @param {string} exifDate - The date in EXIF format.
+ * @returns {Object} The tags for ExifTool.
  */
-const rotateImageMetadata = async (filePath, rotation) => {
-  const tags = await exiftool.read(filePath);
-  const orientation = composeExifOrientation(tags.Orientation, rotation);
-  const result = await exiftool.write(
-    filePath,
-    { "Orientation#": orientation },
-    { writeArgs: ["-overwrite_original"] },
-  );
+const buildEmbeddedDateTags = (exifDate) => ({
+  "EXIF:CreateDate": exifDate,
+  "EXIF:DateTimeOriginal": exifDate,
+  SubSecTimeOriginal: 0,
+});
 
-  if (result.updated !== 1 && result.unchanged !== 1) {
+/**
+ * Writes a date and an optional rotation into one image file with as few rewrites as possible.
+ * JPEG and TIFF rotations update the Orientation tag in the same ExifTool write as the date.
+ * PNG and WebP rotations rewrite the pixels, which keeps the embedded date.
+ * Nothing is written when the stored date already matches and no rotation is requested.
+ * @param {string} filePath - The path to the image file.
+ * @param {string} dateValue - The date value to embed.
+ * @param {*} [rotation=0] - The clockwise rotation to apply, in degrees.
+ * @returns {Promise<{dateWritten: boolean, rotated: boolean}>} What was written.
+ * @throws {Error} If the file type is unsupported or a write fails.
+ */
+const writeEmbeddedImageMetadata = async (
+  filePath,
+  dateValue,
+  rotation = 0,
+) => {
+  assertEmbeddedMetadataSupported(filePath);
+  const exifDate = normalizeExifDate(dateValue);
+  const normalizedRotation = normalizeRotationValue(rotation);
+  const extension = path.extname(filePath).toLowerCase();
+  const tags = await readEmbeddedImageTags(filePath);
+  const needsDate = !hasEmbeddedImageDate(tags, exifDate);
+
+  if (normalizedRotation && metadataRotationExtensions.has(extension)) {
+    await writeEmbeddedTags(
+      filePath,
+      {
+        ...(needsDate ? buildEmbeddedDateTags(exifDate) : {}),
+        "Orientation#": composeExifOrientation(
+          tags.Orientation,
+          normalizedRotation,
+        ),
+      },
+      needsDate ? "created date and orientation" : "orientation",
+    );
+    return { dateWritten: needsDate, rotated: true };
+  }
+
+  if (normalizedRotation && !pixelRotationExtensions.has(extension)) {
     throw new Error(
-      `ExifTool did not update the orientation for ${path.basename(filePath)}.`,
+      `Rotation is not supported for ${extension || "this file type"}.`,
     );
   }
+
+  if (normalizedRotation) {
+    await rotateImagePixels(filePath, normalizedRotation);
+  }
+  if (needsDate) {
+    await writeEmbeddedTags(
+      filePath,
+      buildEmbeddedDateTags(exifDate),
+      "created date",
+    );
+  }
+  return { dateWritten: needsDate, rotated: Boolean(normalizedRotation) };
 };
 
 /**
@@ -1242,7 +1604,6 @@ const rotateImagePixels = async (filePath, rotation) => {
 /**
  * Applies a rotation to an image file using the appropriate method for its format.
  * Updates EXIF Orientation for JPEG/TIFF or rotates pixels for PNG/WebP.
- * Tracks the revision number for changed files and increments it after successful rotation.
  * @param {string} filePath - The path to the image file being rotated.
  * @param {*} rotation - The requested rotation angle in degrees.
  * @returns {Promise<boolean>} True if rotation was applied, false if no rotation is needed.
@@ -1260,7 +1621,17 @@ const applyImageRotation = async (filePath, rotation) => {
   }
 
   if (metadataRotationExtensions.has(extension)) {
-    await rotateImageMetadata(filePath, normalizedRotation);
+    const tags = await readEmbeddedImageTags(filePath);
+    await writeEmbeddedTags(
+      filePath,
+      {
+        "Orientation#": composeExifOrientation(
+          tags.Orientation,
+          normalizedRotation,
+        ),
+      },
+      "orientation",
+    );
   } else if (pixelRotationExtensions.has(extension)) {
     await rotateImagePixels(filePath, normalizedRotation);
   } else {
@@ -1269,10 +1640,6 @@ const applyImageRotation = async (filePath, rotation) => {
     );
   }
 
-  imageRevisionByPath.set(
-    filePath,
-    (imageRevisionByPath.get(filePath) ?? 0) + 1,
-  );
   return true;
 };
 
@@ -1303,7 +1670,12 @@ const applyImageRotations = async (request) => {
     rotations.map(async ({ field, filePath, rotation }) => {
       try {
         await applyImageRotation(filePath, rotation);
-        return { field, filePath, ok: true };
+        return {
+          field,
+          filePath,
+          ok: true,
+          version: buildImageVersion(await fs.stat(filePath)),
+        };
       } catch (error) {
         return {
           field,
@@ -1328,13 +1700,14 @@ const applyImageRotations = async (request) => {
 /**
  * Returns an empty metadata object with default placeholder values.
  * Used when no metadata exists or as a fallback return value.
- * @returns {{date: string, description: string, tags: string[], rotation: number}} An object with empty date/description and empty tags array.
+ * @returns {{date: string, description: string, tags: string[], rotation: number, hasSidecar: boolean}} An object with empty date/description and empty tags array.
  */
 const emptySidecarMetadata = () => ({
   date: "",
   description: "",
   tags: [],
   rotation: 0,
+  hasSidecar: false,
 });
 
 /**
@@ -1380,16 +1753,29 @@ const loadImmichSettings = async (settingsDirectory, secretCodec) => {
  * @param {string} settingsDirectory - The path to the user's application data directory.
  * @param {{encrypt: (value: string) => string, decrypt: (value: string) => string}} secretCodec - An object with encrypt and decrypt functions for secure storage.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The normalized settings to save (may contain unencrypted keys).
+ * @param {{managedFields?: Array<"serverUrl"|"userApiKey"|"adminApiKey">}} [options] - Fields provided by the server
+ *   (environment or sign-in session). They are validated with the rest but always stored empty, so a managed key is
+ *   never written to disk, not even encrypted.
+ * @returns {Promise<Object>} The normalized settings, including any managed values.
  */
-const saveImmichSettings = async (settingsDirectory, secretCodec, settings) => {
+const saveImmichSettings = async (
+  settingsDirectory,
+  secretCodec,
+  settings,
+  { managedFields = [] } = {},
+) => {
   const normalizedSettings = normalizeImmichSettings(settings);
+  const unmanagedSettings = { ...normalizedSettings };
+  for (const field of managedFields) {
+    unmanagedSettings[field] = "";
+  }
   const storedSettings = {
-    ...normalizedSettings,
-    userApiKey: normalizedSettings.userApiKey
-      ? secretCodec.encrypt(normalizedSettings.userApiKey)
+    ...unmanagedSettings,
+    userApiKey: unmanagedSettings.userApiKey
+      ? secretCodec.encrypt(unmanagedSettings.userApiKey)
       : "",
-    adminApiKey: normalizedSettings.adminApiKey
-      ? secretCodec.encrypt(normalizedSettings.adminApiKey)
+    adminApiKey: unmanagedSettings.adminApiKey
+      ? secretCodec.encrypt(unmanagedSettings.adminApiKey)
       : "",
   };
 
@@ -1416,11 +1802,251 @@ const compareFolderNames = (left, right) =>
   left.name.localeCompare(right.name, undefined, { numeric: true });
 
 /**
- * Lists the visible subfolders of a directory and counts its supported images.
+ * The hidden marker file that holds folder-level state, such as whether a reviewer finished the folder.
+ * The leading dot keeps it out of the folder browser and the image scan; immich-go skips non-media files.
+ * @type {string}
+ */
+const folderStateFileName = ".imageparser.json";
+
+/**
+ * The marker file format version written by this build.
+ * @type {number}
+ */
+const folderStateVersion = 1;
+
+const maxProcessedByLength = 128;
+
+/**
+ * The state of a folder without a marker file, or with one that cannot be read.
+ * @type {Readonly<{processed: false, processedAt: null, processedBy: null}>}
+ */
+const unprocessedFolderState = Object.freeze({
+  processed: false,
+  processedAt: null,
+  processedBy: null,
+});
+
+/**
+ * Reads the raw contents of a folder's marker file.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<Object>} The parsed marker, or an empty object when it is missing, unreadable, or not a JSON object.
+ */
+const readFolderMarker = async (directoryPath) => {
+  try {
+    const marker = JSON.parse(
+      await fs.readFile(path.join(directoryPath, folderStateFileName), "utf8"),
+    );
+    return marker && typeof marker === "object" && !Array.isArray(marker)
+      ? marker
+      : {};
+  } catch {
+    return {};
+  }
+};
+
+/**
+ * Reads whether a folder is marked processed, and who marked it when.
+ * A missing, unreadable, or corrupt marker file means the folder is not processed.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<{processed: boolean, processedAt: string|null, processedBy: string|null}>} The folder state.
+ */
+const readFolderState = async (directoryPath) => {
+  const marker = await readFolderMarker(directoryPath);
+  if (marker.processed !== true) {
+    return unprocessedFolderState;
+  }
+  return {
+    processed: true,
+    processedAt:
+      typeof marker.processedAt === "string" ? marker.processedAt : null,
+    processedBy:
+      typeof marker.processedBy === "string" ? marker.processedBy : null,
+  };
+};
+
+/**
+ * How many subfolders a listing reads at once, so large folders do not open hundreds of files together.
+ * @type {number}
+ */
+const folderListingConcurrency = 16;
+
+/**
+ * Maps items through an async function, running at most `limit` calls at a time.
+ * @template T, R
+ * @param {T[]} items - The items to map.
+ * @param {number} limit - The maximum number of calls in flight.
+ * @param {(item: T) => Promise<R>} mapper - The async mapping function.
+ * @returns {Promise<R[]>} The results, in the same order as the items.
+ */
+const mapWithConcurrency = async (items, limit, mapper) => {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index]);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+};
+
+/**
+ * Reads when a folder was created on disk, for sorting the folder browser.
+ * Filesystems that do not report a creation time (birthtime 0, as on some NFS and SMB mounts) fall
+ * back to the modification time, and say so through `createdAtSource`.
+ * @param {string} directoryPath - The folder to read.
+ * @returns {Promise<{createdAt: number|null, createdAtSource: "created"|"modified"|null}>}
+ *   The time in milliseconds and where it came from, or nulls when the folder cannot be read.
+ */
+const readFolderCreatedAt = async (directoryPath) => {
+  try {
+    const stats = await fs.stat(directoryPath);
+    return stats.birthtimeMs > 0
+      ? { createdAt: Math.floor(stats.birthtimeMs), createdAtSource: "created" }
+      : { createdAt: Math.floor(stats.mtimeMs), createdAtSource: "modified" };
+  } catch {
+    return { createdAt: null, createdAtSource: null };
+  }
+};
+
+/**
+ * Reads one folder browser entry: the folder's processed state and its filesystem date.
+ * @param {string} name - The name to show.
+ * @param {string} directoryPath - The folder's path.
+ * @returns {Promise<{name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null, createdAt: number|null, createdAtSource: "created"|"modified"|null}>}
+ *   The entry.
+ */
+const readFolderEntry = async (name, directoryPath) => {
+  const [state, created] = await Promise.all([
+    readFolderState(directoryPath),
+    readFolderCreatedAt(directoryPath),
+  ]);
+  return { name, path: directoryPath, ...state, ...created };
+};
+
+/**
+ * Normalizes the name recorded as the person who marked a folder processed.
+ * @param {*} actor - The signed-in or local user name.
+ * @returns {string|null} The trimmed name, or null when there is none.
+ */
+const normalizeProcessedBy = (actor) =>
+  typeof actor === "string" && actor.trim()
+    ? actor.trim().slice(0, maxProcessedByLength)
+    : null;
+
+/**
+ * Writes the processed flag into one folder's marker file, keeping any other fields it holds.
+ * Unmarking keeps the file and sets `processed` to false. The file is replaced atomically, so a
+ * concurrent listing never reads a partial file. Serialized with other operations on the marker.
+ * @param {string} directoryPath - The folder to mark.
+ * @param {boolean} value - Whether the folder is processed.
+ * @param {string|null} processedBy - Who marked the folder.
+ * @returns {Promise<{processed: boolean, processedAt: string|null, processedBy: string|null}>} The new folder state.
+ */
+const writeFolderProcessed = (directoryPath, value, processedBy) => {
+  const markerPath = path.join(directoryPath, folderStateFileName);
+  return runImageFileOperation([markerPath], async () => {
+    const marker = {
+      ...(await readFolderMarker(directoryPath)),
+      version: folderStateVersion,
+      processed: value,
+      processedAt: value ? new Date().toISOString() : null,
+      processedBy: value ? processedBy : null,
+    };
+    const temporaryPath = path.join(
+      directoryPath,
+      `${folderStateFileName}.${process.pid}.${Date.now()}.tmp`,
+    );
+    try {
+      await fs.writeFile(
+        temporaryPath,
+        `${JSON.stringify(marker, null, 2)}\n`,
+        "utf8",
+      );
+      await fs.rename(temporaryPath, markerPath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { force: true });
+      throw error;
+    }
+    return readFolderState(directoryPath);
+  });
+};
+
+/**
+ * Lists a folder and every visible folder below it. Hidden folders and symbolic links are skipped,
+ * so the walk never leaves the starting folder.
+ * @param {string} directoryPath - The folder to start from.
+ * @returns {Promise<string[]>} The folder followed by its descendants.
+ */
+const listFolderTree = async (directoryPath) => {
+  const folders = [directoryPath];
+  for (let index = 0; index < folders.length; index += 1) {
+    const entries = await fs.readdir(folders[index], { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        folders.push(path.join(folders[index], entry.name));
+      }
+    }
+  }
+  return folders;
+};
+
+/**
+ * Marks a folder, and optionally every visible subfolder, as processed or not processed.
+ * Callers are responsible for confining the path; the web server resolves it for the user first.
+ * @param {string} directoryPath - The folder to mark.
+ * @param {boolean} value - Whether the folder is processed.
+ * @param {{actor?: string|null, includeSubfolders?: boolean}} [options] - Who is marking the folder,
+ *   and whether to mark its subfolders too.
+ * @returns {Promise<{ok: boolean, state: {processed: boolean, processedAt: string|null, processedBy: string|null}, updatedFolders: number, errors: string[]}>}
+ *   The selected folder's new state, the number of folders written, and any per-subfolder failures.
+ * @throws {Error} If the value is not a boolean, the path is not a directory, or the selected folder cannot be written.
+ */
+const setFolderProcessed = async (
+  directoryPath,
+  value,
+  { actor = null, includeSubfolders = false } = {},
+) => {
+  if (typeof value !== "boolean") {
+    throw new Error("The processed value must be true or false.");
+  }
+  const stats = await fs.stat(directoryPath);
+  if (!stats.isDirectory()) {
+    throw new Error("The requested path is not a directory.");
+  }
+
+  const processedBy = normalizeProcessedBy(actor);
+  const state = await writeFolderProcessed(directoryPath, value, processedBy);
+  const errors = [];
+  let updatedFolders = 1;
+  if (includeSubfolders === true) {
+    const [, ...subfolders] = await listFolderTree(directoryPath);
+    for (const subfolder of subfolders) {
+      try {
+        await writeFolderProcessed(subfolder, value, processedBy);
+        updatedFolders += 1;
+      } catch (error) {
+        errors.push(
+          `${path.relative(directoryPath, subfolder)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, state, updatedFolders, errors };
+};
+
+/**
+ * Lists the visible subfolders of a directory, with their processed state and filesystem date, and counts
+ * its supported images. Reads one small marker file and runs one stat per subfolder, a limited number at a time.
  * Callers are responsible for confining the path; the web server resolves it for the user first.
  * @param {string} directoryPath - The directory to list.
- * @returns {Promise<{directories: {name: string, path: string}[], imageCount: number}>} The sorted
- *   subfolders, skipping hidden ones, and the number of supported images directly inside the directory.
+ * @returns {Promise<{directories: {name: string, path: string, processed: boolean, processedAt: string|null, processedBy: string|null, createdAt: number|null, createdAtSource: "created"|"modified"|null}[], imageCount: number, processed: boolean, processedAt: string|null, processedBy: string|null}>}
+ *   The sorted subfolders, skipping hidden ones, the number of supported images directly inside the
+ *   directory, and the directory's own processed state.
  * @throws {Error} If the path does not exist or is not a directory.
  */
 const listDirectory = async (directoryPath) => {
@@ -1430,26 +2056,33 @@ const listDirectory = async (directoryPath) => {
   }
 
   const entries = await fs.readdir(directoryPath, { withFileTypes: true });
-  const directories = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => ({
-      name: entry.name,
-      path: path.join(directoryPath, entry.name),
-    }))
-    .sort(compareFolderNames);
+  const directories = await mapWithConcurrency(
+    entries.filter(
+      (entry) => entry.isDirectory() && !entry.name.startsWith("."),
+    ),
+    folderListingConcurrency,
+    (entry) =>
+      readFolderEntry(entry.name, path.join(directoryPath, entry.name)),
+  );
+  directories.sort(compareFolderNames);
   const imageCount = entries.filter(
     (entry) =>
       entry.isFile() &&
       allowedExtensions.has(path.extname(entry.name).toLowerCase()),
   ).length;
 
-  return { directories, imageCount };
+  return {
+    directories,
+    imageCount,
+    ...(await readFolderState(directoryPath)),
+  };
 };
 
 /**
  * Lists the drive roots that are currently readable, such as C:\ and mapped network drives.
  * Only meaningful on Windows; other platforms have a single filesystem root.
- * @returns {Promise<{name: string, path: string}[]>} The available drives in letter order.
+ * @returns {Promise<{name: string, path: string, processed: false, processedAt: null, processedBy: null, createdAt: null, createdAtSource: null}[]>}
+ *   The available drives in letter order. Drive roots are never marked processed and have no date.
  */
 const listDrives = async () => {
   const letters = Array.from({ length: 26 }, (_, index) =>
@@ -1460,7 +2093,13 @@ const listDrives = async () => {
       const drivePath = `${letter}:\\`;
       try {
         await fs.access(drivePath);
-        return { name: `${letter}:`, path: drivePath };
+        return {
+          name: `${letter}:`,
+          path: drivePath,
+          ...unprocessedFolderState,
+          createdAt: null,
+          createdAtSource: null,
+        };
       } catch {
         return null;
       }
@@ -1470,87 +2109,319 @@ const listDrives = async () => {
 };
 
 /**
- * Reads all image files from a directory and groups them into pairs.
+ * How many folder levels below the selected folder a nested scan may enter.
+ * @type {number}
+ */
+const maxNestedScanDepth = 10;
+
+/**
+ * How many supported image files a nested scan may find before it stops.
+ * @type {number}
+ */
+const maxNestedScanFiles = 1000;
+
+/**
+ * How many folders a nested scan reads at once; kept small so network shares are not flooded.
+ * @type {number}
+ */
+const nestedScanConcurrency = 4;
+
+/**
+ * Splits one folder's entries into supported images, sidecars, and visible subfolders.
+ * Symbolic links are followed with stat, so linked folders count as folders.
+ * @param {string} directoryPath - The folder that was read.
+ * @param {import("node:fs").Dirent[]} entries - The folder's entries.
+ * @returns {Promise<{imageFiles: string[], sidecarFiles: string[], subfolders: string[]}>} The sorted entries.
+ */
+const classifyDirectoryEntries = async (directoryPath, entries) => {
+  const imageFiles = [];
+  const sidecarFiles = [];
+  const subfolders = [];
+  for (const entry of entries) {
+    const entryPath = path.join(directoryPath, entry.name);
+    let isDirectory = entry.isDirectory();
+    if (entry.isSymbolicLink()) {
+      isDirectory = await fs
+        .stat(entryPath)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+    }
+    if (isDirectory) {
+      if (!entry.name.startsWith(".")) {
+        subfolders.push(entryPath);
+      }
+      continue;
+    }
+    const extension = path.extname(entry.name).toLowerCase();
+    if (allowedExtensions.has(extension)) {
+      imageFiles.push(entryPath);
+    } else if (extension === ".xmp" && entry.isFile()) {
+      sidecarFiles.push(entryPath);
+    }
+  }
+  return { imageFiles, sidecarFiles, subfolders };
+};
+
+/**
+ * Finds the supported images in a folder and, when recursive, in every visible folder below it.
+ * Hidden folders are skipped. Each folder is visited once by its real path, so symbolic-link loops end,
+ * and a folder whose real path the isAllowedPath callback rejects is skipped. Going over the depth or
+ * file limit throws instead of returning a partial result.
+ * @param {string} directoryPath - The folder to scan.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, maxDepth?: number, maxFiles?: number}} [options]
+ *   Whether to scan nested folders, a confinement check for the real path of each nested folder, and the limits.
+ * @returns {Promise<{imageFiles: string[], sidecarFiles: string[], folderCount: number, hasSubfolders: boolean}>}
+ *   The image and sidecar files, the number of folders scanned, and whether the folder has visible subfolders.
+ * @throws {Error} If a folder cannot be read or the scan goes over a limit.
+ */
+const scanImageFiles = async (
+  directoryPath,
+  {
+    recursive = false,
+    isAllowedPath = () => true,
+    maxDepth = maxNestedScanDepth,
+    maxFiles = maxNestedScanFiles,
+  } = {},
+) => {
+  const rootListing = await classifyDirectoryEntries(
+    directoryPath,
+    await fs.readdir(directoryPath, { withFileTypes: true }),
+  );
+  const imageFiles = [...rootListing.imageFiles];
+  const sidecarFiles = [...rootListing.sidecarFiles];
+  const hasSubfolders = rootListing.subfolders.length > 0;
+  if (!recursive) {
+    return { imageFiles, sidecarFiles, folderCount: 1, hasSubfolders };
+  }
+
+  const tooManyFiles = () =>
+    new Error(
+      `The folder and its nested folders contain more than ${maxFiles} images. Choose a smaller folder.`,
+    );
+  if (imageFiles.length > maxFiles) {
+    throw tooManyFiles();
+  }
+
+  const visitedRealPaths = new Set([await fs.realpath(directoryPath)]);
+  let folderCount = 1;
+  let currentLevel = rootListing.subfolders;
+  for (let depth = 1; currentLevel.length; depth += 1) {
+    const candidates = await mapWithConcurrency(
+      currentLevel,
+      nestedScanConcurrency,
+      async (folderPath) => {
+        const realPath = await fs.realpath(folderPath).catch(() => null);
+        return realPath && isAllowedPath(realPath)
+          ? { folderPath, realPath }
+          : null;
+      },
+    );
+    const folders = [];
+    for (const candidate of candidates) {
+      if (candidate && !visitedRealPaths.has(candidate.realPath)) {
+        visitedRealPaths.add(candidate.realPath);
+        folders.push(candidate.folderPath);
+      }
+    }
+    if (folders.length && depth > maxDepth) {
+      throw new Error(
+        `The folder has nested folders more than ${maxDepth} levels deep. Choose a folder closer to the images.`,
+      );
+    }
+
+    const listings = await mapWithConcurrency(
+      folders,
+      nestedScanConcurrency,
+      async (folderPath) => {
+        try {
+          return await classifyDirectoryEntries(
+            folderPath,
+            await fs.readdir(folderPath, { withFileTypes: true }),
+          );
+        } catch (error) {
+          throw new Error(
+            `Unable to read ${path.relative(directoryPath, folderPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+          );
+        }
+      },
+    );
+    folderCount += folders.length;
+    currentLevel = [];
+    for (const listing of listings) {
+      imageFiles.push(...listing.imageFiles);
+      sidecarFiles.push(...listing.sidecarFiles);
+      currentLevel.push(...listing.subfolders);
+    }
+    if (imageFiles.length > maxFiles) {
+      throw tooManyFiles();
+    }
+  }
+
+  return { imageFiles, sidecarFiles, folderCount, hasSubfolders };
+};
+
+/**
+ * Reads all image files from a directory, and optionally its nested folders, and groups them into pairs.
  * Returns file listings with pairing information, creation dates, and date-taken if sorting by date.
  * Also collects tag suggestions from existing sidecar metadata files.
  * @param {string} directoryPath - The path to the directory containing image files.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction for ordering results (default: createdAt-asc).
- * @returns {Promise<{directoryPath: string, files: Array, recentTags: string[]}>} An object with directory path, array of paired images, and tag suggestions.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
+ *   nested folders, and a check the web server supplies to confine nested folders by their real path.
+ * @returns {Promise<{directoryPath: string, recursive: boolean, folderCount: number, files: Array, recentTags: string[], folderState: {processed: boolean, processedAt: string|null, processedBy: string|null}, hasSubfolders: boolean}>}
+ *   An object with directory path, whether nested folders were included and how many folders were scanned,
+ *   array of paired images, tag suggestions, the folder's processed state, and whether it has visible subfolders.
+ * @throws {Error} If a folder cannot be read or a nested scan goes over its limits.
  */
-const readDirectory = async (directoryPath, sortBy = defaultSortBy) => {
+const readDirectory = async (
+  directoryPath,
+  sortBy = defaultSortBy,
+  { recursive = false, isAllowedPath } = {},
+) => {
+  const isRecursive = recursive === true;
   if (!directoryPath) {
-    return { directoryPath, files: [], recentTags: [] };
+    return {
+      directoryPath,
+      recursive: isRecursive,
+      folderCount: 0,
+      files: [],
+      recentTags: [],
+      folderState: unprocessedFolderState,
+      hasSubfolders: false,
+    };
   }
 
-  const directoryEntries = await fs.readdir(directoryPath, {
-    withFileTypes: true,
-  });
-  const imageFiles = directoryEntries
-    .filter((entry) => !entry.isDirectory())
-    .map((entry) => path.join(directoryPath, entry.name))
-    .filter((filePath) =>
-      allowedExtensions.has(path.extname(filePath).toLowerCase()),
-    );
+  const { imageFiles, sidecarFiles, folderCount, hasSubfolders } =
+    await scanImageFiles(directoryPath, {
+      recursive: isRecursive,
+      isAllowedPath,
+    });
 
   return {
     directoryPath,
-    files: await pairFiles(imageFiles, sortBy),
-    recentTags: await readRecentTags(directoryPath),
+    recursive: isRecursive,
+    folderCount,
+    files: await pairFiles(imageFiles, sortBy, directoryPath),
+    recentTags: await readRecentTags(sidecarFiles),
+    folderState: await readFolderState(directoryPath),
+    hasSubfolders,
   };
 };
 
 /**
- * Updates image metadata with provided date, description, and tags.
- * Writes sidecar files for the front image (and back if provided) and embeds the date in EXIF.
- * Runs through the serial queue to prevent concurrent file operations.
- * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[]}} metadata - The metadata update request containing paths and values.
- * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string}>} Success result with count of updated files and path to the sidecar file created.
+ * Keeps an image's time of day when the form sends only a calendar day, because the editor edits only the day.
+ * The time comes from the A image's current date: its sidecar, or else the image itself (embedded date taken,
+ * file name, created date). Must run while the caller holds the A image's lock.
+ * @param {string} frontPath - The path to the A image.
+ * @param {string} dateValue - The normalized date to save ("YYYY-MM-DD HH:mm:ss").
+ * @param {*} requestedDate - The date as sent; only a plain "YYYY-MM-DD" day takes the current time.
+ * @returns {Promise<string>} The date to save, with the current time of day when it applies.
  */
+const withCurrentTimeOfDay = async (frontPath, dateValue, requestedDate) => {
+  const day = String(requestedDate ?? "").trim();
+  // An impossible day is left as is, so saving still rejects it.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !buildIsoDateTime(day.split("-"))) {
+    return dateValue;
+  }
+  const currentDate =
+    normalizeXmpDate(await readSidecarRawDate(frontPath)) ||
+    (await resolveImageDateWithoutSidecar(frontPath, {
+      readEmbeddedDate: readEmbeddedDateTakenUnlocked,
+    }));
+  const time = currentDate.match(/T(\d{2}:\d{2}:\d{2})/)?.[1];
+  // Built directly: parsing it with Date would shift the photo's local time by the UTC offset.
+  return time ? `${day} ${time}` : dateValue;
+};
+
 /**
- * Updates image metadata with provided date, description, and tags.
- * Writes sidecar files for the front image (and back if provided) and embeds the date in EXIF.
- * Runs through the serial queue to prevent concurrent file operations.
- * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[]}} metadata - The metadata update request containing paths and values.
- * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string}>} Success result with count of updated files and path to the sidecar file created.
+ * Updates image metadata with provided date, description, and tags, and applies any requested rotations.
+ * Writes the A-file sidecar and embeds the date in each image, combining a rotation with the date in one
+ * ExifTool write per file. Writes whose stored values already match are skipped.
+ * Holds the lock for both images so reads and writes of the same files stay ordered.
+ * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[], frontRotation?: number, backRotation?: number}} metadata - The metadata update request containing paths, values, and rotations.
+ * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string, sidecarWritten: boolean, results: Array<{field: "front"|"back", filePath: string, ok: boolean, dateWritten: boolean, rotated: boolean, version?: string, error?: string}>}>} The per-image results; ok is false when any image could not be updated.
+ * @throws {Error} If no image is selected, the date is invalid, or the sidecar cannot be written.
  */
 const saveMetadata = (metadata) =>
-  runImageFileOperation(async () => {
+  runImageFileOperation([metadata?.frontPath, metadata?.backPath], async () => {
     if (!metadata?.frontPath) {
       throw new Error("No image selected for metadata update.");
     }
 
-    const dateValue = normalizeDateValue(metadata.date);
+    const dateValue = await withCurrentTimeOfDay(
+      metadata.frontPath,
+      normalizeDateValue(metadata.date),
+      metadata.date,
+    );
+    normalizeExifDate(dateValue);
 
-    await writeSidecarFile(
+    const { sidecarPath, written } = await writeSidecarFile(
       metadata.frontPath,
       dateValue,
       metadata.description,
       metadata.tags,
     );
 
-    const imagePaths = [metadata.frontPath, metadata.backPath].filter(Boolean);
-    await Promise.all(
-      imagePaths.map((filePath) => writeEmbeddedImageDate(filePath, dateValue)),
+    const images = [
+      {
+        field: "front",
+        filePath: metadata.frontPath,
+        rotation: metadata.frontRotation,
+      },
+      {
+        field: "back",
+        filePath: metadata.backPath,
+        rotation: metadata.backRotation,
+      },
+    ].filter(({ filePath }) => filePath);
+
+    const results = await Promise.all(
+      images.map(async ({ field, filePath, rotation }) => {
+        try {
+          const { dateWritten, rotated } = await writeEmbeddedImageMetadata(
+            filePath,
+            dateValue,
+            rotation,
+          );
+          return {
+            field,
+            filePath,
+            ok: true,
+            dateWritten,
+            rotated,
+            version: buildImageVersion(await fs.stat(filePath)),
+          };
+        } catch (error) {
+          return {
+            field,
+            filePath,
+            ok: false,
+            dateWritten: false,
+            rotated: false,
+            error:
+              error instanceof Error
+                ? error.message
+                : "Unable to update the image metadata.",
+          };
+        }
+      }),
     );
 
     return {
-      ok: true,
-      updatedFiles: imagePaths.length,
-      sidecarFile:
-        (await resolveExistingSidecarPath(metadata.frontPath)) ??
-        buildSidecarPath(metadata.frontPath),
+      ok: results.every((result) => result.ok),
+      updatedFiles: results.filter(
+        (result) => result.ok && (result.dateWritten || result.rotated),
+      ).length,
+      sidecarFile: sidecarPath,
+      sidecarWritten: written,
+      results,
     };
   });
 
 /**
  * Reads metadata from an image's sidecar file or returns empty defaults if not found.
  * @param {string} [filePath] - The path to the image file (optional).
- * @returns {Promise<Object>} An object containing date, description, tags array, and rotation value.
- */
-/**
- * Reads metadata from an image's sidecar file or returns empty defaults if not found.
- * @param {string} [filePath] - The path to the image file (optional).
- * @returns {Promise<Object>} An object containing date, description, tags array, and rotation value.
+ * @returns {Promise<Object>} An object containing date, description, tags array, rotation value, and whether a sidecar exists.
  */
 const readSidecarMetadataForFile = async (filePath) => {
   if (!filePath) {
@@ -1561,27 +2432,20 @@ const readSidecarMetadataForFile = async (filePath) => {
 };
 
 /**
- * Retrieves the current revision number for an image file from the revision map.
- * The revision count tracks how many times an image has been modified or rotated.
+ * Returns the current version string of an image file.
+ * The version changes whenever the file is rewritten, so it can be used to refresh cached previews.
  * @param {string} filePath - The path to the image file.
- * @returns {number} The revision number (0 if no prior modifications have been recorded).
+ * @returns {Promise<string>} The version string.
  */
-/**
- * Retrieves the current revision number for an image file from the revision map.
- * The revision count tracks how many times an image has been modified or rotated.
- * @param {string} filePath - The path to the image file.
- * @returns {number} The revision number (0 if no prior modifications have been recorded).
- */
-const getImageRevision = (filePath) => imageRevisionByPath.get(filePath) ?? 0;
+const getImageVersion = async (filePath) =>
+  buildImageVersion(await fs.stat(filePath));
 
-// Browsers cannot display TIFF and un-rotated previews can be served as-is.
 /**
- * Checks whether an image needs to be rendered as a PNG preview in the browser.
- * TIFF images always need rendering since browsers cannot display them natively.
- * Images with non-zero rotation also need rendering for proper orientation.
+ * Checks whether the desktop app needs a rendered preview because the browser cannot show the file.
+ * TIFF images always need rendering; so do images with a non-zero rotation.
  * @param {string} filePath - The path to the image file.
  * @param {number} [rotation=0] - The current rotation angle in degrees.
- * @returns {boolean} True if the image needs a rendered PNG preview, false otherwise.
+ * @returns {boolean} True if the image needs a rendered preview, false otherwise.
  */
 const needsRenderedPreview = (filePath, rotation = 0) => {
   const extension = path.extname(filePath).toLowerCase();
@@ -1592,29 +2456,331 @@ const needsRenderedPreview = (filePath, rotation = 0) => {
 };
 
 /**
- * Renders an image file as a PNG buffer with optional rotation applied.
- * First applies EXIF auto-orientation, then rotates if needed, and converts to PNG format.
+ * Renders an image file as a WebP preview whose longest side is at most previewMaxDimension pixels.
+ * First applies EXIF auto-orientation, then rotates if needed.
  * @param {string} filePath - The path to the source image file.
  * @param {number} [rotation=0] - The rotation angle in degrees to apply after auto-orientation.
- * @returns {Promise<Buffer>} A Promise resolving to a PNG image buffer.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
  */
-const renderPreviewPng = async (filePath, rotation = 0) => {
+const renderPreview = (filePath, rotation = 0) => {
   const normalizedRotation = normalizeRotationValue(rotation);
   let image = sharp(filePath).autoOrient();
   if (normalizedRotation) {
     image = image.rotate(normalizedRotation);
   }
-  return image.webp({ preset: "photo", quality: 50 }).toBuffer();
+  return image
+    .resize({
+      width: previewMaxDimension,
+      height: previewMaxDimension,
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .webp({ preset: "photo", quality: 80 })
+    .toBuffer();
 };
 
 /**
- * Queues an image rotation request to run through the serial file operation queue.
- * Ensures rotations are processed sequentially to avoid concurrent file conflicts.
+ * Creates a limiter that runs at most the given number of renders at the same time.
+ * @param {number} maxConcurrent - The number of renders that may run at once.
+ * @returns {(operation: () => Promise<Buffer>) => Promise<Buffer>} Runs a render once a slot is free.
+ */
+const createRenderLimiter = (maxConcurrent) => {
+  let active = 0;
+  const waiting = [];
+
+  return async (operation) => {
+    if (active >= maxConcurrent) {
+      // The finishing render hands its slot straight to the next waiting render.
+      await new Promise((resolve) => waiting.push(resolve));
+    } else {
+      active += 1;
+    }
+
+    try {
+      return await operation();
+    } finally {
+      const next = waiting.shift();
+      if (next) {
+        next();
+      } else {
+        active -= 1;
+      }
+    }
+  };
+};
+
+/**
+ * Runs a preview render once one of the limited preview render slots is free.
+ */
+const withPreviewRenderSlot = createRenderLimiter(maxConcurrentPreviewRenders);
+
+/**
+ * Runs a thumbnail render once one of the limited thumbnail render slots is free.
+ */
+const withThumbnailRenderSlot = createRenderLimiter(
+  maxConcurrentThumbnailRenders,
+);
+
+/**
+ * Returns a resized WebP preview of an image, from the preview cache when possible.
+ * Holds only this file's lock, so previews never wait behind writes to other files.
+ * @param {string} filePath - The path to the source image file.
+ * @param {number} [rotation=0] - The rotation angle in degrees to apply after auto-orientation.
+ * @returns {Promise<{buffer: Buffer, version: string, contentType: string}>} The preview and the source file's version.
+ */
+const getImagePreview = (filePath, rotation = 0) =>
+  runImageFileOperation([filePath], async () => {
+    const normalizedRotation = normalizeRotationValue(rotation);
+    const stats = await fs.stat(filePath);
+    const version = buildImageVersion(stats);
+    const cache = previewCache;
+    const cacheKey = cache
+      ? buildPreviewCacheKey(filePath, stats, normalizedRotation)
+      : null;
+
+    const cachedBuffer = cacheKey ? await cache.get(cacheKey) : null;
+    if (cachedBuffer) {
+      return { buffer: cachedBuffer, version, contentType: "image/webp" };
+    }
+
+    const buffer = await withPreviewRenderSlot(() =>
+      renderPreview(filePath, normalizedRotation),
+    );
+    if (cacheKey) {
+      // Storing the preview does not touch the source file, so it does not need to hold the lock.
+      void cache.put(cacheKey, buffer);
+    }
+    return { buffer, version, contentType: "image/webp" };
+  });
+
+/**
+ * Enables the on-disk preview cache.
+ * @param {{directory: string, maxBytes?: number}} options - The cache directory (outside the photo root) and its size cap.
+ * @returns {ReturnType<typeof createPreviewCache>} The configured cache.
+ */
+const configurePreviewCache = (options) => {
+  previewCache = createPreviewCache(options);
+  // Trim the cache left by earlier runs without delaying startup.
+  void previewCache.prune().catch(() => {});
+  return previewCache;
+};
+
+/**
+ * Renders a small WebP thumbnail that fits within a square of the given size.
+ * Applies EXIF auto-orientation first, so saved rotations show in the thumbnail.
+ * @param {string} filePath - The path to the source image file.
+ * @param {{size?: number, rotation?: number}} [options] - The long-edge size in pixels and an extra rotation.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ */
+const renderThumbnail = async (
+  filePath,
+  { size = defaultThumbnailSize, rotation = 0 } = {},
+) => {
+  const normalizedRotation = normalizeRotationValue(rotation);
+  let image = sharp(filePath).autoOrient();
+  if (normalizedRotation) {
+    image = image.rotate(normalizedRotation);
+  }
+  return image
+    .resize(size, size, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 60 })
+    .toBuffer();
+};
+
+/**
+ * Renders a thumbnail from a cached preview, which is already oriented and rotated.
+ * Decoding the small preview is much cheaper than decoding a large original.
+ * @param {Buffer} preview - The cached WebP preview.
+ * @param {number} size - The long-edge size in pixels.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ */
+const renderThumbnailFromPreview = (preview, size) =>
+  sharp(preview)
+    .resize(size, size, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 60 })
+    .toBuffer();
+
+/**
+ * Clamps a requested thumbnail size to the supported range.
+ * @param {*} value - The requested long-edge size in pixels.
+ * @returns {number} A whole number of pixels, or the default size when the value is invalid.
+ */
+const normalizeThumbnailSize = (value) => {
+  const size = Math.round(Number(value));
+  if (!Number.isFinite(size) || size <= 0) {
+    return defaultThumbnailSize;
+  }
+  return Math.min(Math.max(size, minThumbnailSize), maxThumbnailSize);
+};
+
+/**
+ * Builds the cache key for a thumbnail. Any rewrite of the file (rotation, metadata write)
+ * changes its version, and a rename changes its path, so stale thumbnails are never served.
+ * @param {string} filePath - The path to the source image file.
+ * @param {import("node:fs").Stats} stats - The file's current stats.
+ * @param {number} size - The thumbnail size in pixels.
+ * @param {number} rotation - The normalized extra rotation.
+ * @returns {string} The cache key.
+ */
+const getThumbnailCacheKey = (filePath, stats, size, rotation) =>
+  [path.resolve(filePath), buildImageVersion(stats), rotation, size].join("|");
+
+/**
+ * Returns a cached thumbnail and marks it as recently used.
+ * @param {string} key - The thumbnail cache key.
+ * @returns {Buffer|null} The cached thumbnail, or null when it is not cached.
+ */
+const readCachedThumbnail = (key) => {
+  const buffer = thumbnailCache.get(key);
+  if (!buffer) {
+    return null;
+  }
+  thumbnailCache.delete(key);
+  thumbnailCache.set(key, buffer);
+  return buffer;
+};
+
+/**
+ * Stores a thumbnail, evicting the least recently used ones beyond the cache size limit.
+ * @param {string} key - The thumbnail cache key.
+ * @param {Buffer} buffer - The rendered thumbnail.
+ */
+const cacheThumbnail = (key, buffer) => {
+  if (buffer.length > maxThumbnailCacheBytes) {
+    return;
+  }
+  const previous = thumbnailCache.get(key);
+  if (previous) {
+    thumbnailCacheBytes -= previous.length;
+    thumbnailCache.delete(key);
+  }
+  thumbnailCache.set(key, buffer);
+  thumbnailCacheBytes += buffer.length;
+
+  for (const [oldestKey, oldestBuffer] of thumbnailCache) {
+    if (thumbnailCacheBytes <= maxThumbnailCacheBytes) {
+      break;
+    }
+    thumbnailCache.delete(oldestKey);
+    thumbnailCacheBytes -= oldestBuffer.length;
+  }
+};
+
+/**
+ * Clears the in-memory thumbnail cache, as an app or container restart would.
+ * The on-disk preview cache keeps its thumbnails.
+ */
+const clearThumbnailMemoryCache = () => {
+  thumbnailCache.clear();
+  thumbnailCacheBytes = 0;
+};
+
+/**
+ * Returns a thumbnail from the memory cache or the on-disk preview cache.
+ * @param {string} filePath - The path to the source image file.
+ * @param {import("node:fs").Stats} stats - The file's current stats.
+ * @param {number} size - The thumbnail size in pixels.
+ * @param {number} rotation - The normalized extra rotation.
+ * @returns {Promise<Buffer|null>} The cached thumbnail, or null when it is not cached.
+ */
+const readStoredThumbnail = async (filePath, stats, size, rotation) => {
+  const memoryKey = getThumbnailCacheKey(filePath, stats, size, rotation);
+  const cached = readCachedThumbnail(memoryKey);
+  if (cached) {
+    return cached;
+  }
+  const cache = previewCache;
+  const stored = cache
+    ? await cache.get(buildThumbnailCacheKey(filePath, stats, rotation, size))
+    : null;
+  if (stored) {
+    cacheThumbnail(memoryKey, stored);
+  }
+  return stored;
+};
+
+/**
+ * Returns a thumbnail from the memory or on-disk cache without taking a render slot, or
+ * renders it while holding the file's lock and one of the thumbnail render slots. A thumbnail
+ * is built from the file's cached preview when one exists, and from the original otherwise.
+ * A request whose signal is aborted before rendering starts is dropped, so thumbnails for a
+ * grid the user has left do not delay previews or metadata writes.
+ * @param {string} filePath - The path to the source image file.
+ * @param {{size?: number, rotation?: number, signal?: AbortSignal}} [options] - The thumbnail size, extra rotation, and cancellation signal.
+ * @returns {Promise<Buffer>} A Promise resolving to a WebP image buffer.
+ * @throws {DOMException} An AbortError when the signal is aborted before rendering starts.
+ */
+const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
+  const thumbnailSize = normalizeThumbnailSize(size);
+  const normalizedRotation = normalizeRotationValue(rotation);
+  const cached = await readStoredThumbnail(
+    filePath,
+    await fs.stat(filePath),
+    thumbnailSize,
+    normalizedRotation,
+  );
+  if (cached) {
+    return cached;
+  }
+
+  signal?.throwIfAborted();
+  return runImageFileOperation([filePath], async () => {
+    signal?.throwIfAborted();
+    // A write queued ahead of this request may have changed the file.
+    const stats = await fs.stat(filePath);
+    const current = await readStoredThumbnail(
+      filePath,
+      stats,
+      thumbnailSize,
+      normalizedRotation,
+    );
+    if (current) {
+      return current;
+    }
+    const cache = previewCache;
+    const preview = cache
+      ? await cache.get(
+          buildPreviewCacheKey(filePath, stats, normalizedRotation),
+        )
+      : null;
+    const buffer = await withThumbnailRenderSlot(() => {
+      signal?.throwIfAborted();
+      return preview
+        ? renderThumbnailFromPreview(preview, thumbnailSize)
+        : renderThumbnail(filePath, {
+            size: thumbnailSize,
+            rotation: normalizedRotation,
+          });
+    });
+    cacheThumbnail(
+      getThumbnailCacheKey(filePath, stats, thumbnailSize, normalizedRotation),
+      buffer,
+    );
+    if (cache) {
+      // Storing the thumbnail does not touch the source file, so it does not need to hold the lock.
+      void cache.put(
+        buildThumbnailCacheKey(
+          filePath,
+          stats,
+          normalizedRotation,
+          thumbnailSize,
+        ),
+        buffer,
+      );
+    }
+    return buffer;
+  });
+};
+
+/**
+ * Queues an image rotation request while holding the lock for both images.
  * @param {{frontPath: string|null, frontRotation: number|null, backPath: string|null, backRotation: number|null}} request - The rotation request with file paths and angles.
  * @returns {Promise<{ok: boolean, updatedFiles: number, results: Array}>>} The result of applying rotations to both images (if present).
  */
 const applyImageRotationsQueued = (request) =>
-  runImageFileOperation(() => applyImageRotations(request));
+  runImageFileOperation([request?.frontPath, request?.backPath], () =>
+    applyImageRotations(request),
+  );
 
 /**
  * Checks whether a path exists without following symlinks.
@@ -1684,15 +2850,20 @@ const planDoNotUploadRenames = async (imagePaths, value) => {
  * Flags an image group "Do not upload" by renaming its images and sidecars to carry the
  * exclude marker, or clears the flag by removing it. Nothing is renamed when a target name
  * already exists, and renames already done are undone if a later one fails.
- * @param {{frontPath: string, backPath: string|null, value: boolean}} request - The group and the flag value.
+ * @param {{frontPath: string, backPath: string|null, value: boolean, relativeDirectory?: string}} request - The group,
+ *   the flag value, and the group's folder relative to the loaded folder, used only for the returned id and label.
  * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
- * @returns {Promise<{ok: boolean, id: string, imageLabel: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
+ * @returns {Promise<{ok: boolean, id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
  * @throws {Error} If the request is invalid, a target exists, or a rename fails.
  */
 const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
   const frontPath = String(request?.frontPath ?? "");
   const backPath = request?.backPath ? String(request.backPath) : null;
   const value = request?.value;
+  const relativeDirectory =
+    typeof request?.relativeDirectory === "string"
+      ? request.relativeDirectory
+      : "";
   if (!frontPath) {
     throw new Error("No image selected to flag.");
   }
@@ -1770,17 +2941,16 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
     }
   }
 
-  // Cached previews and revisions are keyed by path, so carry them to the new names.
-  for (const { from, to } of renamed) {
-    imageRevisionByPath.set(to, (imageRevisionByPath.get(from) ?? 0) + 1);
-    imageRevisionByPath.delete(from);
-  }
-
+  // Preview URLs carry the path and the file version, so report the renamed files' versions.
   const renamedPath = (filePath) =>
     renamed.find(({ from }) => from === filePath)?.to ?? filePath;
+  const nextFrontPath = renamedPath(frontPath);
+  const nextBackPath = backPath && renamedPath(backPath);
   return {
     ok: true,
-    ...describePair(renamedPath(frontPath), backPath && renamedPath(backPath)),
+    ...describePair(nextFrontPath, nextBackPath, relativeDirectory),
+    frontVersion: await getImageVersion(nextFrontPath),
+    backVersion: nextBackPath ? await getImageVersion(nextBackPath) : null,
     renamed,
   };
 };
@@ -1792,19 +2962,31 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
  * @returns {ReturnType<typeof setDoNotUpload>} The renamed group.
  */
 const setDoNotUploadQueued = (request, options) =>
-  runImageFileOperation(() => setDoNotUpload(request, options));
+  runImageFileOperation([request?.frontPath, request?.backPath], () =>
+    setDoNotUpload(request, options),
+  );
 
 /**
  * Sets the date on every image pair in a directory that does not already have
  * an XMP sidecar file. Pairs with an existing sidecar are skipped so their
  * previously saved metadata is preserved, and pairs flagged "Do not upload"
  * are skipped as well.
+ * With recursive set, every nested folder is covered, within the same limits as the nested scan.
  * @param {string} directoryPath - The path to the directory.
  * @param {string} date - The ISO date string to apply (e.g. "1991-12-31").
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
+ *   nested folders, and the confinement check for them (see readDirectory).
  * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, excludedPairs: number, errors: string[]}>}
  */
-const setFolderDate = async (directoryPath, date) => {
-  const { files: pairs } = await readDirectory(directoryPath);
+const setFolderDate = async (
+  directoryPath,
+  date,
+  { recursive = false, isAllowedPath } = {},
+) => {
+  const { files: pairs } = await readDirectory(directoryPath, defaultSortBy, {
+    recursive,
+    isAllowedPath,
+  });
 
   const errors = [];
   let updatedPairs = 0;
@@ -1824,13 +3006,21 @@ const setFolderDate = async (directoryPath, date) => {
         continue;
       }
 
-      await saveMetadata({
+      const result = await saveMetadata({
         frontPath: pair.frontPath,
         backPath: pair.backPath,
         date,
         description: "",
         tags: [],
       });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
       updatedPairs += 1;
     } catch (error) {
       errors.push(
@@ -1849,6 +3039,12 @@ const setFolderDate = async (directoryPath, date) => {
 };
 
 /**
+ * Resolves once every queued image file operation (saves, rotations, previews) has finished.
+ * @returns {Promise<void>}
+ */
+const whenImageFileOperationsIdle = () => imageFileLock.whenIdle();
+
+/**
  * Gracefully shuts down ExifTool to release file handles and system resources.
  * Should be called when the application is closing to ensure clean shutdown.
  */
@@ -1858,27 +3054,38 @@ export {
   allowedExtensions,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
+  clearThumbnailMemoryCache,
+  configurePreviewCache,
   defaultSortBy,
+  defaultThumbnailSize,
+  folderStateFileName,
   getGroupKey,
-  getImageRevision,
+  getImagePreview,
+  getImageVersion,
   getImmichFailureHints,
   getImmichGoDiagnostics,
+  getThumbnail,
   listDirectory,
   listDrives,
   loadImmichSettings,
   needsRenderedPreview,
   normalizeRotationValue,
   normalizeSortBy,
+  normalizeThumbnailSize,
   readDirectory,
+  readFolderEntry,
+  readFolderState,
   readSidecarMetadataForFile as readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
+  renderThumbnail,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
+  scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
   toExcludedName,
   toIncludedName,
+  whenImageFileOperationsIdle,
 };

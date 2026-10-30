@@ -1,7 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './DirectoryBrowser.css'
+import {
+  describeFolderDate,
+  FOLDER_SORT_STORAGE_KEY,
+  folderSortFieldLabels,
+  parseFolderSort,
+  sortFolders,
+  type FolderDate,
+  type FolderSort,
+  type FolderSortField,
+} from './folderSort'
+import { describeFolderState, type FolderState } from './folderState'
 
-export type DirectoryListing = {
+export type DirectoryEntry = FolderState & FolderDate & { name: string; path: string }
+
+// The listed folder's own processed state is always false for a virtual root.
+export type DirectoryListing = FolderState & {
   path: string
   // The web share root that paths are shown relative to; null in the desktop app, which shows full paths.
   rootPath: string | null
@@ -10,14 +24,45 @@ export type DirectoryListing = {
   parent: string | null
   // False for the virtual root, which is not a real folder and cannot be opened.
   selectable?: boolean
-  directories: { name: string; path: string }[]
+  directories: DirectoryEntry[]
   imageCount: number
+}
+
+// The chosen folder, and whether its nested folders are loaded with it.
+export type DirectorySelection = {
+  path: string
+  recursive: boolean
 }
 
 type DirectoryBrowserProps = {
   initialPath: string | null
   loadListing: (directoryPath: string | null) => Promise<DirectoryListing>
-  onClose: (selectedPath: string | null) => void
+  onClose: (selection: DirectorySelection | null) => void
+}
+
+// Text and color both mark a processed folder; the visible check mark is hidden from screen readers.
+const ProcessedMark = ({ state }: { state: FolderState }) =>
+  state.processed ? (
+    <span className="directory-browser-processed" title={describeFolderState(state)}>
+      <span aria-hidden="true">✓</span>
+      <span className="visually-hidden">processed</span>
+    </span>
+  ) : null
+
+const readFolderSort = () => {
+  try {
+    return parseFolderSort(window.localStorage.getItem(FOLDER_SORT_STORAGE_KEY))
+  } catch {
+    return parseFolderSort(null)
+  }
+}
+
+const rememberFolderSort = (sort: FolderSort) => {
+  try {
+    window.localStorage.setItem(FOLDER_SORT_STORAGE_KEY, JSON.stringify(sort))
+  } catch {
+    // Remembering the sort is a convenience; sorting still works without storage.
+  }
 }
 
 const isSelectable = (listing: DirectoryListing) => listing.selectable !== false
@@ -45,6 +90,20 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
   const [listing, setListing] = useState<DirectoryListing | null>(null)
   const [error, setError] = useState('')
   const [isLoading, setIsLoading] = useState(true)
+  const [sort, setSort] = useState(readFolderSort)
+  // Unchecked each time the browser opens, so nested scans are always a deliberate choice.
+  const [includeNested, setIncludeNested] = useState(false)
+
+  const updateSort = (nextSort: FolderSort) => {
+    setSort(nextSort)
+    rememberFolderSort(nextSort)
+  }
+
+  const sortedDirectories = useMemo(
+    () => (listing ? sortFolders(listing.directories, sort) : []),
+    [listing, sort],
+  )
+  const isAscending = sort.direction === 'ascending'
 
   const navigate = useCallback(async (directoryPath: string | null) => {
     setIsLoading(true)
@@ -94,7 +153,35 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
         <h2 id="directory-browser-title">Select image folder</h2>
         <p className="directory-browser-path" aria-live="polite">
           {listing ? toDisplayPath(listing) : 'Loading...'}
+          {listing?.processed ? (
+            <span className="directory-browser-processed-badge" title={describeFolderState(listing)}>
+              <span aria-hidden="true">✓</span> Processed
+            </span>
+          ) : null}
         </p>
+        <div className="directory-browser-sort">
+          <label htmlFor="directory-browser-sort-field">Sort by</label>
+          <select
+            id="directory-browser-sort-field"
+            value={sort.field}
+            onChange={(event) => updateSort({ ...sort, field: event.target.value as FolderSortField })}
+          >
+            {Object.entries(folderSortFieldLabels).map(([field, label]) => (
+              <option key={field} value={field}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="secondary-button directory-browser-sort-direction"
+            aria-label={`Sort direction: ${isAscending ? 'Ascending' : 'Descending'}`}
+            title={`Sorted ${sort.direction}; switch to ${isAscending ? 'descending' : 'ascending'}`}
+            onClick={() => updateSort({ ...sort, direction: isAscending ? 'descending' : 'ascending' })}
+          >
+            <span aria-hidden="true">{isAscending ? '↑' : '↓'}</span> {isAscending ? 'Ascending' : 'Descending'}
+          </button>
+        </div>
       </header>
 
       <div className="directory-browser-body" aria-busy={isLoading}>
@@ -107,13 +194,17 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
               </button>
             </li>
           ) : null}
-          {listing?.directories.map((directory) => (
-            <li key={directory.path}>
-              <button type="button" disabled={isLoading} onClick={() => void navigate(directory.path)}>
-                <span aria-hidden="true">📁</span> {directory.name}
-              </button>
-            </li>
-          ))}
+          {sortedDirectories.map((directory) => {
+            const folderDate = sort.field === 'created' ? describeFolderDate(directory) : null
+            return (
+              <li key={directory.path}>
+                <button type="button" disabled={isLoading} onClick={() => void navigate(directory.path)}>
+                  <span aria-hidden="true">📁</span> {directory.name} <ProcessedMark state={directory} />
+                  {folderDate ? <span className="directory-browser-sort-value">{folderDate}</span> : null}
+                </button>
+              </li>
+            )
+          })}
           {listing && !listing.directories.length ? (
             <li className="directory-browser-empty">
               {isSelectable(listing)
@@ -133,6 +224,14 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             : ''}
         </span>
         <div className="directory-browser-actions">
+          <label className="directory-browser-nested">
+            <input
+              type="checkbox"
+              checked={includeNested}
+              onChange={(event) => setIncludeNested(event.target.checked)}
+            />
+            Include nested folders
+          </label>
           <button type="button" className="secondary-button" onClick={() => onClose(null)}>
             Cancel
           </button>
@@ -140,7 +239,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
             type="button"
             className="primary-button"
             disabled={!listing || isLoading || !isSelectable(listing)}
-            onClick={() => listing && onClose(listing.path)}
+            onClick={() => listing && onClose({ path: listing.path, recursive: includeNested })}
           >
             Open this folder
           </button>

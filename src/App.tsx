@@ -8,6 +8,7 @@
   type FocusEvent as ReactFocusEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type SyntheticEvent,
 } from "react";
 import "./App.css";
 import { chooseDirectory } from "./chooseDirectory";
@@ -19,26 +20,60 @@ import {
 } from "./dateEntry";
 import type { DirectoryListing } from "./DirectoryBrowser";
 import {
+  describeFolderState,
+  unprocessedFolderState,
+  type FolderState,
+  type SetFolderProcessedResult,
+} from "./folderState";
+import {
+  describeSaveFailure,
+  describeUnsavedImages,
+  getRemainingRotations,
+  getRotatedImageBox,
+  getUpdatedImageVersions,
+  mapRotatedPointToImage,
+  needsSaveOnLeave,
+  rotatePoint,
+  type ImageSaveResult,
+  type PairRotationState,
+  type RotationField,
+} from "./pairPersistence";
+import {
   countImageFilterMatches,
   filterImagePairs,
   getEmptyFilterMessage,
   imageFilterOptions,
   isImageFilter,
+  isPairProcessed,
   type ImageFilter,
 } from "./imageFilters";
 import { SetFolderDateModal } from "./SetFolderDateModal";
-import { fetchCurrentUser, type CurrentUser } from "./webApi";
+import { ThumbnailGrid } from "./ThumbnailGrid";
+import {
+  GRID_THUMBNAIL_SIZE,
+  type ThumbnailGridCell,
+} from "./thumbnailGridModel";
+import { fetchCurrentUser, isWebApp, type CurrentUser } from "./webApi";
 
 type ImagePair = {
   id: string;
+  /** The A-file name, prefixed with its folder relative to the loaded folder in nested mode. */
   imageLabel: string;
+  /** The pair's folder relative to the loaded folder, with forward slashes; "" for the loaded folder itself. */
+  relativeDirectory: string;
   frontPath: string;
   backPath: string | null;
+  frontVersion: string;
+  backVersion: string | null;
   createdAt: number;
   doNotUpload: boolean;
   excludeMismatch: boolean;
   hasSidecar: boolean;
+  /** The A-file XMP date as YYYY-MM-DD when the folder was read, or an empty string. */
+  sidecarDate: string;
 };
+
+type ViewMode = "grid" | "review";
 
 type SetDoNotUploadResult = Pick<
   ImagePair,
@@ -46,11 +81,27 @@ type SetDoNotUploadResult = Pick<
   | "imageLabel"
   | "frontPath"
   | "backPath"
+  | "frontVersion"
+  | "backVersion"
   | "doNotUpload"
   | "excludeMismatch"
 > & {
   ok: boolean;
   renamed: Array<{ from: string; to: string }>;
+};
+
+type SidecarValues = {
+  date: string;
+  description: string;
+  tags: string[];
+  rotation: number;
+  hasSidecar: boolean;
+};
+
+type UnsavedPairEdits = {
+  imageLabel: string;
+  formValues: MetadataForm;
+  rotations: PairRotationState;
 };
 
 type SortField = "createdAt" | "dateTaken" | "fileName";
@@ -63,11 +114,11 @@ type MetadataForm = {
   tags: string[];
 };
 
-type RotationField = "front" | "back";
-
-type PairRotationState = {
-  front: number;
-  back: number;
+/** Immich settings the web server provides (environment or sign-in), which the user cannot edit. */
+type ImmichManagedFields = {
+  serverUrl: boolean;
+  userApiKey: boolean;
+  adminApiKey: boolean;
 };
 
 type ImmichSettings = {
@@ -78,6 +129,8 @@ type ImmichSettings = {
   tags: string;
   pauseImmichJobs: boolean;
   concurrentTasks: number;
+  /** Set by the web server only; managed keys are never sent to the browser. */
+  managed?: ImmichManagedFields;
 };
 
 type SetFolderDateResult = {
@@ -103,7 +156,16 @@ type ImageRotationResult = {
   field: RotationField;
   filePath: string;
   ok: boolean;
+  version?: string;
   error?: string;
+};
+
+type SaveMetadataResult = {
+  ok: boolean;
+  updatedFiles: number;
+  sidecarFile: string;
+  sidecarWritten: boolean;
+  results: ImageSaveResult[];
 };
 
 type ApplyImageRotationsResult = {
@@ -121,17 +183,19 @@ declare global {
       readDirectory: (
         directoryPath: string,
         sortBy: SortOption,
+        recursive: boolean,
       ) => Promise<{
         directoryPath: string;
+        /** Whether nested folders were included. */
+        recursive: boolean;
+        /** The number of folders scanned, including the loaded folder. */
+        folderCount: number;
         files: ImagePair[];
         recentTags: string[];
+        folderState: FolderState;
+        hasSubfolders: boolean;
       }>;
-      readSidecarMetadata: (filePath: string) => Promise<{
-        date: string;
-        description: string;
-        tags: string[];
-        rotation: number;
-      }>;
+      readSidecarMetadata: (filePath: string) => Promise<SidecarValues>;
       saveMetadata: (metadata: {
         frontPath: string;
         backPath: string | null;
@@ -140,11 +204,13 @@ declare global {
         tags: string[];
         frontRotation: number;
         backRotation: number;
-      }) => Promise<{ ok: boolean; updatedFiles: number; sidecarFile: string }>;
-      getPreviewDataUrl: (
+      }) => Promise<SaveMetadataResult>;
+      getPreviewDataUrl: (filePath: string, version: string) => Promise<string>;
+      getThumbnailUrl: (
         filePath: string,
-        rotation: number,
-      ) => Promise<string>;
+        size: number,
+        version: string,
+      ) => string;
       applyImageRotations: (request: {
         frontPath: string;
         backPath: string | null;
@@ -154,17 +220,25 @@ declare global {
       setFolderDate: (
         directoryPath: string,
         date: string,
+        recursive: boolean,
       ) => Promise<SetFolderDateResult>;
       setDoNotUpload: (request: {
         frontPath: string;
         backPath: string | null;
         value: boolean;
+        relativeDirectory: string;
       }) => Promise<SetDoNotUploadResult>;
+      setFolderProcessed: (
+        directoryPath: string,
+        value: boolean,
+        includeSubfolders: boolean,
+      ) => Promise<SetFolderProcessedResult>;
       loadImmichSettings: () => Promise<ImmichSettings>;
       saveImmichSettings: (settings: ImmichSettings) => Promise<ImmichSettings>;
       uploadToImmich: (
         settings: ImmichSettings,
         directoryPath: string,
+        recursive: boolean,
       ) => Promise<ImmichUploadResult>;
       onImmichUploadProgress: (
         listener: (progress: ImmichUploadProgress) => void,
@@ -212,6 +286,47 @@ const formatImageStatus = (index: number, total: number, label: string) =>
 const formatSavedStatus = (label: string) => `Saved changes to ${label}.`;
 
 /**
+ * Formats the status shown after a folder loads, naming the folder count in nested mode.
+ * @param result - The number of groups found, whether nested folders were included, and how many folders were scanned.
+ * @returns A formatted status string.
+ */
+const describeLoadedGroups = ({
+  files,
+  recursive,
+  folderCount,
+}: {
+  files: readonly unknown[];
+  recursive: boolean;
+  folderCount: number;
+}) =>
+  `Loaded ${files.length} photo group${files.length === 1 ? "" : "s"}${
+    recursive
+      ? ` from ${folderCount} folder${folderCount === 1 ? "" : "s"}`
+      : ""
+  }.`;
+
+/**
+ * Moves a map entry to a new key, for example after a "Do not upload" rename changes a group's ID.
+ * @param map - The map to update.
+ * @param from - The old key.
+ * @param to - The new key.
+ * @returns The updated map, or the same map when there is nothing to move.
+ */
+const renameMapKey = <Value,>(
+  map: ReadonlyMap<string, Value>,
+  from: string,
+  to: string,
+): ReadonlyMap<string, Value> => {
+  if (from === to || !map.has(from)) {
+    return map;
+  }
+  const next = new Map(map);
+  next.set(to, next.get(from) as Value);
+  next.delete(from);
+  return next;
+};
+
+/**
  * Input props that select the whole value when the field gains focus, so typing replaces it.
  * A mouse click would normally collapse the selection on mouseup, so that default is suppressed
  * only for the click that focused the field; later clicks still position the caret normally.
@@ -234,52 +349,150 @@ const selectAllOnFocusProps = {
 };
 
 /**
- * Resolves the preview source URL for an image, accounting for rotation.
- * When running in Electron, attempts to use a preview data URL; otherwise falls back to a file URL.
- * @param filePath - The path to the image file.
- * @param rotation - The rotation value in degrees.
- * @returns A resolved source URL for displaying the image preview.
+ * Reports whether two paths name the same image, treating a "Do not upload" rename as the same file.
+ * Flagging inserts the _exclude marker before the side suffix or extension (img001_exclude_a.jpg).
+ * @param previousPath - The path of the shown image.
+ * @param nextPath - The path of the image to show.
+ * @returns True when the paths differ at most by the _exclude marker.
  */
-const useResolvedPreviewSrc = (filePath: string, rotation: number) => {
-  const [src, setSrc] = useState("");
+const isSameImageFile = (previousPath: string, nextPath: string) => {
+  const withoutExcludeMarker = (filePath: string) =>
+    filePath.replace(/_exclude(?=[_.][^\\/]*$)/, "");
+  return (
+    previousPath === nextPath ||
+    withoutExcludeMarker(previousPath) === withoutExcludeMarker(nextPath)
+  );
+};
+
+type DisplayedPreview = {
+  filePath: string;
+  version: string;
+  src: string;
+  rotation: number;
+  naturalWidth: number;
+  naturalHeight: number;
+};
+
+/**
+ * Resolves the preview shown for one version of an image.
+ * The web app builds the URL locally; Electron renders TIFF files in the main process.
+ * When a save rewrites the shown file (a new date or an applied rotation gives it a new version), or a
+ * "Do not upload" toggle renames it, the new preview is downloaded and decoded before it replaces the old
+ * one, together with its size. Until then the old image stays, with the rotation it was shown with, so the
+ * picture never shrinks, blanks, or flips.
+ * @param filePath - The path to the image file.
+ * @param version - The file's version; it changes whenever the file is rewritten.
+ * @param rotation - The CSS rotation for the current version, in degrees.
+ * @returns The shown source URL, the rotation to show it with, its natural size (0 until known), and a load handler for the image element.
+ */
+const useDisplayedPreview = (
+  filePath: string,
+  version: string,
+  rotation: number,
+) => {
+  const [shown, setShown] = useState<DisplayedPreview>({
+    filePath: "",
+    version: "",
+    src: "",
+    rotation: 0,
+    naturalWidth: 0,
+    naturalHeight: 0,
+  });
+  const rotationRef = useRef(rotation);
+  const shownRef = useRef(shown);
+  const isCurrentVersion =
+    shown.filePath === filePath && shown.version === version;
+
+  // While the shown version is current, it keeps the latest rotation, ready for the next version swap.
+  if (isCurrentVersion && shown.rotation !== rotation) {
+    setShown({ ...shown, rotation });
+  }
+
+  useEffect(() => {
+    rotationRef.current = rotation;
+    shownRef.current = shown;
+  });
 
   useEffect(() => {
     let isActive = true;
 
-    const resolvePreviewUrl = async () => {
-      if (!filePath) {
-        setSrc("");
+    const resolvePreview = async () => {
+      let src = "";
+      if (filePath) {
+        try {
+          src = window.electronAPI
+            ? (await window.electronAPI.getPreviewDataUrl(filePath, version)) ||
+              toFileUrl(filePath)
+            : toFileUrl(filePath);
+        } catch {
+          src = toFileUrl(filePath);
+        }
+      }
+      if (!isActive) {
         return;
       }
 
-      if (!window.electronAPI) {
-        setSrc(toFileUrl(filePath));
-        return;
+      let naturalWidth = 0;
+      let naturalHeight = 0;
+      const previous = shownRef.current;
+      if (
+        src &&
+        isSameImageFile(previous.filePath, filePath) &&
+        previous.src &&
+        previous.src !== src
+      ) {
+        const preloadedImage = new Image();
+        preloadedImage.src = src;
+        try {
+          await preloadedImage.decode();
+          naturalWidth = preloadedImage.naturalWidth;
+          naturalHeight = preloadedImage.naturalHeight;
+        } catch {
+          // Show the new version anyway; the image element reports its own loading errors.
+        }
+        if (!isActive) {
+          return;
+        }
       }
 
-      try {
-        const previewUrl = await window.electronAPI.getPreviewDataUrl(
-          filePath,
-          rotation,
-        );
-        if (isActive) {
-          setSrc(previewUrl || toFileUrl(filePath));
-        }
-      } catch {
-        if (isActive) {
-          setSrc(toFileUrl(filePath));
-        }
-      }
+      setShown({
+        filePath,
+        version,
+        src,
+        rotation: rotationRef.current,
+        naturalWidth,
+        naturalHeight,
+      });
     };
 
-    void resolvePreviewUrl();
+    void resolvePreview();
 
     return () => {
       isActive = false;
     };
-  }, [filePath, rotation]);
+  }, [filePath, version]);
 
-  return src;
+  /**
+   * Records the natural size of the shown image once the element has loaded it.
+   * @param event - The image element's load event.
+   */
+  const handleImageLoad = (event: SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth, naturalHeight } = event.currentTarget;
+    const loadedSrc = event.currentTarget.getAttribute("src");
+    setShown((current) =>
+      current.src === loadedSrc
+        ? { ...current, naturalWidth, naturalHeight }
+        : current,
+    );
+  };
+
+  return {
+    src: shown.src,
+    rotation: isCurrentVersion ? rotation : shown.rotation,
+    naturalWidth: shown.naturalWidth,
+    naturalHeight: shown.naturalHeight,
+    handleImageLoad,
+  };
 };
 
 const MAGNIFIER_LENS_SIZE = 160;
@@ -288,17 +501,26 @@ const MAGNIFIER_EDGE_BUFFER = 32;
 
 const MagnifiedImage = ({
   filePath,
+  version,
   altText,
-  rotation,
+  rotation: requestedRotation,
+  isExpanded,
+  collapsedHeight,
 }: {
   filePath: string;
+  version: string;
   altText: string;
   rotation: number;
+  isExpanded: boolean;
+  collapsedHeight: number;
 }) => {
-  const src = useResolvedPreviewSrc(filePath, rotation);
+  // The rotation that matches the shown image, which lags the requested one only while a new version loads.
+  const { src, rotation, naturalWidth, naturalHeight, handleImageLoad } =
+    useDisplayedPreview(filePath, version, requestedRotation);
   const [isLoading, setIsLoading] = useState(true);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const [availableWidth, setAvailableWidth] = useState(0);
   const [lensStyle, setLensStyle] = useState<{
     left: number;
     top: number;
@@ -307,7 +529,64 @@ const MagnifiedImage = ({
   } | null>(null);
 
   /**
+   * Tracks the width available to the image, so quarter-turned images can be fitted to it.
+   */
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      const style = window.getComputedStyle(container);
+      setAvailableWidth(
+        container.clientWidth -
+          parseFloat(style.paddingLeft) -
+          parseFloat(style.paddingRight),
+      );
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
+  // A quarter turn swaps the visible width and height, so the image is sized and centred in a frame
+  // that has the rotated proportions.
+  const rotatedBox =
+    rotation % 180 !== 0 && naturalWidth > 0 && availableWidth > 0
+      ? getRotatedImageBox({
+          naturalWidth,
+          naturalHeight,
+          rotation,
+          availableWidth,
+          targetHeight: isExpanded ? null : collapsedHeight,
+        })
+      : null;
+  const frameStyle: CSSProperties | undefined = rotatedBox
+    ? {
+        position: "relative",
+        width: rotatedBox.width,
+        height: rotatedBox.height,
+        marginInline: "auto",
+      }
+    : undefined;
+  const imageStyle: CSSProperties | undefined = rotatedBox
+    ? {
+        position: "absolute",
+        left: (rotatedBox.width - rotatedBox.height) / 2,
+        top: (rotatedBox.height - rotatedBox.width) / 2,
+        width: rotatedBox.height,
+        height: rotatedBox.width,
+        maxWidth: "none",
+        margin: 0,
+        transform: `rotate(${rotation}deg)`,
+      }
+    : rotation
+      ? { transform: `rotate(${rotation}deg)` }
+      : undefined;
+
+  /**
    * Handles mouse movement events to update the magnifier lens position and style.
+   * The lens samples the unrotated image and rotates its contents to match the displayed image.
    * @param event - The React mouse event object containing mouse position information.
    */
   const handleMouseMove = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -361,12 +640,25 @@ const MagnifiedImage = ({
           )
         : hoverTop + (hoverHeight - MAGNIFIER_LENS_SIZE) / 2;
 
+    // offsetWidth/offsetHeight ignore the CSS rotation, giving the unrotated layout size.
+    const layoutSize = { width: image.offsetWidth, height: image.offsetHeight };
+    const sample = mapRotatedPointToImage(
+      { x: sampledImageX, y: sampledImageY },
+      { width: imageRect.width, height: imageRect.height },
+      layoutSize,
+      rotation,
+    );
+    const pointerInLens = rotatePoint(
+      { x: pointerX - lensLeft - halfLens, y: pointerY - lensTop - halfLens },
+      -rotation,
+    );
+
     setLensStyle({
       left: lensLeft,
       top: lensTop,
-      backgroundSize: `${imageRect.width * MAGNIFIER_ZOOM}px ${imageRect.height * MAGNIFIER_ZOOM}px`,
-      backgroundPosition: `${pointerX - lensLeft - sampledImageX * MAGNIFIER_ZOOM}px ${
-        pointerY - lensTop - sampledImageY * MAGNIFIER_ZOOM
+      backgroundSize: `${layoutSize.width * MAGNIFIER_ZOOM}px ${layoutSize.height * MAGNIFIER_ZOOM}px`,
+      backgroundPosition: `${halfLens + pointerInLens.x - sample.x * MAGNIFIER_ZOOM}px ${
+        halfLens + pointerInLens.y - sample.y * MAGNIFIER_ZOOM
       }px`,
     });
   };
@@ -378,12 +670,18 @@ const MagnifiedImage = ({
       onMouseMove={handleMouseMove}
       onMouseLeave={() => setLensStyle(null)}
     >
-      <img
-        ref={imageRef}
-        src={src}
-        alt={altText}
-        onLoad={() => setIsLoading(false)}
-      />
+      <div className="magnifier-frame" style={frameStyle}>
+        <img
+          ref={imageRef}
+          src={src}
+          alt={altText}
+          style={imageStyle}
+          onLoad={(event) => {
+            setIsLoading(false);
+            handleImageLoad(event);
+          }}
+        />
+      </div>
       {!isLoading && lensStyle && src ? (
         <div
           className="magnifier-lens"
@@ -392,12 +690,19 @@ const MagnifiedImage = ({
             top: lensStyle.top,
             width: MAGNIFIER_LENS_SIZE,
             height: MAGNIFIER_LENS_SIZE,
-            backgroundImage: `url(${src})`,
-            backgroundRepeat: "no-repeat",
-            backgroundSize: lensStyle.backgroundSize,
-            backgroundPosition: lensStyle.backgroundPosition,
           }}
-        />
+        >
+          <div
+            className="magnifier-lens-image"
+            style={{
+              backgroundImage: `url("${src.replace(/"/g, '\\"')}")`,
+              backgroundRepeat: "no-repeat",
+              backgroundSize: lensStyle.backgroundSize,
+              backgroundPosition: lensStyle.backgroundPosition,
+              transform: rotation ? `rotate(${rotation}deg)` : undefined,
+            }}
+          />
+        </div>
       ) : null}
     </div>
   );
@@ -461,9 +766,40 @@ const defaultImmichSettings: ImmichSettings = {
   concurrentTasks: 2,
 };
 
+/**
+ * Reads the sidecar metadata of both images in a pair.
+ * @param electronApi - The desktop or web API.
+ * @param pair - The pair to read.
+ * @returns The front and back sidecar values (null without a back image).
+ */
+const readPairSidecars = (
+  electronApi: NonNullable<Window["electronAPI"]>,
+  pair: ImagePair,
+) =>
+  Promise.all([
+    electronApi.readSidecarMetadata(pair.frontPath),
+    pair.backPath
+      ? electronApi.readSidecarMetadata(pair.backPath)
+      : Promise.resolve(null),
+  ]);
+
 function App() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [directoryPath, setDirectoryPath] = useState("");
+  // Set from the folder browser on each load; sorting, set-date, and upload keep using it.
+  const [includeNested, setIncludeNested] = useState(false);
+  const [folderCount, setFolderCount] = useState(0);
+  const [folderState, setFolderState] = useState<FolderState>(
+    unprocessedFolderState,
+  );
+  const [hasSubfolders, setHasSubfolders] = useState(false);
+  const [includeSubfoldersInProcessed, setIncludeSubfoldersInProcessed] =
+    useState(false);
+  const [isSettingFolderProcessed, setIsSettingFolderProcessed] =
+    useState(false);
+  const [folderProcessedError, setFolderProcessedError] = useState("");
+  // Set after a successful upload of the open folder, to offer marking it processed.
+  const [hasUploadedFolder, setHasUploadedFolder] = useState(false);
   const [pairs, setPairs] = useState<ImagePair[]>([]);
   const [selectedPairId, setSelectedPairId] = useState<string | null>(null);
   const [savedPairIds, setSavedPairIds] = useState<ReadonlySet<string>>(
@@ -473,6 +809,13 @@ function App() {
   const [filterSnapshotPairIds, setFilterSnapshotPairIds] = useState<
     ReadonlySet<string>
   >(() => new Set());
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [gridFocusPairId, setGridFocusPairId] = useState<string | null>(null);
+  // Dates saved since the folder was read, so the grid shows them without reloading.
+  // Kept apart from `pairs` because replacing the selected pair would reload it in Review.
+  const [savedDates, setSavedDates] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
   const [imageNumberInput, setImageNumberInput] = useState("1");
   const [sortBy, setSortBy] = useState<SortOption>("createdAt-asc");
   const [metadata, setMetadata] = useState<MetadataForm>({
@@ -532,7 +875,36 @@ function App() {
     message: string;
   } | null>(null);
   const [uploadElapsedSeconds, setUploadElapsedSeconds] = useState(0);
+  // Versions of files rewritten since the directory was listed, so their previews are reloaded.
+  const [imageVersions, setImageVersions] = useState<Record<string, string>>(
+    {},
+  );
+  // The pair whose pending save has finished, so its images can be shown without stale orientation.
+  const [readyPairId, setReadyPairId] = useState<string | null>(null);
+  const [pairReloadToken, setPairReloadToken] = useState(0);
+  const [pendingSaveCount, setPendingSaveCount] = useState(0);
   const hasUserChangedRef = useRef(false);
+  // Incremented on every edit, so a save only marks the form clean if nothing changed meanwhile.
+  const editRevisionRef = useRef(0);
+  const pairHasSidecarRef = useRef(false);
+  const selectedPairIdRef = useRef<string | null>(null);
+  const pendingSavesRef = useRef(new Map<string, Promise<boolean>>());
+  const unsavedEditsRef = useRef(new Map<string, UnsavedPairEdits>());
+  const sidecarPrefetchRef = useRef(
+    new Map<string, Promise<[SidecarValues, SidecarValues | null]>>(),
+  );
+  const leavingSaveRef = useRef<{
+    pairId: string;
+    operation: Promise<boolean>;
+  } | null>(null);
+  // A-image rotations chosen in the grid that are not on disk yet, by group ID. The grid and
+  // Review show them until the file is rotated.
+  const [gridRotations, setGridRotations] = useState<
+    ReadonlyMap<string, number>
+  >(new Map());
+  const gridRotationsRef = useRef(new Map<string, number>());
+  // Groups whose grid rotation is queued behind another save and has not started yet.
+  const queuedGridRotationsRef = useRef(new Set<string>());
   const dateInputRef = useRef<HTMLInputElement | null>(null);
   const dayInputRef = useRef<HTMLInputElement | null>(null);
   const yearInputRef = useRef<HTMLInputElement | null>(null);
@@ -541,8 +913,6 @@ function App() {
   const tagInputRef = useRef<HTMLInputElement | null>(null);
   const immichOutputRef = useRef<HTMLPreElement | null>(null);
   const isImmichOutputFollowingRef = useRef(true);
-  const saveTimeoutRef = useRef<number | null>(null);
-  const pendingPersistenceRef = useRef<Promise<boolean> | null>(null);
 
   // Mirrors savedPairIds synchronously, so a filter change can snapshot a save
   // that finished in the same callback before React re-renders.
@@ -574,6 +944,7 @@ function App() {
     savedPairIdsRef.current = empty;
     setSavedPairIds(empty);
     setFilterSnapshotPairIds(empty);
+    setSavedDates(new Map());
   }, []);
 
   const displayPairs = useMemo(
@@ -599,6 +970,28 @@ function App() {
     () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
+
+  const gridCells = useMemo<ThumbnailGridCell[]>(() => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      return [];
+    }
+    return displayPairs.map((pair) => ({
+      id: pair.id,
+      imageLabel: pair.imageLabel,
+      date: savedDates.get(pair.id) ?? pair.sidecarDate,
+      isPaired: pair.backPath !== null,
+      doNotUpload: pair.doNotUpload,
+      isUnprocessed: !pair.doNotUpload && !isPairProcessed(pair, savedPairIds),
+      // A rotation or save rewrites the file, giving the thumbnail a new URL.
+      thumbnailUrl: electronApi.getThumbnailUrl(
+        pair.frontPath,
+        GRID_THUMBNAIL_SIZE,
+        imageVersions[pair.frontPath] ?? pair.frontVersion,
+      ),
+      rotation: gridRotations.get(pair.id) ?? 0,
+    }));
+  }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
 
   /**
    * Loads the signed-in web user, so the header can show who is signed in and offer sign-out.
@@ -721,137 +1114,339 @@ function App() {
     setIsExpanded((current) => !current);
   }, []);
 
-  const clearPendingSave = useCallback(() => {
-    if (saveTimeoutRef.current !== null) {
-      window.clearTimeout(saveTimeoutRef.current);
-      saveTimeoutRef.current = null;
-    }
+  /**
+   * Records an edit to the current pair, so it is saved when the user moves on.
+   */
+  const markUserChanged = useCallback(() => {
+    hasUserChangedRef.current = true;
+    editRevisionRef.current += 1;
   }, []);
 
-  const savePairMetadata = useCallback(
-    async (pair: ImagePair, formValues: MetadataForm) => {
-      const electronApi = window.electronAPI;
-      if (!electronApi) {
-        throw new Error("This application must run inside Electron.");
-      }
+  /**
+   * Keeps the selected pair's id in a ref, so background saves can tell whether their pair is still shown.
+   */
+  useEffect(() => {
+    selectedPairIdRef.current = selectedPair?.id ?? null;
+  }, [selectedPair?.id]);
 
-      await electronApi.saveMetadata({
-        frontPath: pair.frontPath,
-        backPath: pair.backPath,
-        date: formValues.date,
-        description: formValues.description,
-        tags: formValues.tags,
-        frontRotation: rotations.front,
-        backRotation: rotations.back,
+  /**
+   * Records a write to a group's files as its latest pending save, so the next save of the group
+   * runs after it, Review waits for it before showing the group, and quitting waits for it.
+   * @param pairId - The ID of the image group being written.
+   * @param operation - The write, which resolves to whether it succeeded.
+   */
+  const trackPairOperation = useCallback(
+    (pairId: string, operation: Promise<boolean>) => {
+      pendingSavesRef.current.set(pairId, operation);
+      setPendingSaveCount(pendingSavesRef.current.size);
+      void operation.then(() => {
+        if (pendingSavesRef.current.get(pairId) === operation) {
+          pendingSavesRef.current.delete(pairId);
+        }
+        setPendingSaveCount(pendingSavesRef.current.size);
       });
-
-      hasUserChangedRef.current = false;
-      if (!pair.hasSidecar) {
-        markPairsSaved([pair.id]);
-      }
     },
-    [markPairsSaved, rotations],
+    [],
   );
 
   /**
-   * Persists metadata changes to the current selected pair and applies image rotations if needed.
-   * This is a debounced operation that saves changes after user input stabilizes.
-   * @param formValues - The metadata form values (description, date, tags) to persist.
-   *                      If not provided, uses the current metadata state.
+   * Saves a pair's metadata and applies its pending rotations without blocking the UI.
+   * Saves of the same pair run in order. The returned promise never rejects; it resolves to whether the save succeeded.
+   * A failed save names the image in the status line and keeps its values (and any rotation not yet applied),
+   * so reopening the pair shows the user's edits.
+   * @param pair - The pair to save.
+   * @param formValues - The pair's form values.
+   * @param pairRotations - The rotations to apply to the files (zero to save metadata only).
+   * @param editRevision - The edit revision the form values belong to.
+   * @returns Whether the save succeeded.
    */
-  const persistCurrentPair = useCallback(
-    (formValues: MetadataForm = metadata) => {
-      if (pendingPersistenceRef.current) {
-        return pendingPersistenceRef.current;
+  const startPairSave = useCallback(
+    (
+      pair: ImagePair,
+      formValues: MetadataForm,
+      pairRotations: PairRotationState,
+      editRevision: number,
+    ) => {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        return Promise.resolve(false);
       }
 
-      const operation = (async () => {
-        if (!selectedPair) {
-          return true;
-        }
+      const appliesRotation =
+        pairRotations.front !== 0 || pairRotations.back !== 0;
+      const previousSave =
+        pendingSavesRef.current.get(pair.id) ?? Promise.resolve(true);
+      sidecarPrefetchRef.current.delete(pair.id);
 
-        if (!toIsoDate(dateSegmentsRef.current)) {
-          setStatus("Enter a valid month, day, and year before saving.");
-          return false;
-        }
-
-        const electronApi = window.electronAPI;
-        if (!electronApi) {
-          setStatus("This application must run inside Electron.");
-          return false;
-        }
-
-        const rotationSnapshot = { ...rotations };
-        setIsPersistingRotation(true);
-        clearPendingSave();
-
+      const operation = previousSave.then(async () => {
         try {
-          await savePairMetadata(selectedPair, formValues);
-
-          if (rotationSnapshot.front === 0 && rotationSnapshot.back === 0) {
-            return true;
+          const result = await electronApi.saveMetadata({
+            frontPath: pair.frontPath,
+            backPath: pair.backPath,
+            date: formValues.date,
+            description: formValues.description,
+            tags: formValues.tags,
+            frontRotation: pairRotations.front,
+            backRotation: pairRotations.back,
+          });
+          const updatedVersions = getUpdatedImageVersions(result.results);
+          if (Object.keys(updatedVersions).length) {
+            setImageVersions((current) => ({ ...current, ...updatedVersions }));
+          }
+          if (result.sidecarWritten) {
+            const savedDate = formValues.date.slice(0, 10);
+            setSavedDates((current) =>
+              current.get(pair.id) === savedDate
+                ? current
+                : new Map(current).set(pair.id, savedDate),
+            );
           }
 
-          const result = await electronApi.applyImageRotations({
-            frontPath: selectedPair.frontPath,
-            backPath: selectedPair.backPath,
-            frontRotation: rotationSnapshot.front,
-            backRotation: rotationSnapshot.back,
-          });
-          const remainingRotations = { ...rotationSnapshot };
-
-          for (const imageResult of result.results) {
-            if (imageResult.ok) {
-              remainingRotations[imageResult.field] = 0;
+          const remainingRotations = getRemainingRotations(
+            pairRotations,
+            result.results,
+          );
+          if (!pair.hasSidecar) {
+            markPairsSaved([pair.id]);
+          }
+          if (selectedPairIdRef.current === pair.id) {
+            pairHasSidecarRef.current = true;
+            if (appliesRotation) {
+              setRotations(remainingRotations);
+            }
+            if (result.ok && editRevisionRef.current === editRevision) {
+              hasUserChangedRef.current = false;
             }
           }
 
-          setRotations(remainingRotations);
-          const failures = result.results.filter(
-            (imageResult) => !imageResult.ok,
-          );
-          hasUserChangedRef.current =
-            remainingRotations.front !== 0 || remainingRotations.back !== 0;
-
-          if (failures.length) {
-            setStatus(
-              failures
-                .map((failure) => failure.error)
-                .filter(Boolean)
-                .join(" "),
-            );
-            return false;
+          if (result.ok) {
+            unsavedEditsRef.current.delete(pair.id);
+            return true;
           }
 
-          return result.ok;
-        } catch (error) {
-          hasUserChangedRef.current =
-            rotationSnapshot.front !== 0 || rotationSnapshot.back !== 0;
+          unsavedEditsRef.current.set(pair.id, {
+            imageLabel: pair.imageLabel,
+            formValues,
+            rotations: remainingRotations,
+          });
           setStatus(
-            error instanceof Error
-              ? error.message
-              : "Unable to persist image rotation.",
+            describeSaveFailure(
+              pair.imageLabel,
+              result.results
+                .filter((imageResult) => !imageResult.ok)
+                .map((imageResult) => imageResult.error),
+            ),
           );
           return false;
-        } finally {
-          setIsPersistingRotation(false);
-        }
-      })();
-
-      pendingPersistenceRef.current = operation;
-      void operation.finally(() => {
-        if (pendingPersistenceRef.current === operation) {
-          pendingPersistenceRef.current = null;
+        } catch (error) {
+          unsavedEditsRef.current.set(pair.id, {
+            imageLabel: pair.imageLabel,
+            formValues,
+            rotations: pairRotations,
+          });
+          setStatus(
+            describeSaveFailure(pair.imageLabel, [
+              error instanceof Error ? error.message : undefined,
+            ]),
+          );
+          return false;
         }
       });
+
+      trackPairOperation(pair.id, operation);
       return operation;
     },
-    [clearPendingSave, metadata, rotations, savePairMetadata, selectedPair],
+    [markPairsSaved, trackPairOperation],
   );
 
   /**
-   * Navigates to a specific image index after persisting changes from the current pair.
-   * Binds the index to the valid range of displayed pairs and returns early if already at the target.
+   * Rotates a group's A image from the grid. The thumbnail turns at once; the file is rotated in
+   * the background, after any save of the same group, and clicks made before it starts are
+   * combined into one rotation. Only the image is rewritten: the grid never writes a sidecar,
+   * so rotating does not record a date the user never chose.
+   * @param pairId - The ID of the image group to rotate.
+   * @param delta - The rotation change in degrees (±90).
+   */
+  const rotateFromGrid = useCallback(
+    (pairId: string, delta: number) => {
+      const electronApi = window.electronAPI;
+      const pair = pairs.find((candidate) => candidate.id === pairId);
+      if (!electronApi || !pair || isUploading) {
+        return;
+      }
+
+      const pendingRotations = gridRotationsRef.current;
+      const setPendingRotation = (rotation: number) => {
+        if (rotation) {
+          pendingRotations.set(pairId, rotation);
+        } else {
+          pendingRotations.delete(pairId);
+        }
+        setGridRotations(new Map(pendingRotations));
+      };
+      setPendingRotation(
+        normalizeRotation((pendingRotations.get(pairId) ?? 0) + delta),
+      );
+
+      // A rotation that has not started yet applies the latest angle when it runs.
+      if (queuedGridRotationsRef.current.has(pairId)) {
+        return;
+      }
+      queuedGridRotationsRef.current.add(pairId);
+
+      const previousSave =
+        pendingSavesRef.current.get(pairId) ?? Promise.resolve(true);
+      const operation = previousSave.then(async () => {
+        queuedGridRotationsRef.current.delete(pairId);
+        const rotation = pendingRotations.get(pairId) ?? 0;
+        if (!rotation) {
+          return true;
+        }
+
+        let error: string | undefined;
+        try {
+          const result = await electronApi.applyImageRotations({
+            frontPath: pair.frontPath,
+            backPath: null,
+            frontRotation: rotation,
+            backRotation: 0,
+          });
+          const frontResult = result.results.find(
+            (imageResult) => imageResult.field === "front",
+          );
+          if (frontResult?.ok) {
+            const { version } = frontResult;
+            if (version) {
+              setImageVersions((current) => ({
+                ...current,
+                [pair.frontPath]: version,
+              }));
+            }
+          } else {
+            error = frontResult?.error ?? "The image was not rotated.";
+          }
+        } catch (rotationError) {
+          error =
+            rotationError instanceof Error
+              ? rotationError.message
+              : "The image was not rotated.";
+        }
+
+        // Clicks made while this rotation ran stay pending for the next one.
+        setPendingRotation(
+          normalizeRotation((pendingRotations.get(pairId) ?? 0) - rotation),
+        );
+        if (error) {
+          setStatus(`Could not rotate ${pair.imageLabel}: ${error}`);
+        }
+        // A failure is reported here, so later saves of this group still go ahead.
+        return true;
+      });
+      trackPairOperation(pairId, operation);
+    },
+    [isUploading, pairs, trackPairOperation],
+  );
+
+  /**
+   * Waits until every pending save has finished.
+   * @returns The labels of images whose changes could not be saved (empty when all saves succeeded).
+   */
+  const waitForPendingSaves = useCallback(async () => {
+    while (pendingSavesRef.current.size) {
+      await Promise.all(pendingSavesRef.current.values());
+    }
+    return Array.from(
+      unsavedEditsRef.current.values(),
+      (edits) => edits.imageLabel,
+    );
+  }, []);
+
+  /**
+   * Saves the selected pair when it has changes, a pending rotation, or no sidecar yet; otherwise writes nothing.
+   * @param formValues - The metadata form values to persist. If not provided, uses the current metadata state.
+   * @param options - Set wait to false to save in the background and return as soon as the date is validated.
+   * @returns False when the date is invalid or (when waiting) the save failed.
+   */
+  const persistCurrentPair = useCallback(
+    async (
+      formValues: MetadataForm = metadata,
+      { wait = true }: { wait?: boolean } = {},
+    ) => {
+      if (!selectedPair || !isHydrated) {
+        return true;
+      }
+
+      const leavingSave = leavingSaveRef.current;
+      if (leavingSave?.pairId === selectedPair.id) {
+        return wait ? leavingSave.operation : true;
+      }
+
+      if (!toIsoDate(dateSegmentsRef.current)) {
+        setStatus("Enter a valid month, day, and year before saving.");
+        return false;
+      }
+
+      if (!window.electronAPI) {
+        setStatus("This application must run inside Electron.");
+        return false;
+      }
+
+      if (
+        !needsSaveOnLeave({
+          hasUserChanged: hasUserChangedRef.current,
+          rotations,
+          hasSidecar: pairHasSidecarRef.current,
+        })
+      ) {
+        return wait
+          ? ((await pendingSavesRef.current.get(selectedPair.id)) ?? true)
+          : true;
+      }
+
+      const operation = startPairSave(
+        selectedPair,
+        formValues,
+        rotations,
+        editRevisionRef.current,
+      );
+      const nextLeavingSave = { pairId: selectedPair.id, operation };
+      leavingSaveRef.current = nextLeavingSave;
+      void operation.then(() => {
+        if (leavingSaveRef.current === nextLeavingSave) {
+          leavingSaveRef.current = null;
+        }
+      });
+
+      if (!wait) {
+        return true;
+      }
+
+      setIsPersistingRotation(true);
+      try {
+        return await operation;
+      } finally {
+        setIsPersistingRotation(false);
+      }
+    },
+    [isHydrated, metadata, rotations, selectedPair, startPairSave],
+  );
+
+  /**
+   * Saves the reviewed pair before the image list changes. No metadata is saved from the grid:
+   * its only edits are rotations, which are written as they are made, and Review's edits are
+   * saved on the way back to the grid. Saving there would write a default date for an image
+   * the user never opened.
+   * @returns True when it is safe to continue.
+   */
+  const persistReviewedPair = useCallback(
+    () =>
+      viewMode === "review" ? persistCurrentPair() : Promise.resolve(true),
+    [persistCurrentPair, viewMode],
+  );
+
+  /**
+   * Navigates to a specific image index, saving the current pair in the background.
+   * Only an invalid date blocks moving on; a failed save is reported in the status line.
    * @param nextIndex - The target zero-based image index to navigate to.
    * @param formValues - Optional metadata form values to persist before navigating.
    */
@@ -866,8 +1461,12 @@ function App() {
         return;
       }
 
+      // The save runs in the background; only an invalid date blocks moving on.
       const nextPair = displayPairs[boundedIndex];
-      if (!nextPair || !(await persistCurrentPair(formValues))) {
+      if (
+        !nextPair ||
+        !(await persistCurrentPair(formValues, { wait: false }))
+      ) {
         return;
       }
 
@@ -880,7 +1479,8 @@ function App() {
 
   /**
    * Loads metadata from XMP sidecar files when the selected pair changes.
-   * Hydrates the component with initial state and updates metadata, rotations, and status.
+   * Waits for the pair's own pending save first, then uses prefetched sidecar values when available.
+   * Unsaved values from a failed save take precedence over the sidecar.
    */
   useEffect(() => {
     const electronApi = window.electronAPI;
@@ -889,72 +1489,101 @@ function App() {
     }
 
     let isMounted = true;
+    const pair = selectedPair;
     const imageStatus = formatImageStatus(
       selectedIndex,
       displayPairs.length,
-      selectedPair.imageLabel,
+      pair.imageLabel,
     );
 
+    const applyLoadedValues = (
+      values: MetadataForm,
+      pairRotations: PairRotationState,
+      hasChanges: boolean,
+      statusMessage: string,
+    ) => {
+      hasUserChangedRef.current = hasChanges;
+      setMetadata(values);
+      const loadedSegments = parseDateSegments(values.date);
+      dateSegmentsRef.current = loadedSegments;
+      setDateSegments(loadedSegments);
+      setTagInput("");
+      setRotations(pairRotations);
+      setIsHydrated(true);
+      setStatus(statusMessage);
+    };
+
     const loadMetadataFromSidecar = async () => {
+      await pendingSavesRef.current.get(pair.id);
+      if (!isMounted) {
+        return;
+      }
+      setReadyPairId(pair.id);
+
+      const unsavedEdits = unsavedEditsRef.current.get(pair.id);
+      const otherUnsavedImages = describeUnsavedImages(
+        Array.from(unsavedEditsRef.current)
+          .filter(([pairId]) => pairId !== pair.id)
+          .map(([, edits]) => edits.imageLabel),
+      );
+      const unsavedStatus = unsavedEdits
+        ? " Changes to this image are not saved yet."
+        : "";
+
       try {
-        const [frontXmpValues, backXmpValues] = await Promise.all([
-          electronApi.readSidecarMetadata(selectedPair.frontPath),
-          selectedPair.backPath
-            ? electronApi.readSidecarMetadata(selectedPair.backPath)
-            : Promise.resolve(null),
-        ]);
+        const prefetchedSidecars = sidecarPrefetchRef.current.get(pair.id);
+        sidecarPrefetchRef.current.delete(pair.id);
+        const [frontXmpValues, backXmpValues] = await (prefetchedSidecars ??
+          readPairSidecars(electronApi, pair));
 
         if (!isMounted) {
           return;
         }
 
-        hasUserChangedRef.current = false;
-        const loadedDate = frontXmpValues.date
-          ? frontXmpValues.date.slice(0, 10)
-          : defaultDate;
-        setMetadata({
-          date: loadedDate,
-          description: frontXmpValues.description ?? "",
-          tags: frontXmpValues.tags ?? [],
-        });
-        const loadedSegments = parseDateSegments(loadedDate);
-        dateSegmentsRef.current = loadedSegments;
-        setDateSegments(loadedSegments);
+        pairHasSidecarRef.current = frontXmpValues.hasSidecar;
+        const loadedTags = frontXmpValues.tags ?? [];
         setRecentTags((current) => [
-          ...(frontXmpValues.tags ?? []),
+          ...loadedTags,
           ...current.filter(
             (tag) =>
-              !(frontXmpValues.tags ?? []).some(
+              !loadedTags.some(
                 (loadedTag) =>
                   loadedTag.toLocaleLowerCase() === tag.toLocaleLowerCase(),
               ),
           ),
         ]);
-        setTagInput("");
-        setRotations({
-          front: normalizeRotation(frontXmpValues.rotation ?? 0),
-          back: normalizeRotation(backXmpValues?.rotation ?? 0),
-        });
-        setIsHydrated(true);
-        setStatus(imageStatus);
+        applyLoadedValues(
+          unsavedEdits?.formValues ?? {
+            date: frontXmpValues.date
+              ? frontXmpValues.date.slice(0, 10)
+              : defaultDate,
+            description: frontXmpValues.description ?? "",
+            tags: loadedTags,
+          },
+          unsavedEdits?.rotations ?? {
+            front: normalizeRotation(frontXmpValues.rotation ?? 0),
+            back: normalizeRotation(backXmpValues?.rotation ?? 0),
+          },
+          Boolean(unsavedEdits),
+          `${imageStatus}${unsavedStatus}${otherUnsavedImages}`,
+        );
       } catch {
         if (!isMounted) {
           return;
         }
 
-        hasUserChangedRef.current = false;
-        setMetadata({
-          date: defaultDate,
-          description: "",
-          tags: [],
-        });
-        const defaultSegments = parseDateSegments(defaultDate);
-        dateSegmentsRef.current = defaultSegments;
-        setDateSegments(defaultSegments);
-        setTagInput("");
-        setRotations({ front: 0, back: 0 });
-        setIsHydrated(true);
-        setStatus(`${imageStatus} Unable to read saved metadata.`);
+        // Treat an unreadable sidecar as existing, so leaving the pair unchanged does not overwrite it.
+        pairHasSidecarRef.current = true;
+        applyLoadedValues(
+          unsavedEdits?.formValues ?? {
+            date: defaultDate,
+            description: "",
+            tags: [],
+          },
+          unsavedEdits?.rotations ?? { front: 0, back: 0 },
+          Boolean(unsavedEdits),
+          `${imageStatus} Unable to read saved metadata.${unsavedStatus}${otherUnsavedImages}`,
+        );
       }
     };
 
@@ -963,53 +1592,103 @@ function App() {
     return () => {
       isMounted = false;
     };
-  }, [displayPairs.length, selectedIndex, selectedPair]);
+  }, [displayPairs.length, pairReloadToken, selectedIndex, selectedPair]);
 
   /**
-   * Debounces metadata saves and clears pending changes when conditions change.
-   * Triggers a save after user changes stabilize or when navigation occurs.
+   * Prefetches the neighbouring pairs' images and sidecar metadata once the current pair is shown.
+   * Pairs with a pending save are skipped; they are loaded after their save finishes.
    */
   useEffect(() => {
     const electronApi = window.electronAPI;
-    if (!selectedPair || !electronApi || !isHydrated) {
-      clearPendingSave();
-      hasUserChangedRef.current = false;
+    if (!electronApi || !selectedPair || !isHydrated) {
       return;
     }
 
-    if (!hasUserChangedRef.current) {
-      return;
-    }
-
-    clearPendingSave();
-    if (!toIsoDate(dateSegmentsRef.current)) {
-      return;
-    }
-    saveTimeoutRef.current = window.setTimeout(async () => {
-      try {
-        await savePairMetadata(selectedPair, metadata);
-        setStatus(formatSavedStatus(selectedPair.imageLabel));
-      } catch (error) {
-        setStatus(
-          error instanceof Error
-            ? error.message
-            : "Unable to save the metadata.",
-        );
-      } finally {
-        saveTimeoutRef.current = null;
+    const neighbours = [
+      displayPairs[selectedIndex + 1],
+      displayPairs[selectedIndex - 1],
+    ].filter((pair): pair is ImagePair => Boolean(pair));
+    const neighbourIds = new Set(neighbours.map((pair) => pair.id));
+    for (const pairId of sidecarPrefetchRef.current.keys()) {
+      if (!neighbourIds.has(pairId)) {
+        sidecarPrefetchRef.current.delete(pairId);
       }
-    }, 350);
+    }
 
-    return () => {
-      clearPendingSave();
+    const timer = window.setTimeout(() => {
+      for (const pair of neighbours) {
+        if (pendingSavesRef.current.has(pair.id)) {
+          continue;
+        }
+
+        if (!sidecarPrefetchRef.current.has(pair.id)) {
+          const request = readPairSidecars(electronApi, pair);
+          sidecarPrefetchRef.current.set(pair.id, request);
+          request.catch(() => {
+            if (sidecarPrefetchRef.current.get(pair.id) === request) {
+              sidecarPrefetchRef.current.delete(pair.id);
+            }
+          });
+        }
+
+        const images: [string | null, string | null][] = [
+          [pair.frontPath, pair.frontVersion],
+          [pair.backPath, pair.backVersion],
+        ];
+        for (const [filePath, listedVersion] of images) {
+          if (!filePath) {
+            continue;
+          }
+          void electronApi
+            .getPreviewDataUrl(
+              filePath,
+              imageVersions[filePath] ?? listedVersion ?? "",
+            )
+            .then((url) => {
+              if (url) {
+                const preloadedImage = new Image();
+                preloadedImage.src = url;
+              }
+            })
+            .catch(() => {
+              // Prefetching is optional; the image loads normally when the pair is opened.
+            });
+        }
+      }
+    }, 150);
+
+    return () => window.clearTimeout(timer);
+  }, [displayPairs, imageVersions, isHydrated, selectedIndex, selectedPair]);
+
+  /**
+   * Warns before leaving the web app while saves are pending or have failed,
+   * or while the current pair has edits that have not been saved yet.
+   * The desktop app instead waits for pending writes before it quits.
+   */
+  useEffect(() => {
+    if (!isWebApp()) {
+      return;
+    }
+
+    const warnAboutPendingSaves = (event: BeforeUnloadEvent) => {
+      if (
+        pendingSavesRef.current.size ||
+        unsavedEditsRef.current.size ||
+        hasUserChangedRef.current
+      ) {
+        event.preventDefault();
+      }
     };
-  }, [clearPendingSave, selectedPair, metadata, isHydrated, savePairMetadata]);
+    window.addEventListener("beforeunload", warnAboutPendingSaves);
+    return () =>
+      window.removeEventListener("beforeunload", warnAboutPendingSaves);
+  }, []);
 
   /**
    * Focuses the date input field when the component becomes hydrated and a pair is selected.
    */
   useEffect(() => {
-    if (!selectedPair || !isHydrated) {
+    if (!selectedPair || !isHydrated || viewMode !== "review") {
       return;
     }
 
@@ -1021,10 +1700,11 @@ function App() {
     return () => {
       window.cancelAnimationFrame(frameId);
     };
-  }, [isHydrated, selectedPair]);
+  }, [isHydrated, selectedPair, viewMode]);
 
   /**
    * Rotates an image by a given delta value (in 90-degree increments).
+   * The rotation is shown with CSS straight away and written to the file when the pair is left.
    * Does not apply rotation if already persisting, uploading, or not hydrated.
    * @param field - Which image to rotate ("front" or "back").
    * @param delta - The rotation change in degrees (typically Â±90).
@@ -1035,13 +1715,13 @@ function App() {
         return;
       }
 
-      hasUserChangedRef.current = true;
+      markUserChanged();
       setRotations((current) => ({
         ...current,
         [field]: normalizeRotation(current[field] + delta),
       }));
     },
-    [isHydrated, isPersistingRotation, isUploading],
+    [isHydrated, isPersistingRotation, isUploading, markUserChanged],
   );
 
   /**
@@ -1067,7 +1747,21 @@ function App() {
     setDoNotUploadError(null);
 
     try {
-      if (hasUserChangedRef.current && !(await persistCurrentPair())) {
+      const hasPendingChanges =
+        hasUserChangedRef.current ||
+        rotations.front !== 0 ||
+        rotations.back !== 0;
+      if (hasPendingChanges && !(await persistCurrentPair())) {
+        setDoNotUploadError({
+          pairId: pair.id,
+          message:
+            "The flag was not changed because unsaved changes could not be saved.",
+        });
+        return;
+      }
+
+      // Renaming must not race a background save that still targets the old file names.
+      if (!(await (pendingSavesRef.current.get(pair.id) ?? true))) {
         setDoNotUploadError({
           pairId: pair.id,
           message:
@@ -1080,6 +1774,7 @@ function App() {
         frontPath: pair.frontPath,
         backPath: pair.backPath,
         value: !pair.doNotUpload,
+        relativeDirectory: pair.relativeDirectory,
       });
       setPairs((current) =>
         current.map((candidate) =>
@@ -1090,12 +1785,17 @@ function App() {
                 imageLabel: result.imageLabel,
                 frontPath: result.frontPath,
                 backPath: result.backPath,
+                frontVersion: result.frontVersion,
+                backVersion: result.backVersion,
                 doNotUpload: result.doNotUpload,
                 excludeMismatch: result.excludeMismatch,
               }
             : candidate,
         ),
       );
+      setSavedDates((current) => renameMapKey(current, pair.id, result.id));
+      // The pair id comes from the file name, so follow the renamed pair.
+      setSelectedPairId(result.id);
     } catch (error) {
       setDoNotUploadError({
         pairId: pair.id,
@@ -1113,6 +1813,7 @@ function App() {
     isTogglingDoNotUpload,
     isUploading,
     persistCurrentPair,
+    rotations,
     selectedPair,
   ]);
 
@@ -1134,7 +1835,13 @@ function App() {
         target === tagInputRef.current ||
         Boolean(target?.closest(".immich-content input"));
 
-      if (isPersistingRotation || isUploading || !isHydrated) {
+      // Review shortcuts act on the selected image, which the grid does not show.
+      if (
+        viewMode !== "review" ||
+        isPersistingRotation ||
+        isUploading ||
+        !isHydrated
+      ) {
         return;
       }
 
@@ -1211,6 +1918,7 @@ function App() {
     selectedIndex,
     selectedPair?.backPath,
     toggleDoNotUpload,
+    viewMode,
   ]);
 
   /**
@@ -1220,7 +1928,7 @@ function App() {
    * @param value - The new value for the field.
    */
   const updateFormField = (field: "date" | "description", value: string) => {
-    hasUserChangedRef.current = true;
+    markUserChanged();
     setMetadata((current) => ({ ...current, [field]: value }));
   };
 
@@ -1230,7 +1938,7 @@ function App() {
    * @param tags - The new array of tag strings.
    */
   const updateTags = (tags: string[]) => {
-    hasUserChangedRef.current = true;
+    markUserChanged();
     setMetadata((current) => ({ ...current, tags }));
   };
 
@@ -1304,7 +2012,6 @@ function App() {
   ) => {
     const digits = value.replace(/\D/g, "").slice(0, field === "year" ? 4 : 2);
     const next = { ...dateSegmentsRef.current, [field]: digits };
-    clearPendingSave();
     updateDateSegments(next);
 
     // Advance once the segment is complete, including single digits that cannot start a
@@ -1427,22 +2134,14 @@ function App() {
       return;
     }
 
-    clearPendingSave();
     updateDateSegments(next);
     const formValues =
       nextDate === metadata.date ? metadata : { ...metadata, date: nextDate };
 
     if (selectedIndex + 1 >= displayPairs.length) {
       if (selectedPair && hasUserChangedRef.current) {
-        try {
-          await savePairMetadata(selectedPair, formValues);
+        if (await persistCurrentPair(formValues)) {
           setStatus(formatSavedStatus(selectedPair.imageLabel));
-        } catch (error) {
-          setStatus(
-            error instanceof Error
-              ? error.message
-              : "Unable to save the metadata.",
-          );
         }
       }
       return;
@@ -1469,40 +2168,73 @@ function App() {
     setStatus("Scanning directory for photos...");
 
     try {
-      const selectedDirectory = await chooseDirectory(
+      const selection = await chooseDirectory(
         window.electronAPI.browseDirectory,
       );
-      if (!selectedDirectory) {
+      if (!selection) {
         setStatus("No directory selected.");
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
-      setStatus("Scanning directory for photos...");
-      const result = await window.electronAPI.readDirectory(
-        selectedDirectory,
-        sortBy,
+      setStatus("Saving changes...");
+      const unsavedImages = await waitForPendingSaves();
+      if (
+        unsavedImages.length &&
+        !window.confirm(
+          `Changes to ${unsavedImages.join(", ")} could not be saved and will be lost. Open the other folder anyway?`,
+        )
+      ) {
+        setStatus(
+          `Stayed in this folder.${describeUnsavedImages(unsavedImages)}`,
+        );
+        return;
+      }
+
+      setStatus(
+        selection.recursive
+          ? "Scanning directory and nested folders for photos..."
+          : "Scanning directory for photos...",
       );
+      const result = await window.electronAPI.readDirectory(
+        selection.path,
+        sortBy,
+        selection.recursive,
+      );
+      unsavedEditsRef.current.clear();
+      sidecarPrefetchRef.current.clear();
+      setImageVersions({});
       setDirectoryPath(result.directoryPath);
+      setIncludeNested(result.recursive);
+      setFolderCount(result.folderCount);
+      setFolderState(result.folderState);
+      setHasSubfolders(result.hasSubfolders);
+      setIncludeSubfoldersInProcessed(false);
+      setFolderProcessedError("");
+      setHasUploadedFolder(false);
       setIsHydrated(false);
       setPairs(result.files);
       resetSavedPairs();
+      setViewMode("grid");
+      setGridFocusPairId(null);
       setImageFilter("all");
       setRecentTags(result.recentTags);
       setImageNumberInput("1");
       setSelectedPairId(result.files[0]?.id ?? null);
 
       if (!result.files.length) {
-        setStatus("No supported images were found in that directory.");
+        setStatus(
+          result.recursive
+            ? "No supported images were found in that directory or its nested folders."
+            : "No supported images were found in that directory.",
+        );
         return;
       }
 
-      setStatus(
-        `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
-      );
+      setStatus(describeLoadedGroups(result));
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -1526,7 +2258,7 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
@@ -1534,23 +2266,27 @@ function App() {
       setStatus("Sorting photos...");
 
       try {
+        await waitForPendingSaves();
         const result = await window.electronAPI.readDirectory(
           directoryPath,
           nextSortBy,
+          includeNested,
         );
+        sidecarPrefetchRef.current.clear();
+        setImageVersions({});
         setSortBy(nextSortBy);
+        setFolderCount(result.folderCount);
+        setFolderState(result.folderState);
+        setHasSubfolders(result.hasSubfolders);
         setIsHydrated(false);
         setPairs(result.files);
         resetSavedPairs();
         setRecentTags(result.recentTags);
         setImageNumberInput("1");
         setSelectedPairId(
-          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ??
-            null,
+          filterImagePairs(result.files, imageFilter, new Set())[0]?.id ?? null,
         );
-        setStatus(
-          `Loaded ${result.files.length} photo group${result.files.length === 1 ? "" : "s"}.`,
-        );
+        setStatus(describeLoadedGroups(result));
       } catch (error) {
         setStatus(
           error instanceof Error
@@ -1561,7 +2297,14 @@ function App() {
         setIsBusy(false);
       }
     },
-    [directoryPath, imageFilter, persistCurrentPair, resetSavedPairs],
+    [
+      directoryPath,
+      imageFilter,
+      includeNested,
+      persistReviewedPair,
+      resetSavedPairs,
+      waitForPendingSaves,
+    ],
   );
 
   /**
@@ -1575,10 +2318,11 @@ function App() {
         return;
       }
 
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         return;
       }
 
+      await waitForPendingSaves();
       // Take the snapshot now: images saved later stay in this list until the
       // filter is changed again or the folder is reloaded.
       const snapshot = savedPairIdsRef.current;
@@ -1592,8 +2336,54 @@ function App() {
       setSelectedPairId(firstPairId);
       setImageNumberInput("1");
     },
-    [imageFilter, pairs, persistCurrentPair, selectedPairId],
+    [
+      imageFilter,
+      pairs,
+      persistReviewedPair,
+      selectedPairId,
+      waitForPendingSaves,
+    ],
   );
+
+  /**
+   * Opens an image from the grid in Review. The grid saves no metadata, so there is nothing to
+   * save first; a grid rotation still being written is shown, and Review loads after it.
+   * @param pairId - The ID of the image group to review.
+   */
+  const openPairInReview = useCallback(
+    (pairId: string) => {
+      const index = displayPairs.findIndex((pair) => pair.id === pairId);
+      if (index === -1) {
+        return;
+      }
+
+      if (pairId !== selectedPairId) {
+        setIsHydrated(false);
+        setSelectedPairId(pairId);
+      }
+      setImageNumberInput(String(index + 1));
+      setViewMode("review");
+    },
+    [displayPairs, selectedPairId],
+  );
+
+  /**
+   * Saves the reviewed image, then returns to the grid with that image focused.
+   * Waits for the save so the grid shows the new date; stays in Review when it fails,
+   * and the status bar explains why.
+   */
+  const returnToGrid = useCallback(async () => {
+    if (viewMode === "grid") {
+      return;
+    }
+
+    if (!(await persistCurrentPair())) {
+      return;
+    }
+
+    setGridFocusPairId(selectedPair?.id ?? null);
+    setViewMode("grid");
+  }, [persistCurrentPair, selectedPair, viewMode]);
 
   /**
    * Updates an Immich setting field with a new value and persists it to storage.
@@ -1626,9 +2416,17 @@ function App() {
 
     try {
       setImmichStatus("Applying pending image rotation before upload...");
-      if (!(await persistCurrentPair())) {
+      if (!(await persistReviewedPair())) {
         setImmichStatus(
           "Upload stopped because an image rotation could not be persisted.",
+        );
+        return;
+      }
+
+      const unsavedImages = await waitForPendingSaves();
+      if (unsavedImages.length) {
+        setImmichStatus(
+          `Upload stopped because changes to ${unsavedImages.join(", ")} could not be saved. Open those images to retry.`,
         );
         return;
       }
@@ -1636,16 +2434,23 @@ function App() {
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
+      setHasUploadedFolder(false);
       isImmichOutputFollowingRef.current = true;
-      setImmichStatus("Uploading the selected directory to Immich...");
+      setImmichStatus(
+        includeNested
+          ? "Uploading the selected directory and its nested folders to Immich..."
+          : "Uploading the selected directory to Immich...",
+      );
       const savedSettings =
         await electronApi.saveImmichSettings(immichSettings);
       setImmichSettings(savedSettings);
       const result = await electronApi.uploadToImmich(
         savedSettings,
         directoryPath,
+        includeNested,
       );
       setImmichOutput(result.output);
+      setHasUploadedFolder(result.ok);
       setImmichStatus(
         result.ok
           ? "Immich upload completed successfully."
@@ -1680,8 +2485,29 @@ function App() {
         throw new Error("API is not available.");
       }
 
-      const result = await electronApi.setFolderDate(directoryPath, date);
+      await waitForPendingSaves();
+      const result = await electronApi.setFolderDate(
+        directoryPath,
+        date,
+        includeNested,
+      );
       const failedLabels = result.errors.map((error) => error.split(": ")[0]);
+      // The bulk write skips flagged groups and groups that already have a sidecar.
+      const datedPairIds = pairs
+        .filter(
+          (pair) =>
+            !pair.doNotUpload &&
+            !isPairProcessed(pair, savedPairIdsRef.current) &&
+            !failedLabels.includes(pair.imageLabel),
+        )
+        .map((pair) => pair.id);
+      setSavedDates((current) => {
+        const next = new Map(current);
+        for (const id of datedPairIds) {
+          next.set(id, date);
+        }
+        return next;
+      });
       markPairsSaved(
         pairs
           .filter((pair) => !failedLabels.includes(pair.imageLabel))
@@ -1718,7 +2544,9 @@ function App() {
       setIsSetFolderDateModalOpen(false);
       // Reload the current pair's metadata to reflect any write that may have
       // affected the currently displayed image.
+      sidecarPrefetchRef.current.clear();
       setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
     } catch (error) {
       setStatus(
         error instanceof Error
@@ -1729,22 +2557,74 @@ function App() {
       setIsSettingFolderDate(false);
     }
   };
+  /**
+   * Marks the open folder, and optionally every subfolder, as processed or not processed.
+   * @param value - Whether the folder is processed.
+   * @param includeSubfolders - Whether to mark every subfolder the same way.
+   */
+  const handleSetFolderProcessed = async (
+    value: boolean,
+    includeSubfolders: boolean,
+  ) => {
+    const electronApi = window.electronAPI;
+    if (!electronApi || !directoryPath) {
+      return;
+    }
+
+    setIsSettingFolderProcessed(true);
+    setFolderProcessedError("");
+    try {
+      const result = await electronApi.setFolderProcessed(
+        directoryPath,
+        value,
+        includeSubfolders,
+      );
+      setFolderState(result.state);
+      const scope =
+        result.updatedFolders === 1
+          ? "this folder"
+          : `${result.updatedFolders} folders`;
+      setStatus(`Marked ${scope} as ${value ? "processed" : "not processed"}.`);
+      if (!result.ok) {
+        setFolderProcessedError(
+          `Some subfolders could not be marked: ${result.errors.join("; ")}`,
+        );
+      }
+    } catch (error) {
+      setFolderProcessedError(
+        error instanceof Error
+          ? error.message
+          : "Unable to change the folder's processed state.",
+      );
+    } finally {
+      setIsSettingFolderProcessed(false);
+    }
+  };
+  const managedImmichFields = immichSettings.managed;
   const canUploadToImmich =
     Boolean(directoryPath) &&
-    Boolean(immichSettings.serverUrl.trim()) &&
-    Boolean(immichSettings.userApiKey.trim());
+    (Boolean(managedImmichFields?.serverUrl) ||
+      Boolean(immichSettings.serverUrl.trim())) &&
+    (Boolean(managedImmichFields?.userApiKey) ||
+      Boolean(immichSettings.userApiKey.trim()));
   const isTransitionLocked =
     isBusy ||
     isPersistingRotation ||
     isUploading ||
     isSettingFolderDate ||
+    isSettingFolderProcessed ||
     isTogglingDoNotUpload;
   const flaggedPairCount = pairs.filter((pair) => pair.doNotUpload).length;
+  const folderNestedDescription = `(including nested folders, ${folderCount} folder${folderCount === 1 ? "" : "s"})`;
   const selectedDoNotUploadError =
     doNotUploadError && doNotUploadError.pairId === selectedPair?.id
       ? doNotUploadError.message
       : "";
   const isImageControlLocked = isTransitionLocked || !isHydrated;
+  const getDisplayedVersion = (
+    filePath: string | null,
+    listedVersion: string | null,
+  ) => (filePath ? (imageVersions[filePath] ?? listedVersion ?? "") : "");
   const imageStackStyle: ImageStackStyle = {
     "--collapsed-image-height": `${collapsedImageHeight}px`,
   };
@@ -1773,7 +2653,11 @@ function App() {
               className="secondary-button"
               onClick={() => setIsSetFolderDateModalOpen(true)}
               disabled={isTransitionLocked}
-              title="Set a date for all images in this folder that don't yet have saved metadata"
+              title={
+                includeNested
+                  ? "Set a date for all images in this folder and its nested folders that don't yet have saved metadata"
+                  : "Set a date for all images in this folder that don't yet have saved metadata"
+              }
             >
               {isSettingFolderDate ? "Setting date\u2026" : "Set date for all"}
             </button>
@@ -1791,7 +2675,55 @@ function App() {
 
       <div className="status-bar">
         <span>{status}</span>
-        {directoryPath ? <strong>{directoryPath}</strong> : null}
+        {pendingSaveCount > 0 ? (
+          <span className="save-indicator" role="status">
+            Saving {pendingSaveCount} image{pendingSaveCount === 1 ? "" : "s"}…
+          </span>
+        ) : null}
+        {directoryPath ? (
+          <div className="folder-processed">
+            <strong>{directoryPath}</strong>
+            {includeNested ? (
+              <span className="folder-nested">{folderNestedDescription}</span>
+            ) : null}
+            <button
+              type="button"
+              className="processed-toggle"
+              aria-pressed={folderState.processed}
+              title={describeFolderState(folderState)}
+              onClick={() =>
+                void handleSetFolderProcessed(
+                  !folderState.processed,
+                  hasSubfolders && includeSubfoldersInProcessed,
+                )
+              }
+              disabled={isTransitionLocked}
+            >
+              <span aria-hidden="true">
+                {folderState.processed ? "✓" : "○"}
+              </span>{" "}
+              Processed
+            </button>
+            {hasSubfolders ? (
+              <label className="processed-subfolders">
+                <input
+                  type="checkbox"
+                  checked={includeSubfoldersInProcessed}
+                  onChange={(event) =>
+                    setIncludeSubfoldersInProcessed(event.target.checked)
+                  }
+                  disabled={isTransitionLocked}
+                />
+                Include subfolders
+              </label>
+            ) : null}
+            {folderProcessedError ? (
+              <span className="folder-processed-error" role="alert">
+                {folderProcessedError}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
       </div>
 
       {!directoryPath ? (
@@ -1800,217 +2732,30 @@ function App() {
         </section>
       ) : (
         <main className="workspace">
-          <aside className="metadata-panel">
-            <div className="metadata-grid">
-              <fieldset className="metadata-date">
-                <legend>Date</legend>
-                <div className="date-segments">
-                  <input
-                    ref={dateInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={2}
-                    aria-label="Month"
-                    value={dateSegments.month}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("month", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("month")}
-                    onKeyDown={(event) =>
-                      void handleDateKeyDown(event, "month")
-                    }
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                  <span aria-hidden="true">/</span>
-                  <input
-                    ref={dayInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={2}
-                    aria-label="Day"
-                    value={dateSegments.day}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("day", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("day")}
-                    onKeyDown={(event) => void handleDateKeyDown(event, "day")}
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                  <span aria-hidden="true">/</span>
-                  <input
-                    ref={yearInputRef}
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={4}
-                    aria-label="Year"
-                    value={dateSegments.year}
-                    {...selectAllOnFocusProps}
-                    onChange={(event) =>
-                      handleDateSegmentChange("year", event.target.value)
-                    }
-                    onBlur={() => handleDateSegmentBlur("year")}
-                    onKeyDown={(event) => void handleDateKeyDown(event, "year")}
-                    disabled={isPersistingRotation || isUploading}
-                  />
-                </div>
-              </fieldset>
-
-              <label className="metadata-description">
-                Description
-                <input
-                  ref={descriptionInputRef}
-                  type="text"
-                  value={metadata.description}
-                  {...selectAllOnFocusProps}
-                  onChange={(event) =>
-                    updateFormField("description", event.target.value)
-                  }
-                  placeholder="Image description"
-                  onKeyDown={(event) => void handleDescriptionKeyDown(event)}
-                  disabled={isPersistingRotation || isUploading}
-                />
-              </label>
-
-              <details
-                className="metadata-details"
-                open={isMetadataEntryExpanded}
-                onToggle={(event) =>
-                  setIsMetadataEntryExpanded(event.currentTarget.open)
-                }
+          <div className="view-bar">
+            <div className="view-switch" role="group" aria-label="View">
+              <button
+                type="button"
+                aria-pressed={viewMode === "grid"}
+                onClick={() => void returnToGrid()}
+                disabled={isTransitionLocked}
               >
-                <summary className="metadata-details-summary">
-                  <span>Tags</span>
-                  <span className="metadata-details-action">
-                    {isMetadataEntryExpanded ? "Collapse" : "Expand"}
-                  </span>
-                </summary>
-                <div className="metadata-details-content">
-                  <div className="metadata-tags">
-                    <label htmlFor="new-tag">Tags</label>
-                    <div className="tag-entry">
-                      <input
-                        id="new-tag"
-                        ref={tagInputRef}
-                        type="text"
-                        value={tagInput}
-                        onChange={(event) => setTagInput(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" || event.key === ",") {
-                            event.preventDefault();
-                            addTag();
-                          }
-                        }}
-                        placeholder="Type a new tag"
-                        disabled={isPersistingRotation || isUploading}
-                      />
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={addTag}
-                        disabled={
-                          !tagInput.trim() ||
-                          isPersistingRotation ||
-                          isUploading
-                        }
-                      >
-                        Add
-                      </button>
-                    </div>
-                  </div>
-
-                  {metadata.tags.length ? (
-                    <div className="selected-tags" aria-label="Selected tags">
-                      {metadata.tags.map((tag) => (
-                        <button
-                          key={tag.toLocaleLowerCase()}
-                          type="button"
-                          onClick={() => toggleTag(tag)}
-                          disabled={isPersistingRotation || isUploading}
-                          aria-label={`Remove ${tag}`}
-                        >
-                          {tag} <span aria-hidden="true">&times;</span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  <fieldset className="recent-tags">
-                    <legend>Recent tags</legend>
-                    {recentTags.length ? (
-                      <div className="recent-tag-options">
-                        {recentTags.map((tag) => (
-                          <label key={tag.toLocaleLowerCase()}>
-                            <input
-                              type="checkbox"
-                              checked={metadata.tags.some(
-                                (selectedTag) =>
-                                  selectedTag.toLocaleLowerCase() ===
-                                  tag.toLocaleLowerCase(),
-                              )}
-                              onChange={() => toggleTag(tag)}
-                              disabled={isPersistingRotation || isUploading}
-                            />
-                            <span>{tag}</span>
-                          </label>
-                        ))}
-                      </div>
-                    ) : (
-                      <span className="field-help">
-                        Tags from recently modified XMP files appear here.
-                      </span>
-                    )}
-                  </fieldset>
-                </div>
-              </details>
-
-              <div className="do-not-upload">
-                <button
-                  type="button"
-                  className={`secondary-button do-not-upload-toggle${
-                    selectedPair?.doNotUpload
-                      ? " do-not-upload-toggle--active"
-                      : ""
-                  }`}
-                  aria-label="Do not upload"
-                  aria-pressed={selectedPair?.doNotUpload ?? false}
-                  aria-describedby="do-not-upload-help"
-                  title="Do not upload (Space)"
-                  onClick={() => void toggleDoNotUpload()}
-                  disabled={!selectedPair || isImageControlLocked}
-                >
-                  <svg
-                    className="do-not-upload-icon"
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
-                    focusable="false"
-                  >
-                    <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
-                  </svg>
-                </button>
-                <span id="do-not-upload-help" className="visually-hidden">
-                  Press Space to toggle. Flagged files are renamed with
-                  &ldquo;_exclude&rdquo; and skipped by Immich uploads.
-                </span>
-              </div>
+                Grid
+              </button>
+              <button
+                type="button"
+                aria-pressed={viewMode === "review"}
+                onClick={() => {
+                  if (selectedPair) {
+                    openPairInReview(selectedPair.id);
+                  }
+                }}
+                disabled={!selectedPair || isTransitionLocked}
+              >
+                Review
+              </button>
             </div>
-
-            {selectedPair?.excludeMismatch ? (
-              <p className="do-not-upload-warning" role="status">
-                Only one side of this group is flagged Do not upload. Toggle the
-                flag to rename both sides to match.
-              </p>
-            ) : null}
-            {selectedDoNotUploadError ? (
-              <p className="do-not-upload-error" role="alert">
-                {selectedDoNotUploadError}
-              </p>
-            ) : null}
-          </aside>
-
-          <section className="viewer-panel">
-            <div className="viewer-toolbar">
+            <div className="view-bar-controls">
               <label className="sort-control">
                 <span>Sort by</span>
                 <select
@@ -2057,159 +2802,433 @@ function App() {
                   ))}
                 </select>
               </label>
-              <label
-                className="size-control"
-                title={
-                  isExpanded
-                    ? "Image height applies to the collapsed view"
-                    : undefined
-                }
-              >
-                <span>Image height</span>
-                <input
-                  type="range"
-                  min={MIN_COLLAPSED_IMAGE_HEIGHT}
-                  max={MAX_COLLAPSED_IMAGE_HEIGHT}
-                  step={COLLAPSED_IMAGE_HEIGHT_STEP}
-                  value={collapsedImageHeight}
-                  onChange={(event) =>
-                    setCollapsedImageHeight(
-                      clampCollapsedImageHeight(Number(event.target.value)),
-                    )
-                  }
-                  aria-valuetext={`${collapsedImageHeight} pixels`}
-                  disabled={isExpanded}
-                />
-                <output aria-hidden="true">{collapsedImageHeight}px</output>
-              </label>
-              <button
-                type="button"
-                onClick={() => void navigateToIndex(selectedIndex - 1)}
-                disabled={selectedIndex === 0 || isImageControlLocked}
-              >
-                Previous
-              </button>
-
-              <label className="image-counter">
-                <span className="visually-hidden">Go to image</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={displayPairs.length}
-                  value={imageNumberInput}
-                  onChange={(event) => setImageNumberInput(event.target.value)}
-                  onKeyDown={handleImageNumberKeyDown}
-                  disabled={isImageControlLocked}
-                  aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
-                />
-                <span aria-hidden="true">/ {displayPairs.length}</span>
-              </label>
-              <button
-                type="button"
-                onClick={() => void navigateToIndex(selectedIndex + 1)}
-                disabled={
-                  selectedIndex >= displayPairs.length - 1 ||
-                  isImageControlLocked
-                }
-              >
-                Next
-              </button>
             </div>
+          </div>
 
-            <div
-              className={`image-stack${
-                !selectedPair || !selectedPair.backPath || isExpanded
-                  ? " image-stack--single"
-                  : ""
-              }${isExpanded ? " image-stack--expanded" : ""}`}
-              style={imageStackStyle}
-            >
-              {displayPairs.length > 0 ? (
-                <>
-                  <div className="image-card">
-                    <div className="image-card-header">
-                      <div className="image-label">
-                        Front image
-                        {selectedPair?.doNotUpload ? (
-                          <span className="do-not-upload-badge">
-                            Do not upload
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="image-actions">
-                        <button
-                          type="button"
-                          onClick={() => rotateImage("front", -90)}
-                          disabled={isImageControlLocked}
-                        >
-                          Rotate left
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => rotateImage("front", 90)}
-                          disabled={isImageControlLocked}
-                        >
-                          Rotate right
-                        </button>
-                        <button
-                          type="button"
-                          onClick={toggleExpanded}
-                          disabled={isImageControlLocked}
-                        >
-                          {isExpanded ? "Collapse" : "Expand"}
-                        </button>
-                      </div>
+          {viewMode === "grid" ? (
+            <section className="viewer-panel grid-panel" aria-label="Images">
+              <ThumbnailGrid
+                key={directoryPath}
+                cells={gridCells}
+                focusCellId={gridFocusPairId}
+                emptyMessage={getEmptyFilterMessage(imageFilter, pairs.length)}
+                onOpen={openPairInReview}
+                onRotate={rotateFromGrid}
+                canRotate={!isUploading}
+              />
+            </section>
+          ) : (
+            <>
+              <aside className="metadata-panel">
+                <div className="metadata-grid">
+                  <fieldset className="metadata-date">
+                    <legend>Date</legend>
+                    <div className="date-segments">
+                      <input
+                        ref={dateInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        aria-label="Month"
+                        value={dateSegments.month}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("month", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("month")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "month")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
+                      <span aria-hidden="true">/</span>
+                      <input
+                        ref={dayInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={2}
+                        aria-label="Day"
+                        value={dateSegments.day}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("day", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("day")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "day")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
+                      <span aria-hidden="true">/</span>
+                      <input
+                        ref={yearInputRef}
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={4}
+                        aria-label="Year"
+                        value={dateSegments.year}
+                        {...selectAllOnFocusProps}
+                        onChange={(event) =>
+                          handleDateSegmentChange("year", event.target.value)
+                        }
+                        onBlur={() => handleDateSegmentBlur("year")}
+                        onKeyDown={(event) =>
+                          void handleDateKeyDown(event, "year")
+                        }
+                        disabled={isPersistingRotation || isUploading}
+                      />
                     </div>
-                    <MagnifiedImage
-                      filePath={selectedPair?.frontPath ?? ""}
-                      altText={`${selectedPair?.imageLabel ?? ""}`}
-                      rotation={rotations.front}
-                    />
-                  </div>
+                  </fieldset>
 
-                  {selectedPair && selectedPair.backPath ? (
-                    <div className="image-card">
-                      <div className="image-card-header">
-                        <div className="image-label">Back image</div>
-                        <div className="image-actions">
+                  <label className="metadata-description">
+                    Description
+                    <input
+                      ref={descriptionInputRef}
+                      type="text"
+                      value={metadata.description}
+                      {...selectAllOnFocusProps}
+                      onChange={(event) =>
+                        updateFormField("description", event.target.value)
+                      }
+                      placeholder="Image description"
+                      onKeyDown={(event) =>
+                        void handleDescriptionKeyDown(event)
+                      }
+                      disabled={isPersistingRotation || isUploading}
+                    />
+                  </label>
+
+                  <details
+                    className="metadata-details"
+                    open={isMetadataEntryExpanded}
+                    onToggle={(event) =>
+                      setIsMetadataEntryExpanded(event.currentTarget.open)
+                    }
+                  >
+                    <summary className="metadata-details-summary">
+                      <span>Tags</span>
+                      <span className="metadata-details-action">
+                        {isMetadataEntryExpanded ? "Collapse" : "Expand"}
+                      </span>
+                    </summary>
+                    <div className="metadata-details-content">
+                      <div className="metadata-tags">
+                        <label htmlFor="new-tag">Tags</label>
+                        <div className="tag-entry">
+                          <input
+                            id="new-tag"
+                            ref={tagInputRef}
+                            type="text"
+                            value={tagInput}
+                            onChange={(event) =>
+                              setTagInput(event.target.value)
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === ",") {
+                                event.preventDefault();
+                                addTag();
+                              }
+                            }}
+                            placeholder="Type a new tag"
+                            disabled={isPersistingRotation || isUploading}
+                          />
                           <button
                             type="button"
-                            onClick={() => rotateImage("back", -90)}
-                            disabled={isImageControlLocked}
+                            className="secondary-button"
+                            onClick={addTag}
+                            disabled={
+                              !tagInput.trim() ||
+                              isPersistingRotation ||
+                              isUploading
+                            }
                           >
-                            Rotate left
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => rotateImage("back", 90)}
-                            disabled={isImageControlLocked}
-                          >
-                            Rotate right
-                          </button>
-                          <button
-                            type="button"
-                            onClick={toggleExpanded}
-                            disabled={isImageControlLocked}
-                          >
-                            {isExpanded ? "Collapse" : "Expand"}
+                            Add
                           </button>
                         </div>
                       </div>
-                      <MagnifiedImage
-                        filePath={selectedPair?.backPath ?? ""}
-                        altText={`${selectedPair?.imageLabel ?? ""} backside`}
-                        rotation={rotations.back}
-                      />
+
+                      {metadata.tags.length ? (
+                        <div
+                          className="selected-tags"
+                          aria-label="Selected tags"
+                        >
+                          {metadata.tags.map((tag) => (
+                            <button
+                              key={tag.toLocaleLowerCase()}
+                              type="button"
+                              onClick={() => toggleTag(tag)}
+                              disabled={isPersistingRotation || isUploading}
+                              aria-label={`Remove ${tag}`}
+                            >
+                              {tag} <span aria-hidden="true">&times;</span>
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <fieldset className="recent-tags">
+                        <legend>Recent tags</legend>
+                        {recentTags.length ? (
+                          <div className="recent-tag-options">
+                            {recentTags.map((tag) => (
+                              <label key={tag.toLocaleLowerCase()}>
+                                <input
+                                  type="checkbox"
+                                  checked={metadata.tags.some(
+                                    (selectedTag) =>
+                                      selectedTag.toLocaleLowerCase() ===
+                                      tag.toLocaleLowerCase(),
+                                  )}
+                                  onChange={() => toggleTag(tag)}
+                                  disabled={isPersistingRotation || isUploading}
+                                />
+                                <span>{tag}</span>
+                              </label>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="field-help">
+                            Tags from recently modified XMP files appear here.
+                          </span>
+                        )}
+                      </fieldset>
                     </div>
-                  ) : null}
-                </>
-              ) : (
-                <p role="status">
-                  {getEmptyFilterMessage(imageFilter, pairs.length)}
-                </p>
-              )}
-            </div>
-          </section>
+                  </details>
+
+                  <div className="do-not-upload">
+                    <button
+                      type="button"
+                      className={`secondary-button do-not-upload-toggle${
+                        selectedPair?.doNotUpload
+                          ? " do-not-upload-toggle--active"
+                          : ""
+                      }`}
+                      aria-label="Do not upload"
+                      aria-pressed={selectedPair?.doNotUpload ?? false}
+                      aria-describedby="do-not-upload-help"
+                      title="Do not upload (Space)"
+                      onClick={() => void toggleDoNotUpload()}
+                      disabled={!selectedPair || isImageControlLocked}
+                    >
+                      <svg
+                        className="do-not-upload-icon"
+                        viewBox="0 0 24 24"
+                        aria-hidden="true"
+                        focusable="false"
+                      >
+                        <path d="M12 16V5M7 10l5-5 5 5M5 19h14M4 4l16 16" />
+                      </svg>
+                    </button>
+                    <span id="do-not-upload-help" className="visually-hidden">
+                      Press Space to toggle. Flagged files are renamed with
+                      &ldquo;_exclude&rdquo; and skipped by Immich uploads.
+                    </span>
+                  </div>
+                </div>
+
+                {selectedPair?.excludeMismatch ? (
+                  <p className="do-not-upload-warning" role="status">
+                    Only one side of this group is flagged Do not upload. Toggle
+                    the flag to rename both sides to match.
+                  </p>
+                ) : null}
+                {selectedDoNotUploadError ? (
+                  <p className="do-not-upload-error" role="alert">
+                    {selectedDoNotUploadError}
+                  </p>
+                ) : null}
+              </aside>
+
+              <section className="viewer-panel">
+                <div className="viewer-toolbar">
+                  <button
+                    type="button"
+                    className="back-to-grid"
+                    onClick={() => void returnToGrid()}
+                    disabled={isTransitionLocked}
+                  >
+                    <span aria-hidden="true">&larr;</span> Back to grid
+                  </button>
+                  <label
+                    className="size-control"
+                    title={
+                      isExpanded
+                        ? "Image height applies to the collapsed view"
+                        : undefined
+                    }
+                  >
+                    <span>Image height</span>
+                    <input
+                      type="range"
+                      min={MIN_COLLAPSED_IMAGE_HEIGHT}
+                      max={MAX_COLLAPSED_IMAGE_HEIGHT}
+                      step={COLLAPSED_IMAGE_HEIGHT_STEP}
+                      value={collapsedImageHeight}
+                      onChange={(event) =>
+                        setCollapsedImageHeight(
+                          clampCollapsedImageHeight(Number(event.target.value)),
+                        )
+                      }
+                      aria-valuetext={`${collapsedImageHeight} pixels`}
+                      disabled={isExpanded}
+                    />
+                    <output aria-hidden="true">{collapsedImageHeight}px</output>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void navigateToIndex(selectedIndex - 1)}
+                    disabled={selectedIndex === 0 || isImageControlLocked}
+                  >
+                    Previous
+                  </button>
+
+                  <label className="image-counter">
+                    <span className="visually-hidden">Go to image</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={displayPairs.length}
+                      value={imageNumberInput}
+                      onChange={(event) =>
+                        setImageNumberInput(event.target.value)
+                      }
+                      onKeyDown={handleImageNumberKeyDown}
+                      disabled={isImageControlLocked}
+                      aria-label={`Go to image number, current image ${selectedIndex + 1} of ${displayPairs.length}`}
+                    />
+                    <span aria-hidden="true">/ {displayPairs.length}</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => void navigateToIndex(selectedIndex + 1)}
+                    disabled={
+                      selectedIndex >= displayPairs.length - 1 ||
+                      isImageControlLocked
+                    }
+                  >
+                    Next
+                  </button>
+                </div>
+
+                <div
+                  className={`image-stack${
+                    !selectedPair || !selectedPair.backPath || isExpanded
+                      ? " image-stack--single"
+                      : ""
+                  }${isExpanded ? " image-stack--expanded" : ""}`}
+                  style={imageStackStyle}
+                >
+                  {displayPairs.length > 0 ? (
+                    <>
+                      <div className="image-card">
+                        <div className="image-card-header">
+                          <div className="image-label">
+                            Front image
+                            {selectedPair?.doNotUpload ? (
+                              <span className="do-not-upload-badge">
+                                Do not upload
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="image-actions">
+                            <button
+                              type="button"
+                              onClick={() => rotateImage("front", -90)}
+                              disabled={isImageControlLocked}
+                            >
+                              Rotate left
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => rotateImage("front", 90)}
+                              disabled={isImageControlLocked}
+                            >
+                              Rotate right
+                            </button>
+                            <button
+                              type="button"
+                              onClick={toggleExpanded}
+                              disabled={isImageControlLocked}
+                            >
+                              {isExpanded ? "Collapse" : "Expand"}
+                            </button>
+                          </div>
+                        </div>
+                        <MagnifiedImage
+                          filePath={
+                            selectedPair && readyPairId === selectedPair.id
+                              ? selectedPair.frontPath
+                              : ""
+                          }
+                          version={getDisplayedVersion(
+                            selectedPair?.frontPath ?? null,
+                            selectedPair?.frontVersion ?? null,
+                          )}
+                          altText={`${selectedPair?.imageLabel ?? ""}`}
+                          rotation={normalizeRotation(
+                            rotations.front +
+                              (gridRotations.get(selectedPair?.id ?? "") ?? 0),
+                          )}
+                          isExpanded={isExpanded}
+                          collapsedHeight={collapsedImageHeight}
+                        />
+                      </div>
+
+                      {selectedPair && selectedPair.backPath ? (
+                        <div className="image-card">
+                          <div className="image-card-header">
+                            <div className="image-label">Back image</div>
+                            <div className="image-actions">
+                              <button
+                                type="button"
+                                onClick={() => rotateImage("back", -90)}
+                                disabled={isImageControlLocked}
+                              >
+                                Rotate left
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => rotateImage("back", 90)}
+                                disabled={isImageControlLocked}
+                              >
+                                Rotate right
+                              </button>
+                              <button
+                                type="button"
+                                onClick={toggleExpanded}
+                                disabled={isImageControlLocked}
+                              >
+                                {isExpanded ? "Collapse" : "Expand"}
+                              </button>
+                            </div>
+                          </div>
+                          <MagnifiedImage
+                            filePath={
+                              readyPairId === selectedPair.id
+                                ? selectedPair.backPath
+                                : ""
+                            }
+                            version={getDisplayedVersion(
+                              selectedPair.backPath,
+                              selectedPair.backVersion,
+                            )}
+                            altText={`${selectedPair?.imageLabel ?? ""} backside`}
+                            rotation={rotations.back}
+                            isExpanded={isExpanded}
+                            collapsedHeight={collapsedImageHeight}
+                          />
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p role="status">
+                      {getEmptyFilterMessage(imageFilter, pairs.length)}
+                    </p>
+                  )}
+                </div>
+              </section>
+            </>
+          )}
 
           <details className="immich-panel">
             <summary className="immich-panel-summary">
@@ -2223,7 +3242,10 @@ function App() {
             </summary>
 
             <div className="immich-content">
-              <span className="immich-directory">Uploads: {directoryPath}</span>
+              <span className="immich-directory">
+                Uploads: {directoryPath}
+                {includeNested ? ` ${folderNestedDescription}` : ""}
+              </span>
               {flaggedPairCount > 0 ? (
                 <span className="immich-skipped">
                   {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
@@ -2232,51 +3254,72 @@ function App() {
               ) : null}
 
               <div className="immich-grid">
-                <label>
-                  Server URL
-                  <input
-                    type="url"
-                    value={immichSettings.serverUrl}
-                    onChange={(event) =>
-                      updateImmichSetting("serverUrl", event.target.value)
-                    }
-                    placeholder="https://photos.example.com"
-                    required
-                    disabled={isUploading}
-                  />
-                </label>
+                {managedImmichFields?.serverUrl ? (
+                  // Shown as text, not a read-only input, so it does not look editable.
+                  <div
+                    className="immich-managed-field"
+                    role="group"
+                    aria-labelledby="immich-server-url-label"
+                  >
+                    <span id="immich-server-url-label">Server URL</span>
+                    <span className="immich-managed-value">
+                      {immichSettings.serverUrl}
+                    </span>
+                    <span className="field-help">
+                      Set by your administrator.
+                    </span>
+                  </div>
+                ) : (
+                  <label>
+                    Server URL
+                    <input
+                      type="url"
+                      value={immichSettings.serverUrl}
+                      onChange={(event) =>
+                        updateImmichSetting("serverUrl", event.target.value)
+                      }
+                      placeholder="https://photos.example.com"
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
-                <label>
-                  User API key
-                  <input
-                    type="password"
-                    value={immichSettings.userApiKey}
-                    onChange={(event) =>
-                      updateImmichSetting("userApiKey", event.target.value)
-                    }
-                    autoComplete="new-password"
-                    required
-                    disabled={isUploading}
-                  />
-                </label>
+                {managedImmichFields?.userApiKey ? null : (
+                  <label>
+                    User API key
+                    <input
+                      type="password"
+                      value={immichSettings.userApiKey}
+                      onChange={(event) =>
+                        updateImmichSetting("userApiKey", event.target.value)
+                      }
+                      autoComplete="new-password"
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
-                <label>
-                  Admin API key
-                  <input
-                    type="password"
-                    value={immichSettings.adminApiKey}
-                    onChange={(event) =>
-                      updateImmichSetting("adminApiKey", event.target.value)
-                    }
-                    autoComplete="new-password"
-                    required={immichSettings.pauseImmichJobs}
-                    disabled={isUploading}
-                    aria-describedby="admin-api-key-help"
-                  />
-                  <span id="admin-api-key-help" className="field-help">
-                    Required when pausing Immich jobs.
-                  </span>
-                </label>
+                {managedImmichFields?.adminApiKey ? null : (
+                  <label>
+                    Admin API key
+                    <input
+                      type="password"
+                      value={immichSettings.adminApiKey}
+                      onChange={(event) =>
+                        updateImmichSetting("adminApiKey", event.target.value)
+                      }
+                      autoComplete="new-password"
+                      required={immichSettings.pauseImmichJobs}
+                      disabled={isUploading}
+                      aria-describedby="admin-api-key-help"
+                    />
+                    <span id="admin-api-key-help" className="field-help">
+                      Required when pausing Immich jobs.
+                    </span>
+                  </label>
+                )}
 
                 <label>
                   Target album
@@ -2384,6 +3427,34 @@ function App() {
                   </pre>
                 ) : null}
               </div>
+
+              {hasUploadedFolder && !folderState.processed ? (
+                <div
+                  className="immich-mark-processed"
+                  role="group"
+                  aria-label="Mark folder as processed"
+                >
+                  <span>Mark folder as processed?</span>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void handleSetFolderProcessed(true, false)}
+                    disabled={isTransitionLocked}
+                  >
+                    This folder
+                  </button>
+                  {hasSubfolders ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => void handleSetFolderProcessed(true, true)}
+                      disabled={isTransitionLocked}
+                    >
+                      This folder and all subfolders
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </details>
         </main>
@@ -2392,6 +3463,7 @@ function App() {
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}
         totalCount={pairs.length}
+        nestedFolderCount={includeNested ? folderCount : null}
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}

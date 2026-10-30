@@ -43,23 +43,35 @@ const loadDirectoryListing = (directoryPath: string | null) => {
 // Mirrors the Electron preload bridge so App.tsx works unchanged when served over HTTP.
 const createWebApi = (): ImageParserApi => ({
   browseDirectory: loadDirectoryListing,
-  readDirectory: (directoryPath, sortBy) =>
-    postJson("api/read-directory", { directoryPath, sortBy }),
+  readDirectory: (directoryPath, sortBy, recursive) =>
+    postJson("api/read-directory", { directoryPath, sortBy, recursive }),
   readSidecarMetadata: (filePath) =>
     postJson("api/read-sidecar-metadata", { filePath }),
   saveMetadata: (metadata) => postJson("api/save-metadata", metadata),
-  getPreviewDataUrl: async (filePath, rotation) =>
-    (await postJson<{ url: string }>("api/preview-url", { filePath, rotation }))
-      .url,
+  // Built locally: the version changes whenever the file is rewritten, so the browser can cache each URL.
+  getPreviewDataUrl: async (filePath, version) =>
+    `api/image?${new URLSearchParams({ path: filePath, v: version }).toString()}`,
+  getThumbnailUrl: (filePath, size, version) =>
+    `api/image?${new URLSearchParams({
+      path: filePath,
+      thumb: String(size),
+      v: version,
+    }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
-  setFolderDate: (directoryPath, date) =>
-    postJson("api/set-folder-date", { directoryPath, date }),
+  setFolderDate: (directoryPath, date, recursive) =>
+    postJson("api/set-folder-date", { directoryPath, date, recursive }),
   setDoNotUpload: (request) => postJson("api/do-not-upload", request),
+  setFolderProcessed: (directoryPath, value, includeSubfolders) =>
+    postJson("api/folder-processed", {
+      path: directoryPath,
+      value,
+      includeSubfolders,
+    }),
   loadImmichSettings: () => requestJson("api/immich-settings"),
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
-  uploadToImmich: (settings, directoryPath) =>
-    postJson("api/upload-to-immich", { settings, directoryPath }),
+  uploadToImmich: (settings, directoryPath, recursive) =>
+    postJson("api/upload-to-immich", { settings, directoryPath, recursive }),
   onImmichUploadProgress: (listener) => {
     const eventSource = new EventSource("api/immich-progress");
     eventSource.onmessage = (event) => {
@@ -129,6 +141,11 @@ const connectServerDebugLog = async () => {
     // Debug logging is optional; the app works without it.
   }
 };
+
+/**
+ * Reports whether the app runs in a browser against the web server rather than in Electron.
+ */
+export const isWebApp = () => isWebApiInstalled;
 
 /**
  * Returns the signed-in web user, or null in the desktop app or when the server cannot say.

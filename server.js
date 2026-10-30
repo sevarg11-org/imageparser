@@ -21,24 +21,36 @@ import {
 import {
   allowedExtensions,
   applyImageRotations,
+  configurePreviewCache,
   defaultSortBy,
-  getImageRevision,
+  getImagePreview,
+  getImageVersion,
   getImmichGoDiagnostics,
+  getThumbnail,
   listDirectory,
   loadImmichSettings,
-  needsRenderedPreview,
+  normalizeRotationValue,
   normalizeSortBy,
+  normalizeThumbnailSize,
   readDirectory,
+  readFolderEntry,
   readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
+  whenImageFileOperationsIdle,
 } from "./core.js";
+import {
+  applyManagedImmichSettings,
+  getManagedImmichFields,
+  listManagedFields,
+  readManagedImmichConfig,
+  toClientImmichSettings,
+} from "./managedImmichSettings.js";
 import {
   createAllowedRootsCache,
   isInsideDirectory,
@@ -54,6 +66,10 @@ const configuredRoot = path.resolve(process.env.IMAGEPARSER_ROOT || "/data");
 const configDirectory = path.resolve(
   process.env.IMAGEPARSER_CONFIG_DIR || "/config",
 );
+// Previews are cached under the config directory, never inside the photo root.
+const previewCacheDirectory = path.join(configDirectory, "preview-cache");
+const previewCacheMaxBytes =
+  (Number(process.env.IMAGEPARSER_PREVIEW_CACHE_MB) || 1024) * 1024 * 1024;
 const authUsername = process.env.IMAGEPARSER_USERNAME || "";
 const authPassword = process.env.IMAGEPARSER_PASSWORD || "";
 const debugEnabled = /^(1|true|yes|on)$/i.test(
@@ -73,6 +89,8 @@ const oidcAdminGroup = process.env.OIDC_ADMIN_GROUP || "imageparser-admin";
 const oidcAdminClaim = process.env.OIDC_ADMIN_CLAIM || "imageparser_admin";
 const oidcFoldersClaim =
   process.env.OIDC_FOLDERS_CLAIM || "imageparser_folders";
+const oidcImmichApiKeyClaim =
+  process.env.OIDC_IMMICH_API_KEY_CLAIM || "immich_api_key";
 const oidcAllowInsecureRequests = /^(1|true|yes|on)$/i.test(
   process.env.OIDC_ALLOW_INSECURE_REQUESTS ?? "",
 );
@@ -193,6 +211,20 @@ const resolvePathForUser = async (user, requestedPath) => {
  */
 const resolveOptionalPathForUser = async (user, requestedPath) =>
   requestedPath ? resolvePathForUser(user, requestedPath) : null;
+
+/**
+ * Builds the options for a directory scan, confining nested folders to the user's allowed folders by real path.
+ * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
+ * @param {unknown} recursive - The request's recursive flag; only true includes nested folders.
+ * @returns {Promise<{recursive: boolean, isAllowedPath: (realPath: string) => boolean}>} The scan options.
+ */
+const getScanOptionsForUser = async (user, recursive) => {
+  const allowedRoots = await getAllowedRoots(user);
+  return {
+    recursive: recursive === true,
+    isAllowedPath: (realPath) => isPathAllowed(realPath, allowedRoots),
+  };
+};
 
 /**
  * Returns the directory holding a user's Immich settings.
@@ -356,6 +388,8 @@ const authenticateRequest = (request, sessionCodec) => {
   const session = sessionCodec.open(
     parseCookies(request.headers.cookie).get(cookieNames.session),
   );
+  // The session restores the user's Immich key after a restart, so it is registered for redaction here.
+  logger.addSecret(session?.user?.immichApiKey);
   return session?.user ?? null;
 };
 
@@ -458,21 +492,6 @@ const readJsonBody = async (request) => {
   } catch {
     throw new HttpError(400, "The request body is not valid JSON.");
   }
-};
-
-/**
- * Builds an image URL with rotation and revision parameters.
- * @param {string} filePath - The path to the image file.
- * @param {number} rotation - The rotation value (0-360).
- * @returns {string} The constructed image URL.
- */
-const buildImageUrl = (filePath, rotation) => {
-  const params = new URLSearchParams({
-    path: filePath,
-    rotation: String(Number(rotation) || 0),
-    rev: String(getImageRevision(filePath)),
-  });
-  return `api/image?${params.toString()}`;
 };
 
 /**
@@ -625,7 +644,8 @@ const toRootRelativeName = (folderPath) =>
  * Non-administrators with several shared folders start at a virtual root listing only those folders.
  * @param {{isAdmin: boolean, folders: string[]}} user - The request's user context.
  * @param {URL} url - The parsed URL object containing query parameters.
- * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, and imageCount.
+ * @returns {Promise<Object>} Object with path, rootPath, parent, selectable, directories, imageCount, and
+ *   the folder's processed state; each directory also carries its processed state and filesystem date.
  *   A parent of "" means the virtual root; null means there is nothing above.
  * @throws {HttpError} 400 if the path is not a directory.
  */
@@ -639,15 +659,19 @@ const handleBrowse = async (user, url) => {
         rootPath: rootDirectory,
         parent: null,
         selectable: false,
-        directories: allowedRoots
-          .map((allowedRoot) => ({
-            name: toRootRelativeName(allowedRoot),
-            path: allowedRoot,
-          }))
-          .sort((left, right) =>
-            left.name.localeCompare(right.name, undefined, { numeric: true }),
-          ),
+        directories: (
+          await Promise.all(
+            allowedRoots.map((allowedRoot) =>
+              readFolderEntry(toRootRelativeName(allowedRoot), allowedRoot),
+            ),
+          )
+        ).sort((left, right) =>
+          left.name.localeCompare(right.name, undefined, { numeric: true }),
+        ),
         imageCount: 0,
+        processed: false,
+        processedAt: null,
+        processedBy: null,
       };
     }
     requestedPath = allowedRoots[0];
@@ -662,7 +686,7 @@ const handleBrowse = async (user, url) => {
     throw new HttpError(400, "The requested path is not a directory.");
   }
 
-  const { directories, imageCount } = await listDirectory(directoryPath);
+  const listing = await listDirectory(directoryPath);
 
   let parent = path.dirname(directoryPath);
   if (allowedRoots.includes(directoryPath)) {
@@ -674,13 +698,73 @@ const handleBrowse = async (user, url) => {
     rootPath: rootDirectory,
     parent,
     selectable: true,
-    directories,
-    imageCount,
+    ...listing,
   };
 };
 
 /**
- * Handles an image request, returning the raw file or a rendered preview.
+ * Sends a WebP grid thumbnail for an already-confined image path.
+ * Like previews, the ETag follows the file's version and a request whose `v` matches the file
+ * on disk may be cached indefinitely. A request whose client disconnects before rendering
+ * starts is dropped without rendering.
+ * @param {ClientRequest} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {string} filePath - The resolved image path inside the user's folders.
+ * @param {URL} url - The parsed URL; `thumb` holds the long-edge size in pixels.
+ * @returns {Promise<void>}
+ */
+const sendThumbnail = async (request, response, filePath, url) => {
+  const size = normalizeThumbnailSize(url.searchParams.get("thumb"));
+  const version = await getImageVersion(filePath);
+  const cacheHeaders = {
+    ETag: `"thumb-${size}-${version}"`,
+    "Cache-Control":
+      url.searchParams.get("v") === version
+        ? "private, max-age=31536000, immutable"
+        : "private, no-cache",
+  };
+
+  if (request.headers["if-none-match"] === cacheHeaders.ETag) {
+    response.writeHead(304, cacheHeaders);
+    response.end();
+    return;
+  }
+
+  const controller = new AbortController();
+  const abortIfUnanswered = () => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  };
+  response.once("close", abortIfUnanswered);
+  let thumbnail;
+  try {
+    thumbnail = await getThumbnail(filePath, {
+      size,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return;
+    }
+    throw error;
+  } finally {
+    response.off("close", abortIfUnanswered);
+  }
+
+  response.writeHead(200, {
+    ...cacheHeaders,
+    "Content-Type": "image/webp",
+    "Content-Length": thumbnail.length,
+  });
+  response.end(thumbnail);
+};
+
+/**
+ * Handles an image request, returning a resized WebP preview of the file, or a grid
+ * thumbnail when `thumb` is given.
+ * The browser builds the URL with the file's version (`v`); a request whose version matches the
+ * file on disk may be cached indefinitely, because any rewrite of the file changes its version.
  * @param {ClientRequest} request - The HTTP request object.
  * @param {ServerResponse} response - The HTTP response object.
  * @param {URL} url - The parsed URL object containing query parameters.
@@ -697,37 +781,35 @@ const handleImage = async (request, response, url) => {
     throw new HttpError(400, "Unsupported image type.");
   }
 
-  const rotation = Number(url.searchParams.get("rotation")) || 0;
-  const stats = await fs.stat(filePath);
-  const etag = `"${stats.size.toString(16)}-${Math.floor(stats.mtimeMs).toString(16)}-${rotation}"`;
-  const cacheHeaders = { ETag: etag, "Cache-Control": "private, no-cache" };
+  if (url.searchParams.has("thumb")) {
+    await sendThumbnail(request, response, filePath, url);
+    return;
+  }
 
-  if (request.headers["if-none-match"] === etag) {
-    response.writeHead(304, cacheHeaders);
+  const rotation = normalizeRotationValue(url.searchParams.get("rotation"));
+  const buildCacheHeaders = (version) => ({
+    ETag: `"${version}-${rotation}"`,
+    "Cache-Control":
+      url.searchParams.get("v") === version
+        ? "private, max-age=31536000, immutable"
+        : "private, no-cache",
+  });
+
+  const currentVersion = await getImageVersion(filePath);
+  const currentHeaders = buildCacheHeaders(currentVersion);
+  if (request.headers["if-none-match"] === currentHeaders.ETag) {
+    response.writeHead(304, currentHeaders);
     response.end();
     return;
   }
 
-  if (needsRenderedPreview(filePath, rotation)) {
-    const pngBuffer = await runImageFileOperation(() =>
-      renderPreviewPng(filePath, rotation),
-    );
-    response.writeHead(200, {
-      ...cacheHeaders,
-      "Content-Type": "image/webp",
-      "Content-Length": pngBuffer.length,
-    });
-    response.end(pngBuffer);
-    return;
-  }
-
+  const preview = await getImagePreview(filePath, rotation);
   response.writeHead(200, {
-    ...cacheHeaders,
-    "Content-Type":
-      contentTypeByExtension[extension] ?? "application/octet-stream",
-    "Content-Length": stats.size,
+    ...buildCacheHeaders(preview.version),
+    "Content-Type": preview.contentType,
+    "Content-Length": preview.buffer.length,
   });
-  fsSync.createReadStream(filePath).pipe(response);
+  response.end(preview.buffer);
 };
 
 /**
@@ -746,9 +828,10 @@ const validateMetadataPaths = async (user, payload) => ({
  * Creates an API routes object with handlers for all endpoints.
  * Every handler reads the authenticated user from `request.user`.
  * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {{serverUrl: string, adminApiKey: string}} immichConfig - Immich settings managed by the environment.
  * @returns {Object} Object mapping route strings to async handler functions.
  */
-const createApiRoutes = (secretCodec) => ({
+const createApiRoutes = (secretCodec, immichConfig) => ({
   "GET /api/config": async (request) => ({
     rootPath: rootDirectory,
     debug: debugEnabled && request.user.isAdmin,
@@ -766,7 +849,11 @@ const createApiRoutes = (secretCodec) => ({
       body.directoryPath,
     );
     const { field, direction } = normalizeSortBy(body.sortBy ?? defaultSortBy);
-    return readDirectory(directoryPath, `${field}-${direction}`);
+    return readDirectory(
+      directoryPath,
+      `${field}-${direction}`,
+      await getScanOptionsForUser(request.user, body.recursive),
+    );
   },
   "POST /api/read-sidecar-metadata": async (request) => {
     const body = await readJsonBody(request);
@@ -778,33 +865,35 @@ const createApiRoutes = (secretCodec) => ({
     saveMetadata(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
-  "POST /api/preview-url": async (request) => {
-    const body = await readJsonBody(request);
-    return {
-      url: buildImageUrl(
-        await resolvePathForUser(request.user, body.filePath),
-        body.rotation,
-      ),
-    };
-  },
   "POST /api/apply-image-rotations": async (request) =>
     applyImageRotations(
       await validateMetadataPaths(request.user, await readJsonBody(request)),
     ),
+  // Managed values (environment and sign-in session) are never sent to the browser or saved.
   "GET /api/immich-settings": async (request) =>
-    registerImmichSecrets(
-      await loadImmichSettings(
-        await getUserSettingsDirectory(request.user),
-        secretCodec,
+    toClientImmichSettings(
+      registerImmichSecrets(
+        await loadImmichSettings(
+          await getUserSettingsDirectory(request.user),
+          secretCodec,
+        ),
       ),
+      immichConfig,
+      request.user,
     ),
   "POST /api/immich-settings": async (request) => {
     const body = registerImmichSecrets(await readJsonBody(request));
-    return saveImmichSettings(
+    const savedSettings = await saveImmichSettings(
       await getUserSettingsDirectory(request.user, { create: true }),
       secretCodec,
-      body,
+      applyManagedImmichSettings(body, immichConfig, request.user),
+      {
+        managedFields: listManagedFields(
+          getManagedImmichFields(immichConfig, request.user),
+        ),
+      },
     );
+    return toClientImmichSettings(savedSettings, immichConfig, request.user);
   },
   "POST /api/do-not-upload": async (request) => {
     // Both images are confined to the user's folders; core renames only within their folder.
@@ -816,6 +905,16 @@ const createApiRoutes = (secretCodec) => ({
       frontPath: body.frontPath,
       backPath: body.backPath,
       value: body.value,
+      relativeDirectory: body.relativeDirectory,
+    });
+  },
+  "POST /api/folder-processed": async (request) => {
+    const body = await readJsonBody(request);
+    // Subfolders are walked without following symbolic links, so they stay inside the confined folder.
+    const directoryPath = await resolvePathForUser(request.user, body.path);
+    return setFolderProcessed(directoryPath, body.value, {
+      actor: request.user.username || null,
+      includeSubfolders: body.includeSubfolders === true,
     });
   },
   "POST /api/set-folder-date": async (request) => {
@@ -824,7 +923,11 @@ const createApiRoutes = (secretCodec) => ({
       request.user,
       body.directoryPath,
     );
-    return setFolderDate(directoryPath, body.date);
+    return setFolderDate(
+      directoryPath,
+      body.date,
+      await getScanOptionsForUser(request.user, body.recursive),
+    );
   },
   "POST /api/upload-to-immich": async (request) => {
     const body = await readJsonBody(request);
@@ -833,14 +936,15 @@ const createApiRoutes = (secretCodec) => ({
       request.user,
       body.directoryPath,
     );
-    // The settings come from the user's own form (loaded from their own settings file), so
-    // each upload runs with the signed-in user's Immich credentials.
+    // The settings come from the user's own form (loaded from their own settings file), with the
+    // managed URL and keys applied here, so each upload runs with the signed-in user's Immich credentials.
     return runImmichUpload(
-      body.settings,
+      applyManagedImmichSettings(body.settings, immichConfig, request.user),
       directoryPath,
       createProgressReporter(request.user.userKey),
       {
         debug: debugEnabled,
+        recursive: body.recursive === true,
         log: logger,
         lockKey: request.user.userKey || "default",
       },
@@ -899,15 +1003,15 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
       }
 
       let user;
+      let claims;
       try {
-        user = buildUserContext(
-          await oidcClient.finishLogin(url.searchParams, checks),
-          {
-            foldersClaim: oidcFoldersClaim,
-            adminGroup: oidcAdminGroup,
-            adminClaim: oidcAdminClaim,
-          },
-        );
+        claims = await oidcClient.finishLogin(url.searchParams, checks);
+        user = buildUserContext(claims, {
+          foldersClaim: oidcFoldersClaim,
+          adminGroup: oidcAdminGroup,
+          adminClaim: oidcAdminClaim,
+          immichApiKeyClaim: oidcImmichApiKeyClaim,
+        });
       } catch (error) {
         // openid-client wraps the specific reason (e.g. a bad signature or unexpected "alg") in `cause`.
         const reason = error?.cause?.message ?? error?.message;
@@ -935,11 +1039,31 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
         return;
       }
 
+      logger.addSecret(user.immichApiKey);
       logger.info("User signed in.", {
         username: user.username,
         isAdmin: user.isAdmin,
         folders: user.folders.length,
+        immichApiKey: Boolean(user.immichApiKey),
       });
+      if (!user.immichApiKey) {
+        // Names and types only, never values, so a missing or mistyped Immich key can be diagnosed.
+        const immichApiKeyValue = claims[oidcImmichApiKeyClaim];
+        logger.info(
+          `No Immich API key in the "${oidcImmichApiKeyClaim}" claim for ${user.username}; they enter their own.`,
+          {
+            claim:
+              immichApiKeyValue === undefined
+                ? "missing"
+                : typeof immichApiKeyValue === "string"
+                  ? immichApiKeyValue.trim()
+                    ? "too long"
+                    : "empty"
+                  : `not a string (${Array.isArray(immichApiKeyValue) ? "array" : typeof immichApiKeyValue})`,
+            receivedClaims: Object.keys(claims).sort(),
+          },
+        );
+      }
       sendRedirect(response, appLocation, [
         serializeCookie(cookieNames.session, session, {
           maxAgeSeconds: sessionMaxAgeSeconds,
@@ -1030,16 +1154,17 @@ const rejectUnauthenticated = (request, response, url) => {
 
 /**
  * Creates an HTTP request handler with authentication, routing, and error handling.
- * @param {{secretCodec: Object, sessionCodec: Object|null, loginCodec: Object|null, oidcClient: Object|null}} context - Settings codec, and the OpenID Connect client and cookie codecs when enabled.
+ * @param {{secretCodec: Object, immichConfig: Object, sessionCodec: Object|null, loginCodec: Object|null, oidcClient: Object|null}} context - Settings codec, managed Immich settings, and the OpenID Connect client and cookie codecs when enabled.
  * @returns {Function} An async function that handles HTTP requests and responses.
  */
 const createRequestHandler = ({
   secretCodec,
+  immichConfig,
   sessionCodec,
   loginCodec,
   oidcClient,
 }) => {
-  const apiRoutes = createApiRoutes(secretCodec);
+  const apiRoutes = createApiRoutes(secretCodec, immichConfig);
   const authRoutes = oidcEnabled
     ? createAuthRoutes({ oidcClient, sessionCodec, loginCodec })
     : {};
@@ -1187,11 +1312,34 @@ const start = async () => {
     );
   }
 
+  const immichConfig = await readManagedImmichConfig(process.env);
+  // The admin key lives only in the environment (or secret file) and memory, never in /config.
+  logger.addSecret(immichConfig.adminApiKey);
+
   rootDirectory = await fs.realpath(configuredRoot);
   const masterKey = await loadSecretKey();
+  const realConfigDirectory = await fs
+    .realpath(configDirectory)
+    .catch(() => configDirectory);
+  const realPreviewCacheDirectory = path.join(
+    realConfigDirectory,
+    path.basename(previewCacheDirectory),
+  );
+  if (isInsideDirectory(realPreviewCacheDirectory, rootDirectory)) {
+    // Cached previews must never appear among (or be served as) the user's photos.
+    logger.warn(
+      "IMAGEPARSER_CONFIG_DIR is inside IMAGEPARSER_ROOT; the preview cache is disabled.",
+    );
+  } else {
+    configurePreviewCache({
+      directory: realPreviewCacheDirectory,
+      maxBytes: previewCacheMaxBytes,
+    });
+  }
   const server = http.createServer(
     createRequestHandler({
       secretCodec: createAesGcmCodec(masterKey),
+      immichConfig,
       ...createOidcContext(masterKey),
     }),
   );
@@ -1207,10 +1355,22 @@ const start = async () => {
     ]) {
       client.end();
     }
-    void shutdownCore().finally(() => process.exit(0));
+    // Let in-flight metadata writes finish so no image is left half-written.
+    void whenImageFileOperationsIdle()
+      .then(() => shutdownCore())
+      .finally(() => process.exit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  // Without this, a port that cannot be opened (in use, or reserved by the OS) ends the process silently.
+  server.on("error", (error) => {
+    logger.error(
+      `Image Parser could not listen on ${host}:${port} (${error?.code ?? "unknown error"}). Choose another port with PORT.`,
+      error,
+    );
+    void shutdownCore().finally(() => process.exit(1));
+  });
 
   server.listen(port, host, () => {
     logger.info(
@@ -1235,6 +1395,12 @@ const start = async () => {
       logger.warn(
         "Authentication is disabled. Set OIDC_ISSUER_URL, or IMAGEPARSER_USERNAME and IMAGEPARSER_PASSWORD, to enable it.",
       );
+    }
+    if (immichConfig.serverUrl || immichConfig.adminApiKey) {
+      logger.info("Immich settings are managed by the environment.", {
+        serverUrl: immichConfig.serverUrl || null,
+        adminApiKey: Boolean(immichConfig.adminApiKey),
+      });
     }
     if (debugEnabled) {
       logger.warn(

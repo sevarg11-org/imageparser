@@ -9,6 +9,8 @@ import * as oidc from "openid-client";
 import { normalizeFolderGrants } from "./pathAccess.js";
 
 const maxUsernameLength = 128;
+// Immich API keys are about 40 characters; longer values are ignored so they cannot bloat the session cookie.
+const maxImmichApiKeyLength = 512;
 
 /**
  * Derives a purpose-specific 32-byte key from the server's master key.
@@ -143,13 +145,15 @@ const createUserKey = (subject) =>
  * @param {Object} claims - Merged ID token and userinfo claims.
  * A user is an administrator when they belong to the admin group, or when the admin claim is exactly
  * true (a boolean, or the string "true" for attributes entered as text).
- * @param {{foldersClaim: string, adminGroup: string, adminClaim?: string}} options - The folder claim, admin group, and admin claim names.
- * @returns {{userKey: string, username: string, isAdmin: boolean, folders: string[]}} The user context.
+ * The user's Immich API key, when the Immich key claim is a non-empty string, is kept only in the sealed
+ * session and is never returned to the browser or saved.
+ * @param {{foldersClaim: string, adminGroup: string, adminClaim?: string, immichApiKeyClaim?: string}} options - The folder claim, admin group, admin claim, and Immich API key claim names.
+ * @returns {{userKey: string, username: string, isAdmin: boolean, folders: string[], immichApiKey?: string}} The user context.
  * @throws {Error} If the claims have no subject.
  */
 const buildUserContext = (
   claims,
-  { foldersClaim, adminGroup, adminClaim = "" },
+  { foldersClaim, adminGroup, adminClaim = "", immichApiKeyClaim = "" },
 ) => {
   const subject = typeof claims?.sub === "string" ? claims.sub : "";
   if (!subject) {
@@ -163,6 +167,11 @@ const buildUserContext = (
     (value) => typeof value === "string" && value.trim(),
   );
   const adminClaimValue = adminClaim ? claims[adminClaim] : undefined;
+  const immichApiKeyValue = immichApiKeyClaim
+    ? claims[immichApiKeyClaim]
+    : undefined;
+  const immichApiKey =
+    typeof immichApiKeyValue === "string" ? immichApiKeyValue.trim() : "";
 
   return {
     userKey: createUserKey(subject),
@@ -173,6 +182,9 @@ const buildUserContext = (
       (typeof adminClaimValue === "string" &&
         adminClaimValue.trim().toLowerCase() === "true"),
     folders: normalizeFolderGrants(claims[foldersClaim]),
+    ...(immichApiKey && immichApiKey.length <= maxImmichApiKeyLength
+      ? { immichApiKey }
+      : {}),
   };
 };
 

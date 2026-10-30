@@ -8,6 +8,7 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
 - **Metadata Editing**: Edit EXIF dates embedded in image files and XMP sidecar metadata (description, tags, orientation).
 - **Immich Upload**: Batch upload paired images to Immich with configurable albums, tags, and concurrent tasks.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
+- **Processed Folders**: Mark a folder (optionally with all its subfolders) as processed from the main screen or after an Immich upload; the folder browser shows a checkmark next to processed folders.
 - **Cross-Platform**: Desktop app for Windows/macOS/Linux via Electron; web server version for TrueNAS/Docker or local deployment.
 
 ## Architecture
@@ -120,6 +121,27 @@ Create a stack from `docker-compose.yml`. Configure these environment variables:
 | `IMAGEPARSER_DEBUG`      | `false`                      | Streams server logs to the browser  |
 | `IMAGEPARSER_TAG`        | `latest`                     | Image tag to run (default `latest`) |
 
+#### Immich settings for every user (optional)
+
+An administrator can set the Immich server and admin key once for every user instead of each user typing them in:
+
+| Variable                    | Example                      | Purpose                                                        |
+| --------------------------- | ---------------------------- | -------------------------------------------------------------- |
+| `IMMICH_URL`                | `https://immich.example.com` | Immich server for all users; the field becomes read-only       |
+| `IMMICH_ADMIN_API_KEY`      | _(admin API key)_            | Pauses Immich jobs during every upload; the field is hidden    |
+| `IMMICH_ADMIN_API_KEY_FILE` | `/run/secrets/immich_admin`  | File holding the admin key; takes precedence over the variable |
+
+- These values override what users saved. The admin key is never sent to the browser, written to `/config`, or
+  shown in logs. Create it on a **dedicated Immich admin account**: it gives admin rights for every upload.
+- The server refuses to start if `IMMICH_URL` is not an `http://` or `https://` URL, or if
+  `IMMICH_ADMIN_API_KEY_FILE` cannot be read or is empty.
+- With single sign-on, each user's own Immich API key can also come from Authentik; see
+  [Single sign-on with Authentik](#single-sign-on-with-authentik).
+- The desktop app ignores these variables and keeps using OS secure storage.
+
+Resized previews are cached in `preview-cache/` inside the config directory and trimmed when the cache grows past
+1 GB. Set `IMAGEPARSER_PREVIEW_CACHE_MB` on the container to change the limit. The folder is safe to delete.
+
 For single sign-on with per-user folders, set the `OIDC_*` variables instead of the Basic auth pair; see
 [Single sign-on with Authentik](#single-sign-on-with-authentik).
 
@@ -186,6 +208,7 @@ keep them set as backup credentials for [emergency access](#emergency-access-whe
    return {
        "imageparser_folders": sorted(set(folders)),
        "imageparser_admin": request.user.attributes.get("imageparser_admin") is True,
+       "immich_api_key": request.user.attributes.get("immich_api_key", ""),
    }
    ```
 
@@ -211,6 +234,10 @@ keep them set as backup credentials for [emergency access](#emergency-access-whe
    - add them to the `imageparser-admin` group (sent in the default `groups` claim), or
    - set the attribute `imageparser_admin: true` on the user (sent by the mapping above).
 
+   **Immich API keys (optional):** set `immich_api_key: <the user's Immich API key>` on a user. Users with the
+   attribute upload without entering a key, and the API key field is hidden for them. Users without it enter
+   their own key as before.
+
 4. Set these variables in the stack's `.env` and redeploy:
 
 | Variable                       | Example                                                | Purpose                                     |
@@ -223,6 +250,7 @@ keep them set as backup credentials for [emergency access](#emergency-access-whe
 | `OIDC_ADMIN_GROUP`             | `imageparser-admin`                                    | Group with access to the whole share        |
 | `OIDC_ADMIN_CLAIM`             | `imageparser_admin`                                    | Claim that makes a single user an admin     |
 | `OIDC_FOLDERS_CLAIM`           | `imageparser_folders`                                  | Claim listing each user's folders           |
+| `OIDC_IMMICH_API_KEY_CLAIM`    | `immich_api_key`                                       | Claim holding a user's own Immich API key   |
 | `OIDC_SESSION_HOURS`           | `8`                                                    | Sign-in lifetime                            |
 | `OIDC_ALLOW_INSECURE_REQUESTS` | `false`                                                | Allow an HTTP issuer (trusted networks)     |
 | `OIDC_DISABLED`                | `false`                                                | Emergency bypass of sign-in (see below)     |
@@ -233,6 +261,9 @@ Notes:
   or the session expires. **Sign out** also ends the Authentik session.
 - Session cookies are encrypted with a key derived from `IMAGEPARSER_SECRET_KEY` (or `/config/secret.key`).
   Changing the key signs everyone out.
+- The Immich API key from Authentik is never saved: not in `/config`, not even encrypted, and not in logs. It is
+  kept only in the user's encrypted session cookie, which the browser cannot read, and is read again at each
+  sign-in.
 - Per-user Immich settings are stored in `/config/users/<id>/immich-settings.json`, where `<id>` is a hash of the
   user's Authentik ID. The shared `/config/immich-settings.json` used without sign-on is not migrated.
 - If Authentik uses a certificate from a private CA, mount the CA certificate and set `NODE_EXTRA_CA_CERTS` to its
@@ -277,6 +308,8 @@ Access at `http://localhost:8080`.
 - `/healthz` answers without credentials so container health checks work; it reveals nothing else.
 - No HTTPS is configured in the container; keep it on your LAN or put behind a reverse proxy with TLS.
 - API keys are encrypted at rest using AES-256-GCM with per-request authentication.
+- Keys set by `IMMICH_ADMIN_API_KEY` or an Authentik `immich_api_key` attribute are never returned to the browser
+  or saved to `/config`.
 
 ## Metadata Operations
 
@@ -285,6 +318,7 @@ The shared core logic handles:
 - **XMP Sidecars**: Create/update `.xmp` files containing description, tags, EXIF dates, and Adobe Photoshop date fields.
 - **Embedded EXIF**: Write creation date directly into image files (`.jpg`, `.tif`, etc.) using ExifTool.
 - **Rotation**: Apply orientation to metadata (`Orientation` tag) or rotate pixel data for PNG/WebP formats.
+- **Folder State**: Store the processed mark, with who set it and when, in a hidden `.imageparser.json` file inside the folder, so every user and both apps see the same state. A missing or unreadable file means the folder is not processed.
 
 ## Testing
 

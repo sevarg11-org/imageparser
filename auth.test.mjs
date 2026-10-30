@@ -158,3 +158,34 @@ test("grants administrator access through the admin claim", () => {
     "the claim is ignored when no admin claim name is configured",
   );
 });
+
+test("reads the user's Immich API key from the configured claim", () => {
+  const withClaim = { ...options, immichApiKeyClaim: "immich_api_key" };
+  assert.equal(
+    buildUserContext({ sub: "s", immich_api_key: " key-1 " }, withClaim)
+      .immichApiKey,
+    "key-1",
+  );
+  for (const value of [
+    "",
+    "   ",
+    42,
+    true,
+    ["key"],
+    undefined,
+    "x".repeat(513),
+  ]) {
+    assert.equal(
+      "immichApiKey" in
+        buildUserContext({ sub: "s", immich_api_key: value }, withClaim),
+      false,
+      JSON.stringify(value),
+    );
+  }
+  assert.equal(
+    "immichApiKey" in
+      buildUserContext({ sub: "s", immich_api_key: "key-1" }, options),
+    false,
+    "the claim is ignored when no Immich key claim name is configured",
+  );
+});

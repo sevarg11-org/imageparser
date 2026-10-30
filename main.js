@@ -1,25 +1,28 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from "electron";
+import { app, BrowserWindow, ipcMain, protocol, safeStorage } from "electron";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  allowedExtensions,
   applyImageRotations,
+  configurePreviewCache,
   defaultSortBy,
-  getImageRevision,
+  getImagePreview,
+  getThumbnail,
   listDirectory,
   listDrives,
   loadImmichSettings,
   needsRenderedPreview,
   readDirectory,
   readSidecarMetadata,
-  renderPreviewPng,
-  runImageFileOperation,
   runImmichUpload,
   saveImmichSettings,
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  setFolderProcessed,
   shutdownCore,
+  whenImageFileOperationsIdle,
 } from "./core.js";
 import fs from "node:fs/promises";
 
@@ -96,31 +99,79 @@ const safeStorageCodec = Object.freeze({
 const getSettingsDirectory = () => app.getPath("userData");
 
 /**
- * Retrieves a preview data URL for an image file with optional rotation.
- * If the file needs a rendered preview, generates one; otherwise uses the
- * original file URL with revision tracking. Falls back gracefully to file
- * URLs or empty strings on errors.
+ * The read-only URL scheme that serves grid thumbnails, so `<img>` elements can load them
+ * without holding base64 data URLs in renderer memory. The preload script builds its URLs.
+ * @type {string}
+ */
+const thumbnailScheme = "imageparser-thumb";
+
+// Custom schemes must be registered before the app is ready.
+protocol.registerSchemesAsPrivileged([
+  { scheme: thumbnailScheme, privileges: { standard: true, secure: true } },
+]);
+
+/**
+ * Serves a cached WebP thumbnail for a supported image file. Only GET requests for
+ * absolute paths to regular image files are answered; nothing can be written.
+ * @param {Request} request - The protocol request; `path` and `size` are query parameters.
+ * @returns {Promise<Response>} The thumbnail, or an empty error response.
+ */
+const handleThumbnailRequest = async (request) => {
+  const url = new URL(request.url);
+  const filePath = url.searchParams.get("path") ?? "";
+  if (
+    request.method !== "GET" ||
+    !path.isAbsolute(filePath) ||
+    !allowedExtensions.has(path.extname(filePath).toLowerCase())
+  ) {
+    return new Response(null, { status: 400 });
+  }
+
+  try {
+    if (!(await fs.stat(filePath)).isFile()) {
+      return new Response(null, { status: 404 });
+    }
+    const thumbnail = await getThumbnail(filePath, {
+      size: url.searchParams.get("size"),
+      signal: request.signal,
+    });
+    // The URL carries the file's version, so a changed file always gets a new URL.
+    return new Response(thumbnail, {
+      headers: {
+        "Content-Type": "image/webp",
+        "Cache-Control": "private, max-age=31536000, immutable",
+      },
+    });
+  } catch (error) {
+    return new Response(null, {
+      status: error?.code === "ENOENT" ? 404 : 500,
+    });
+  }
+};
+
+/**
+ * Retrieves a preview URL for an image file.
+ * Files the browser can display are loaded directly, with the file's version in the URL so a
+ * rewritten file is reloaded. TIFF files are rendered (and cached) as WebP data URLs.
+ * Rotation is shown by the renderer, so previews are never rendered just to rotate them.
  * @param {string} filePath - The path to the image file.
- * @param {number} [rotation=0] - The rotation angle in degrees.
+ * @param {string} [version=""] - The file's version, from the directory listing or the last save.
  * @returns {Promise<string>} A data URL for the preview, a file URL, or an empty string.
  */
-const getPreviewDataUrl = async (filePath, rotation = 0) => {
+const getPreviewDataUrl = async (filePath, version = "") => {
   if (!filePath) {
     return "";
   }
 
-  if (!needsRenderedPreview(filePath, rotation)) {
+  if (!needsRenderedPreview(filePath)) {
     const fileUrl = pathToFileURL(filePath);
-    fileUrl.searchParams.set(
-      "imageParserRevision",
-      String(getImageRevision(filePath)),
-    );
+    fileUrl.searchParams.set("v", String(version ?? ""));
     return fileUrl.href;
   }
 
   try {
-    const pngBuffer = await renderPreviewPng(filePath, rotation);
-    return `data:image/webp;base64,${pngBuffer.toString("base64")}`;
+    const preview = await getImagePreview(filePath);
+    return `data:${preview.contentType};base64,${preview.buffer.toString("base64")}`;
   } catch {
     try {
       return pathToFileURL(filePath).href;
@@ -235,6 +286,10 @@ const createMainWindow = () => {
  * the app is ready, and recreates it if all windows are closed.
  */
 app.whenReady().then(() => {
+  protocol.handle(thumbnailScheme, handleThumbnailRequest);
+  configurePreviewCache({
+    directory: path.join(getSettingsDirectory(), "preview-cache"),
+  });
   createMainWindow();
 
   app.on("activate", () => {
@@ -258,8 +313,20 @@ app.on("window-all-closed", () => {
  * Main application lifecycle hook that shuts down core operations
  * when the app is being quit.
  */
-app.on("will-quit", () => {
-  void shutdownCore();
+let isShutdownComplete = false;
+app.on("will-quit", (event) => {
+  if (isShutdownComplete) {
+    return;
+  }
+
+  // Saves started just before closing run in the background; let them finish before stopping ExifTool.
+  event.preventDefault();
+  void whenImageFileOperationsIdle()
+    .then(() => shutdownCore())
+    .finally(() => {
+      isShutdownComplete = true;
+      app.quit();
+    });
 });
 
 /**
@@ -281,6 +348,9 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
       selectable: false,
       directories: await listDrives(),
       imageCount: 0,
+      processed: false,
+      processedAt: null,
+      processedBy: null,
     };
   }
 
@@ -289,7 +359,7 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
   }
 
   const resolvedPath = path.resolve(directoryPath || os.homedir());
-  const { directories, imageCount } = await listDirectory(resolvedPath);
+  const listing = await listDirectory(resolvedPath);
   const parentPath = path.dirname(resolvedPath);
   let parent = parentPath;
   if (parentPath === resolvedPath) {
@@ -301,8 +371,7 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
     rootPath: null,
     parent,
     selectable: true,
-    directories,
-    imageCount,
+    ...listing,
   };
 });
 
@@ -312,12 +381,13 @@ ipcMain.handle("browse-directory", async (_event, directoryPath) => {
  * @param {*} _event - The IPC event object.
  * @param {string} directoryPath - The path to the directory to read.
  * @param {string} [sortBy=defaultSortBy] - The field to sort by.
- * @returns {Promise<string[]>} An array of file paths in the directory.
+ * @param {boolean} [recursive=false] - Whether to include nested folders.
+ * @returns {Promise<Object>} The paired images and folder details.
  */
 ipcMain.handle(
   "read-directory",
-  (_event, directoryPath, sortBy = defaultSortBy) =>
-    readDirectory(directoryPath, sortBy),
+  (_event, directoryPath, sortBy = defaultSortBy, recursive = false) =>
+    readDirectory(directoryPath, sortBy, { recursive: recursive === true }),
 );
 
 /**
@@ -341,16 +411,16 @@ ipcMain.handle("read-sidecar-metadata", (_event, filePath) =>
 );
 
 /**
- * IPC handler for getting a preview data URL of an image with optional rotation.
+ * IPC handler for getting a preview URL of an image.
  * Returns a data URL that can be displayed in the UI for the specified file
  * and rotation angle.
  * @param {*} _event - The IPC event object.
  * @param {string} filePath - The path to the image file.
- * @param {number} rotation - The rotation angle in degrees.
+ * @param {string} version - The file's version, so a rewritten file is reloaded.
  * @returns {Promise<string>} A data URL or file URL for the preview.
  */
-ipcMain.handle("get-preview-data-url", (_event, filePath, rotation) =>
-  runImageFileOperation(() => getPreviewDataUrl(filePath, rotation)),
+ipcMain.handle("get-preview-data-url", (_event, filePath, version) =>
+  getPreviewDataUrl(filePath, version),
 );
 
 /**
@@ -397,12 +467,46 @@ ipcMain.handle("save-immich-settings", (_event, settings) =>
  * IPC handler for setting the date on all images in a directory that do not
  * already have an XMP sidecar file.
  * @param {*} _event - The IPC event object.
- * @param {{directoryPath: string, date: string}} payload
+ * @param {{directoryPath: string, date: string, recursive?: boolean}} payload
  * @returns {Promise<{ok: boolean, updatedPairs: number, skippedPairs: number, errors: string[]}>}
  */
-ipcMain.handle("set-folder-date", (_event, { directoryPath, date }) =>
-  setFolderDate(directoryPath, date),
+ipcMain.handle(
+  "set-folder-date",
+  (_event, { directoryPath, date, recursive }) =>
+    setFolderDate(directoryPath, date, { recursive: recursive === true }),
 );
+
+/**
+ * Returns the local account name recorded as the person who marked a folder processed.
+ * @returns {string|null} The operating system user name, or null when it cannot be read.
+ */
+const getLocalUserName = () => {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * IPC handler for marking a folder, and optionally its subfolders, as processed or not processed.
+ * @param {*} _event - The IPC event object.
+ * @param {{directoryPath: string, value: boolean, includeSubfolders?: boolean}} request - The folder and the new state.
+ * @returns {Promise<Object>} The folder's new state, the number of folders written, and any errors.
+ */
+ipcMain.handle("set-folder-processed", (_event, request) => {
+  if (typeof request?.directoryPath !== "string" || !request.directoryPath) {
+    throw new Error("The folder path must be a non-empty string.");
+  }
+  return setFolderProcessed(
+    path.resolve(request.directoryPath),
+    request.value,
+    {
+      actor: getLocalUserName(),
+      includeSubfolders: request.includeSubfolders === true,
+    },
+  );
+});
 
 /**
  * IPC handler for flagging an image group "Do not upload" or clearing the flag.
@@ -416,15 +520,21 @@ ipcMain.handle("set-do-not-upload", (_event, request) =>
     frontPath: request?.frontPath,
     backPath: request?.backPath,
     value: request?.value,
+    relativeDirectory: request?.relativeDirectory,
   }),
 );
 
-ipcMain.handle("upload-to-immich", async (_event, settings, directoryPath) => {
-  const reportProgress = (progress) => {
-    if (!_event.sender.isDestroyed()) {
-      _event.sender.send("immich-upload-progress", progress);
-    }
-  };
+ipcMain.handle(
+  "upload-to-immich",
+  async (_event, settings, directoryPath, recursive = false) => {
+    const reportProgress = (progress) => {
+      if (!_event.sender.isDestroyed()) {
+        _event.sender.send("immich-upload-progress", progress);
+      }
+    };
 
-  return runImmichUpload(settings, directoryPath, reportProgress);
-});
+    return runImmichUpload(settings, directoryPath, reportProgress, {
+      recursive: recursive === true,
+    });
+  },
+);

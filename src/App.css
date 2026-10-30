@@ -115,6 +115,69 @@
   word-break: break-all;
 }
 
+.folder-processed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px 14px;
+}
+
+.folder-nested {
+  margin-left: -8px;
+  opacity: 0.85;
+}
+
+.processed-toggle {
+  appearance: none;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  background: #1e293b;
+  color: #e2e8f0;
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.processed-toggle[aria-pressed="true"] {
+  border-color: #4ade80;
+  background: rgba(34, 197, 94, 0.18);
+  color: #bbf7d0;
+}
+
+.processed-toggle:focus-visible {
+  outline: 3px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.processed-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.processed-subfolders {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+}
+
+.folder-processed-error {
+  flex-basis: 100%;
+  color: #fca5a5;
+  text-align: right;
+}
+
+.immich-mark-processed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  color: #dfeaf7;
+}
+
 .empty-state {
   min-height: 420px;
   border: 1px dashed rgba(148, 163, 184, 0.5);
@@ -138,6 +201,57 @@
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 18px;
   padding: 18px;
+}
+
+.view-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.view-bar-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.view-switch {
+  display: inline-flex;
+  padding: 4px;
+  border: 1px solid #334155;
+  border-radius: 14px;
+  background: #0f172a;
+}
+
+.view-switch button {
+  appearance: none;
+  border: none;
+  border-radius: 10px;
+  padding: 0.6rem 1.2rem;
+  background: transparent;
+  color: #cbd5e1;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.view-switch button[aria-pressed="true"] {
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  color: white;
+}
+
+.view-switch button:focus-visible,
+.back-to-grid:focus-visible {
+  outline: 3px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.view-switch button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .viewer-toolbar {
@@ -365,12 +479,25 @@
   border-radius: 6px;
   pointer-events: none;
   box-shadow: 0 0 0 9999px rgba(15, 23, 42, 0.45);
+  overflow: hidden;
   z-index: 5;
   transition:
     left 100ms ease-out,
-    top 100ms ease-out,
+    top 100ms ease-out;
+}
+
+/* Holds the magnified image; rotated with the displayed image so the lens matches it. */
+.magnifier-lens-image {
+  position: absolute;
+  inset: 0;
+  transition:
     background-size 100ms ease-out,
     background-position 100ms ease-out;
+}
+
+.save-indicator {
+  color: #7dd3fc;
+  white-space: nowrap;
 }
 
 .metadata-panel {
@@ -657,13 +784,21 @@
   gap: 14px;
 }
 
-.immich-grid label {
+.immich-grid label,
+.immich-managed-field {
   display: flex;
   flex-direction: column;
   gap: 8px;
   color: #dfeaf7;
   font-weight: 600;
   text-align: left;
+}
+
+/* A value set by the administrator: plain text, so it does not look like an editable input. */
+.immich-managed-value {
+  color: #f8fafc;
+  font-weight: 400;
+  overflow-wrap: anywhere;
 }
 
 .immich-tags {
@@ -810,6 +945,14 @@
   .status-bar {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .folder-processed {
+    justify-content: flex-start;
+  }
+
+  .folder-processed-error {
+    text-align: left;
   }
 
   .immich-actions {

@@ -1,7 +1,10 @@
 .directory-browser {
   width: min(640px, calc(100vw - 2rem));
   max-height: min(720px, calc(100vh - 2rem));
+  box-sizing: border-box;
   padding: 0;
+  /* Only the folder list scrolls; the browser's modal styles default dialogs to overflow: auto. */
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--bg);
@@ -42,7 +45,7 @@
 
 .directory-browser-body {
   flex: 1;
-  min-height: 12rem;
+  min-height: min(12rem, 25vh);
   overflow-y: auto;
   padding: 0.5rem 0;
 }
@@ -101,5 +104,74 @@
 
 .directory-browser-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.5rem;
+  align-items: center;
+}
+
+.directory-browser-nested {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-right: 0.5rem;
+  cursor: pointer;
+}
+
+.directory-browser {
+  --processed: #15803d;
+}
+
+@media (prefers-color-scheme: dark) {
+  .directory-browser {
+    --processed: #4ade80;
+  }
+}
+
+.directory-browser-processed {
+  margin-left: 0.35rem;
+  color: var(--processed);
+  font-weight: 700;
+}
+
+.directory-browser-processed-badge {
+  display: inline-block;
+  margin-left: 0.6rem;
+  padding: 0 0.45rem;
+  border: 1px solid var(--processed);
+  border-radius: 999px;
+  color: var(--processed);
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.directory-browser-sort {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.directory-browser-sort select {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.directory-browser-sort select:focus-visible,
+.directory-browser-sort-direction:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.directory-browser-sort-value {
+  margin-left: 0.6rem;
+  color: var(--text);
+  font-size: 0.8rem;
+  white-space: nowrap;
 }
