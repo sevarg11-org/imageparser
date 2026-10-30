@@ -3282,6 +3282,86 @@ const addTagsToPairs = async (
 };
 
 /**
+ * Counts how many of the chosen image groups already have a saved location, so replacing them can be confirmed.
+ * Groups whose sidecar cannot be read count as having none.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to check.
+ * @param {{readMetadata?: typeof readSidecarMetadata}} [dependencies] - A replaceable read step, for tests.
+ * @returns {Promise<number>} The number of groups with a location.
+ */
+const countPairsWithLocation = async (
+  pairs,
+  { readMetadata = readSidecarMetadata } = {},
+) => {
+  let count = 0;
+  for (const pair of pairs) {
+    try {
+      if ((await readMetadata(pair.frontPath)).location) {
+        count += 1;
+      }
+    } catch {
+      // An unreadable sidecar has no location to replace.
+    }
+  }
+  return count;
+};
+
+/**
+ * Applies one place to the chosen image groups. Each group's A-file sidecar is read and rewritten through
+ * saveMetadata, so writes stay serialized by the image file queue and the group's date, description and tags are
+ * kept. One group failing does not stop the rest.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to update.
+ * @param {SidecarLocation} location - The place to save.
+ * @param {{readMetadata?: typeof readSidecarMetadata, save?: typeof saveMetadata}} [dependencies] - Replaceable
+ *   read and save steps, for tests.
+ * @returns {Promise<{ok: boolean, updatedPairs: number, failedFrontPaths: string[], errors: string[]}>}
+ * @throws {Error} If the location is missing or its coordinates are out of range.
+ */
+const setLocationForPairs = async (
+  pairs,
+  location,
+  { readMetadata = readSidecarMetadata, save = saveMetadata } = {},
+) => {
+  const safeLocation = normalizeLocation(location);
+  if (!safeLocation) {
+    throw new Error("Choose a place first.");
+  }
+
+  const errors = [];
+  const failedFrontPaths = [];
+  let updatedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const { date, description, tags } = await readMetadata(pair.frontPath);
+      const result = await save({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description,
+        tags,
+        location: safeLocation,
+      });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
+      updatedPairs += 1;
+    } catch (error) {
+      failedFrontPaths.push(pair.frontPath);
+      errors.push(
+        `${path.basename(pair.frontPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, failedFrontPaths, errors };
+};
+
+/**
  * Resets the processing state of every image in a directory by deleting its XMP sidecar files.
  * Only sidecars belonging to the folder's images are deleted (both naming conventions, for the A and B
  * images), never other .xmp files. Images and the folder's own processed marker are left untouched.
@@ -3382,6 +3462,8 @@ export {
   scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
   addTagsToPairs,
+  countPairsWithLocation,
+  setLocationForPairs,
   formatXmpCoordinate,
   parseXmpCoordinate,
   buildSidecarDocument,

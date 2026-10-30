@@ -49,6 +49,9 @@ import {
 } from "./imageFilters";
 import { AddTagsModal } from "./AddTagsModal";
 import AlbumCombobox from "./AlbumCombobox";
+import LocationPicker from "./LocationPicker";
+import type { Place, PlaceLocation } from "./placeTypes";
+import { SetLocationModal } from "./SetLocationModal";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { ThumbnailGrid } from "./ThumbnailGrid";
 import {
@@ -103,6 +106,7 @@ type SidecarValues = {
   date: string;
   description: string;
   tags: string[];
+  location?: PlaceLocation | null;
   rotation: number;
   hasSidecar: boolean;
 };
@@ -121,6 +125,7 @@ type MetadataForm = {
   date: string;
   description: string;
   tags: string[];
+  location: PlaceLocation | null;
 };
 
 /** Immich settings the web server provides (environment or sign-in), which the user cannot edit. */
@@ -211,9 +216,25 @@ declare global {
         date: string;
         description: string;
         tags: string[];
+        location: PlaceLocation | null;
         frontRotation: number;
         backRotation: number;
       }) => Promise<SaveMetadataResult>;
+      searchPlaces: (query: string) => Promise<Place[]>;
+      getRecentPlaces: () => Promise<Place[]>;
+      rememberPlace: (place: Place) => Promise<Place>;
+      countPairsWithLocation: (
+        pairs: { frontPath: string; backPath: string | null }[],
+      ) => Promise<number>;
+      setPairsLocation: (
+        pairs: { frontPath: string; backPath: string | null }[],
+        location: PlaceLocation,
+      ) => Promise<{
+        ok: boolean;
+        updatedPairs: number;
+        failedFrontPaths: string[];
+        errors: string[];
+      }>;
       getPreviewDataUrl: (filePath: string, version: string) => Promise<string>;
       getThumbnailUrl: (
         filePath: string,
@@ -858,6 +879,7 @@ function App() {
     date: defaultDate,
     description: "",
     tags: [],
+    location: null,
   });
   const [dateSegments, setDateSegments] = useState(() =>
     parseDateSegments(defaultDate),
@@ -908,6 +930,9 @@ function App() {
     () => new Set(),
   );
   const [isSelectedDateModalOpen, setIsSelectedDateModalOpen] = useState(false);
+  const [isSetLocationModalOpen, setIsSetLocationModalOpen] = useState(false);
+  const [isSettingLocation, setIsSettingLocation] = useState(false);
+  const [setLocationFailures, setSetLocationFailures] = useState<string[]>([]);
   const [isAddTagsModalOpen, setIsAddTagsModalOpen] = useState(false);
   const [isAddingTags, setIsAddingTags] = useState(false);
   const [addTagsFailures, setAddTagsFailures] = useState<string[]>([]);
@@ -1261,6 +1286,7 @@ function App() {
             date: formValues.date,
             description: formValues.description,
             tags: formValues.tags,
+            location: formValues.location,
             frontRotation: pairRotations.front,
             backRotation: pairRotations.back,
           });
@@ -1633,6 +1659,7 @@ function App() {
               : defaultDate,
             description: frontXmpValues.description ?? "",
             tags: loadedTags,
+            location: frontXmpValues.location ?? null,
           },
           unsavedEdits?.rotations ?? {
             front: normalizeRotation(frontXmpValues.rotation ?? 0),
@@ -1653,6 +1680,7 @@ function App() {
             date: defaultDate,
             description: "",
             tags: [],
+            location: null,
           },
           unsavedEdits?.rotations ?? { front: 0, back: 0 },
           Boolean(unsavedEdits),
@@ -2014,6 +2042,15 @@ function App() {
   const updateTags = (tags: string[]) => {
     markUserChanged();
     setMetadata((current) => ({ ...current, tags }));
+  };
+
+  /**
+   * Sets or clears the current pair's location, which is saved with the rest of its metadata.
+   * @param location - The chosen place, or null to remove it.
+   */
+  const updateLocation = (location: PlaceLocation | null) => {
+    markUserChanged();
+    setMetadata((current) => ({ ...current, location }));
   };
 
   /**
@@ -2777,6 +2814,87 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
     }
   };
   /**
+   * Counts the selected groups that already have a location, for the replace confirmation.
+   */
+  const countSelectedLocations = async () => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      throw new Error("API is not available.");
+    }
+    await waitForPendingSaves();
+    return electronApi.countPairsWithLocation(
+      pairs
+        .filter((pair) => selectedGridIds.has(pair.id))
+        .map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+    );
+  };
+
+  /**
+   * Applies one place to the groups selected in the grid. Groups that fail stay selected and are listed in the
+   * dialog so the place can be applied again.
+   * @param location - The place chosen in the modal.
+   */
+  const handleConfirmSetLocation = async (location: PlaceLocation) => {
+    const chosenPairs = pairs.filter((pair) => selectedGridIds.has(pair.id));
+    if (!chosenPairs.length) {
+      setIsSetLocationModalOpen(false);
+      return;
+    }
+
+    setIsSettingLocation(true);
+    setSetLocationFailures([]);
+    setStatus(`Setting location for ${chosenPairs.length} selected groups...`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      const result = await electronApi.setPairsLocation(
+        chosenPairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+        location,
+      );
+      const failedPaths = new Set(result.failedFrontPaths);
+      markPairsSaved(
+        chosenPairs
+          .filter((pair) => !failedPaths.has(pair.frontPath))
+          .map((pair) => pair.id),
+      );
+      setSelectedGridIds(
+        new Set(
+          chosenPairs
+            .filter((pair) => failedPaths.has(pair.frontPath))
+            .map((pair) => pair.id),
+        ),
+      );
+      setStatus(
+        result.ok
+          ? `Set location to ${location.name || "the chosen place"} for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`
+          : `Location set for ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}; ${result.errors.length} failed.`,
+      );
+      if (result.ok) {
+        setIsSetLocationModalOpen(false);
+      } else {
+        setSetLocationFailures(result.errors);
+      }
+      sidecarPrefetchRef.current.clear();
+      setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to set the location for the selected images.";
+      setStatus(message);
+      setSetLocationFailures([message]);
+    } finally {
+      setIsSettingLocation(false);
+    }
+  };
+
+  /**
    * Adds tags to the groups selected in the grid. Existing tags are kept; groups that fail stay selected and
    * are listed in the dialog so the tags can be added again.
    * @param tags - The tags chosen in the modal.
@@ -2967,6 +3085,18 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                 title="Add tags to the selected images, keeping the tags they already have"
               >
                 Add tags to selected ({selectedGridIds.size})
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => {
+                  setSetLocationFailures([]);
+                  setIsSetLocationModalOpen(true);
+                }}
+                disabled={isTransitionLocked}
+                title="Set one location for the selected images"
+              >
+                Set location for selected ({selectedGridIds.size})
               </button>
             </>
           ) : null}
@@ -3309,6 +3439,16 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       </fieldset>
                     </div>
                   </details>
+
+                  <div className="metadata-location">
+                    <label htmlFor="image-location">Location</label>
+                    <LocationPicker
+                      id="image-location"
+                      value={metadata.location}
+                      onChange={updateLocation}
+                      disabled={isPersistingRotation || isUploading}
+                    />
+                  </div>
 
                   <div className="do-not-upload">
                     <button
@@ -3816,6 +3956,15 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}
+      />
+      <SetLocationModal
+        isOpen={isSetLocationModalOpen}
+        selectedCount={selectedGridIds.size}
+        isSubmitting={isSettingLocation}
+        failures={setLocationFailures}
+        countExisting={countSelectedLocations}
+        onConfirm={(location) => void handleConfirmSetLocation(location)}
+        onClose={() => setIsSetLocationModalOpen(false)}
       />
       <AddTagsModal
         isOpen={isAddTagsModalOpen}

@@ -42,6 +42,8 @@ import {
   setFolderDate,
   resetFolderMetadata,
   addTagsToPairs,
+  countPairsWithLocation,
+  setLocationForPairs,
   setPairsDate,
   setFolderProcessed,
   shutdownCore,
@@ -1005,6 +1007,34 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     return addTagsToPairs(
       pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
       body.tags,
+    );
+  },
+  "POST /api/count-pairs-location": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs)) {
+      throw new HttpError(400, "No images selected.");
+    }
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return {
+      count: await countPairsWithLocation(
+        pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      ),
+    };
+  },
+  "POST /api/set-pairs-location": async (request) => {
+    const body = await readJsonBody(request);
+    if (!Array.isArray(body.pairs)) {
+      throw new HttpError(400, "No images selected.");
+    }
+    // Every path is confined to the user's folders before anything is written.
+    const pairs = await Promise.all(
+      body.pairs.map((pair) => validateMetadataPaths(request.user, pair)),
+    );
+    return setLocationForPairs(
+      pairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+      body.location,
     );
   },
   "POST /api/apply-image-rotations": async (request) =>
