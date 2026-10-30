@@ -607,47 +607,39 @@
   gap: 8px;
 }
 
-.metadata-details {
-  min-width: 0;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 10px;
-  overflow: hidden;
-  transition: grid-column 0.3s ease-out;
-}
-
-.metadata-details[open] {
-  grid-column: 1 / -1;
-}
-
-.metadata-details-summary {
+.metadata-details-toggle {
+  appearance: none;
   display: flex;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  background: transparent;
   padding: 0.8rem 0.9rem;
   color: #dfeaf7;
+  font: inherit;
   font-weight: 600;
+  text-align: left;
   cursor: pointer;
-  list-style: none;
   user-select: none;
 }
 
-.metadata-details-summary::-webkit-details-marker {
-  display: none;
-}
-
-.metadata-details-summary::after {
+.metadata-details-toggle::after {
   content: "+";
   color: #7dd3fc;
   font-size: 1.35rem;
   line-height: 1;
 }
 
-.metadata-details[open] .metadata-details-summary::after {
+.metadata-details-toggle[aria-expanded="true"]::after {
   content: "\2212";
 }
 
-.metadata-details-summary:focus-visible {
+.metadata-details-toggle:focus-visible {
   outline: 2px solid #7dd3fc;
   outline-offset: -3px;
 }
@@ -659,11 +651,43 @@
   font-weight: 400;
 }
 
-.metadata-details-content {
+/* The second row of the metadata grid: Tags on one half, Location on the other. */
+.additional-details {
+  grid-column: 1 / -1;
+  grid-row: 2;
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
-  padding: 0 0.9rem 0.9rem;
-  border-top: 1px solid rgba(148, 163, 184, 0.14);
+  align-items: start;
+}
+
+/* Not clipped (no overflow: hidden), so a long tag list grows the box and dropdowns can overlay it. */
+.detail-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 0.8rem 0.9rem 0.9rem;
+}
+
+.detail-box h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+/* The entry field takes a third of the box; the chosen tags or place take the other two thirds. */
+.detail-box-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.detail-box-row > .field-help {
+  margin: 0;
+  align-self: center;
 }
 
 .tag-entry {
@@ -959,6 +983,10 @@
     grid-column: auto;
   }
 
+  .additional-details {
+    grid-row: auto;
+  }
+
   .immich-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -988,4 +1016,15 @@
   .viewer-toolbar {
     flex-wrap: wrap;
   }
+}
+
+@media (max-width: 760px) {
+  .additional-details,
+  .detail-box-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.tag-entry input {
+  min-width: 0;
 }
