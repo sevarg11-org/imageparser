@@ -91,11 +91,17 @@ const toFileInput = (filePath) => {
  * Runs ffmpeg or ffprobe without a shell and returns its standard output.
  * @param {"ffmpeg"|"ffprobe"} name - The binary to run.
  * @param {string[]} args - The arguments.
- * @param {{signal?: AbortSignal}} [options] - Stops the command when aborted.
- * @returns {Promise<Buffer>} The standard output.
+ * @param {{signal?: AbortSignal, timeoutMs?: number|null, onStdout?: (chunk: Buffer) => void}} [options] - Stops
+ *   the command when aborted; a time limit (null for none, as for compression); and a listener that receives
+ *   standard output instead of it being collected.
+ * @returns {Promise<Buffer>} The standard output (empty when onStdout is given).
  * @throws {Error} If the binary is missing, the command fails, or it runs too long.
  */
-export const runMediaCommand = async (name, args, { signal } = {}) => {
+export const runMediaCommand = async (
+  name,
+  args,
+  { signal, timeoutMs = mediaCommandTimeoutMs, onStdout } = {},
+) => {
   const binary = await resolveMediaBinary(name);
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
@@ -125,13 +131,20 @@ export const runMediaCommand = async (name, args, { signal } = {}) => {
       child.kill();
       finish(signal?.reason ?? new Error(`${name} was stopped.`));
     };
-    const timer = setTimeout(() => {
-      child.kill();
-      finish(new Error(`${name} took too long.`));
-    }, mediaCommandTimeoutMs);
+    const timer =
+      timeoutMs === null
+        ? null
+        : setTimeout(() => {
+            child.kill();
+            finish(new Error(`${name} took too long.`));
+          }, timeoutMs);
     signal?.addEventListener("abort", stop, { once: true });
 
     child.stdout.on("data", (chunk) => {
+      if (onStdout) {
+        onStdout(chunk);
+        return;
+      }
       outputBytes += chunk.length;
       if (outputBytes > maxCommandOutputBytes) {
         child.kill();
@@ -179,7 +192,7 @@ export const probeVideo = async (filePath, { run = runMediaCommand } = {}) => {
     "-print_format",
     "json",
     "-show_entries",
-    "format=duration:stream=codec_type,codec_name,width,height",
+    `format=duration:format_tags=${compressedMarkerTag},creation_time:stream=codec_type,codec_name,width,height`,
     toFileInput(filePath),
   ]);
   return parseProbeOutput(output.toString("utf8"));
@@ -188,7 +201,7 @@ export const probeVideo = async (filePath, { run = runMediaCommand } = {}) => {
 /**
  * Parses ffprobe's JSON output.
  * @param {string} text - The ffprobe output.
- * @returns {{durationSeconds: number|null, videoCodec: string|null, audioCodec: string|null, width: number|null, height: number|null}}
+ * @returns {{durationSeconds: number|null, videoCodec: string|null, audioCodec: string|null, width: number|null, height: number|null, compressedByImageParser: boolean, creationTime: string|null}}
  */
 export const parseProbeOutput = (text) => {
   let parsed;
@@ -212,7 +225,218 @@ export const parseProbeOutput = (text) => {
     audioCodec: typeof audio?.codec_name === "string" ? audio.codec_name : null,
     width: toDimension(video?.width),
     height: toDimension(video?.height),
+    compressedByImageParser: Object.entries(parsed?.format?.tags ?? {}).some(
+      ([key, value]) =>
+        key.toLowerCase() === compressedMarkerTag && String(value) === "1",
+    ),
+    creationTime: (() => {
+      const value = parsed?.format?.tags?.creation_time;
+      return typeof value === "string" && !Number.isNaN(Date.parse(value))
+        ? value
+        : null;
+    })(),
   };
+};
+
+/**
+ * The container tag Image Parser writes into every video it compresses, so a compressed video is never
+ * compressed again (each pass would lose quality).
+ * @type {string}
+ */
+export const compressedMarkerTag = "imageparser_compressed";
+
+/**
+ * The compression choices, kept inside the recommended ranges for digitized tape: H.265 at CRF 23-26 or
+ * H.264 at CRF 20-23, the medium or slow preset, and AAC-LC at 128-192 kbps.
+ */
+export const videoCompressionLimits = Object.freeze({
+  h265: Object.freeze({ minCrf: 23, maxCrf: 26, defaultCrf: 24 }),
+  h264: Object.freeze({ minCrf: 20, maxCrf: 23, defaultCrf: 21 }),
+  presets: Object.freeze(["medium", "slow"]),
+  minAudioBitrateKbps: 128,
+  maxAudioBitrateKbps: 192,
+});
+
+/**
+ * The default compression settings: off, H.265 at CRF 24, medium preset, 160 kbps AAC.
+ */
+export const defaultVideoCompression = Object.freeze({
+  enabled: false,
+  codec: "h265",
+  crf: videoCompressionLimits.h265.defaultCrf,
+  preset: "medium",
+  audioBitrateKbps: 160,
+});
+
+/**
+ * Validates compression settings. Missing values take the defaults; out-of-range values are rejected so a
+ * typo never produces a much larger or much worse file than intended.
+ * @param {*} value - The raw settings.
+ * @returns {{enabled: boolean, codec: "h265"|"h264", crf: number, preset: "medium"|"slow", audioBitrateKbps: number}}
+ * @throws {Error} If a value is outside the recommended range.
+ */
+export const normalizeVideoCompression = (value) => {
+  const codec = value?.codec === "h264" ? "h264" : "h265";
+  const limits = videoCompressionLimits[codec];
+  const crf =
+    value?.crf === undefined || value?.crf === null || value?.crf === ""
+      ? limits.defaultCrf
+      : Number(value.crf);
+  const preset = value?.preset ?? defaultVideoCompression.preset;
+  const audioBitrateKbps =
+    value?.audioBitrateKbps === undefined ||
+    value?.audioBitrateKbps === null ||
+    value?.audioBitrateKbps === ""
+      ? defaultVideoCompression.audioBitrateKbps
+      : Number(value.audioBitrateKbps);
+
+  if (!Number.isInteger(crf) || crf < limits.minCrf || crf > limits.maxCrf) {
+    throw new Error(
+      `The ${codec === "h265" ? "H.265" : "H.264"} quality (CRF) must be a whole number from ${limits.minCrf} through ${limits.maxCrf}.`,
+    );
+  }
+  if (!videoCompressionLimits.presets.includes(preset)) {
+    throw new Error("The encoder preset must be medium or slow.");
+  }
+  if (
+    !Number.isInteger(audioBitrateKbps) ||
+    audioBitrateKbps < videoCompressionLimits.minAudioBitrateKbps ||
+    audioBitrateKbps > videoCompressionLimits.maxAudioBitrateKbps
+  ) {
+    throw new Error(
+      `The audio bitrate must be a whole number of kbps from ${videoCompressionLimits.minAudioBitrateKbps} through ${videoCompressionLimits.maxAudioBitrateKbps}.`,
+    );
+  }
+  return {
+    enabled: value?.enabled === true,
+    codec,
+    crf,
+    preset,
+    audioBitrateKbps,
+  };
+};
+
+/**
+ * Builds the ffmpeg arguments that compress one video to MP4:
+ * - the native resolution (never scaled; only an odd width or height loses its last pixel, which the
+ *   encoders require),
+ * - the source frame rate as a constant frame rate,
+ * - H.265 (tagged hvc1 so Apple devices and browsers play it) or H.264 with CRF quality and the chosen preset,
+ * - AAC-LC audio at the chosen bitrate, keeping the source's channel layout,
+ * - the source's metadata, its recording date when it has none, and the Image Parser marker.
+ * @param {string} inputPath - The absolute path of the source video.
+ * @param {string} outputPath - The absolute path to write; it gets no extension, so the format is set explicitly.
+ * @param {ReturnType<typeof normalizeVideoCompression>} settings - The compression settings.
+ * @param {{creationTime?: string|null}} [options] - The date to record when the source has none (ISO 8601).
+ * @returns {string[]} The ffmpeg arguments.
+ */
+export const buildCompressionArguments = (
+  inputPath,
+  outputPath,
+  settings,
+  { creationTime = null } = {},
+) => {
+  const videoArguments =
+    settings.codec === "h264"
+      ? ["-c:v", "libx264", "-profile:v", "high"]
+      : [
+          "-c:v",
+          "libx265",
+          "-tag:v",
+          "hvc1",
+          "-x265-params",
+          "log-level=error",
+        ];
+  return [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-nostats",
+    "-progress",
+    "pipe:1",
+    "-y",
+    "-i",
+    toFileInput(inputPath),
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a?",
+    "-map_metadata",
+    "0",
+    ...videoArguments,
+    "-crf",
+    String(settings.crf),
+    "-preset",
+    settings.preset,
+    "-pix_fmt",
+    "yuv420p",
+    "-vf",
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    "-fps_mode",
+    "cfr",
+    "-c:a",
+    "aac",
+    "-profile:a",
+    "aac_low",
+    "-b:a",
+    `${settings.audioBitrateKbps}k`,
+    "-movflags",
+    "+faststart+use_metadata_tags",
+    ...(creationTime ? ["-metadata", `creation_time=${creationTime}`] : []),
+    "-metadata",
+    `${compressedMarkerTag}=1`,
+    "-f",
+    "mp4",
+    toFileInput(outputPath),
+  ];
+};
+
+/**
+ * Compresses one video with ffmpeg. There is no time limit: a long tape at the slow preset can take hours.
+ * @param {string} inputPath - The absolute path of the source video.
+ * @param {string} outputPath - The absolute path to write.
+ * @param {ReturnType<typeof normalizeVideoCompression>} settings - The compression settings.
+ * @param {{creationTime?: string|null, durationSeconds?: number|null, signal?: AbortSignal, onProgress?: (fraction: number) => void, run?: typeof runMediaCommand}} [options] -
+ *   The date to record when the source has none, the source duration (for progress), a cancellation signal,
+ *   a progress listener (0 to 1), and a replaceable command runner, for tests.
+ * @returns {Promise<void>}
+ */
+export const compressVideo = async (
+  inputPath,
+  outputPath,
+  settings,
+  {
+    creationTime = null,
+    durationSeconds = null,
+    signal,
+    onProgress,
+    run = runMediaCommand,
+  } = {},
+) => {
+  let pending = "";
+  await run(
+    "ffmpeg",
+    buildCompressionArguments(inputPath, outputPath, settings, {
+      creationTime,
+    }),
+    {
+      signal,
+      timeoutMs: null,
+      onStdout: (chunk) => {
+        pending += chunk.toString();
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        for (const line of lines) {
+          const match = line.match(/^out_time_us=(\d+)/);
+          if (match && durationSeconds && onProgress) {
+            onProgress(
+              Math.min(1, Number(match[1]) / 1_000_000 / durationSeconds),
+            );
+          }
+        }
+      },
+    },
+  );
 };
 
 /**

@@ -1332,6 +1332,10 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
         recursive: body.recursive === true,
         log: logger,
         lockKey: request.user.userKey || "default",
+        // Video compression rewrites files, so nested folders stay confined to the user's folders.
+        isAllowedPath: (
+          await getScanOptionsForUser(request.user, body.recursive === true)
+        ).isAllowedPath,
       },
     );
   },

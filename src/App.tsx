@@ -62,6 +62,11 @@ import TagInput from "./TagInput";
 import { mergeTagSources } from "./tagSuggestions";
 import VideoPlayer from "./VideoPlayer";
 import {
+  DEFAULT_VIDEO_COMPRESSION,
+  VIDEO_COMPRESSION_LIMITS,
+  type VideoCompressionSettings,
+} from "./videoModel";
+import {
   fetchCurrentUser,
   isWebApp,
   loadImmichTags,
@@ -153,6 +158,8 @@ type ImmichSettings = {
   tags: string;
   pauseImmichJobs: boolean;
   concurrentTasks: number;
+  /** Compresses standalone videos in place (replacing the originals) before the upload. */
+  videoCompression: VideoCompressionSettings;
   /** Set by the web server only; managed keys are never sent to the browser. */
   managed?: ImmichManagedFields;
 };
@@ -169,10 +176,12 @@ type ImmichUploadResult = {
   ok: boolean;
   exitCode: number;
   output: string;
+  /** How many videos were compressed in place (renamed to .mp4) before the upload. */
+  compressedVideos?: number;
 };
 
 type ImmichUploadProgress = {
-  phase: "uploading";
+  phase: "compressing" | "uploading";
   output: string;
 };
 
@@ -882,6 +891,7 @@ const defaultImmichSettings: ImmichSettings = {
   tags: "",
   pauseImmichJobs: true,
   concurrentTasks: 2,
+  videoCompression: DEFAULT_VIDEO_COMPRESSION,
 };
 
 /**
@@ -1204,7 +1214,13 @@ function App() {
       try {
         const savedSettings = await electronApi.loadImmichSettings();
         if (isMounted) {
-          setImmichSettings(savedSettings);
+          setImmichSettings({
+            ...savedSettings,
+            videoCompression: {
+              ...DEFAULT_VIDEO_COMPRESSION,
+              ...savedSettings.videoCompression,
+            },
+          });
         }
       } catch (error) {
         if (isMounted) {
@@ -1259,7 +1275,11 @@ function App() {
 
     return electronApi.onImmichUploadProgress((progress) => {
       setImmichOutput(progress.output);
-      setImmichStatus("Immich is processing the selected directory...");
+      setImmichStatus(
+        progress.phase === "compressing"
+          ? "Compressing videos before the upload..."
+          : "Immich is processing the selected directory...",
+      );
     });
   }, []);
 
@@ -2608,6 +2628,21 @@ function App() {
   };
 
   /**
+   * Updates part of the video compression settings.
+   * @param changes - The compression fields to change.
+   */
+  const updateVideoCompression = (
+    changes: Partial<VideoCompressionSettings>,
+  ) => {
+    setImmichSettings((current) => ({
+      ...current,
+      videoCompression: { ...current.videoCompression, ...changes },
+    }));
+  };
+  const compressionCrfLimits =
+    VIDEO_COMPRESSION_LIMITS[immichSettings.videoCompression.codec];
+
+  /**
    * Handles the upload of images to Immich after applying pending image rotations.
    * Saves settings, processes any outstanding rotation tasks, then uploads the directory.
    */
@@ -2665,6 +2700,10 @@ function App() {
           ? "Immich upload completed successfully."
           : `Immich upload failed with exit code ${result.exitCode}.`,
       );
+      // Compressed videos replaced their originals (often under a new .mp4 name), so the list is stale.
+      if (result.compressedVideos) {
+        await reloadDirectory(sortBy);
+      }
     } catch (error) {
       setImmichStatus(
         error instanceof Error ? error.message : "Unable to upload to Immich.",
@@ -4029,6 +4068,109 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   />
                 </label>
               </div>
+
+              <fieldset
+                className="video-compression"
+                disabled={isUploading}
+                aria-describedby="video-compression-help"
+              >
+                <legend>Video compression</legend>
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={immichSettings.videoCompression.enabled}
+                    onChange={(event) =>
+                      updateVideoCompression({ enabled: event.target.checked })
+                    }
+                  />
+                  Compress videos before uploading
+                </label>
+                <p
+                  id="video-compression-help"
+                  className="video-compression-help"
+                >
+                  Each standalone video is re-encoded to MP4 at its own
+                  resolution and frame rate, and{" "}
+                  <strong>the original file is replaced</strong>. Live photo
+                  videos, videos flagged &quot;Do not upload&quot;, and videos
+                  already compressed are left as they are. If any video cannot
+                  be compressed, the upload does not start.
+                </p>
+                {immichSettings.videoCompression.enabled ? (
+                  <div className="video-compression-options">
+                    <label>
+                      Video codec
+                      <select
+                        value={immichSettings.videoCompression.codec}
+                        onChange={(event) => {
+                          const codec =
+                            event.target.value === "h264" ? "h264" : "h265";
+                          updateVideoCompression({
+                            codec,
+                            crf: VIDEO_COMPRESSION_LIMITS[codec].defaultCrf,
+                          });
+                        }}
+                      >
+                        <option value="h265">
+                          H.265 (HEVC): smaller, slower to encode
+                        </option>
+                        <option value="h264">
+                          H.264 (AVC): plays everywhere
+                        </option>
+                      </select>
+                    </label>
+                    <label>
+                      Quality (CRF {compressionCrfLimits.minCrf}–
+                      {compressionCrfLimits.maxCrf}; lower is better and bigger)
+                      <input
+                        type="number"
+                        min={compressionCrfLimits.minCrf}
+                        max={compressionCrfLimits.maxCrf}
+                        step="1"
+                        value={immichSettings.videoCompression.crf}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            crf: Number(event.target.value),
+                          })
+                        }
+                        required
+                      />
+                    </label>
+                    <label>
+                      Encoder preset
+                      <select
+                        value={immichSettings.videoCompression.preset}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            preset:
+                              event.target.value === "slow" ? "slow" : "medium",
+                          })
+                        }
+                      >
+                        <option value="medium">Medium</option>
+                        <option value="slow">
+                          Slow: smaller files, takes longer
+                        </option>
+                      </select>
+                    </label>
+                    <label>
+                      Audio (AAC-LC)
+                      <select
+                        value={immichSettings.videoCompression.audioBitrateKbps}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            audioBitrateKbps: Number(event.target.value),
+                          })
+                        }
+                      >
+                        <option value={128}>128 kbps</option>
+                        <option value={160}>160 kbps</option>
+                        <option value={192}>192 kbps</option>
+                      </select>
+                    </label>
+                  </div>
+                ) : null}
+              </fieldset>
 
               <div className="immich-actions">
                 <label className="checkbox-field">

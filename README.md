@@ -8,6 +8,14 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
 - **Metadata Editing**: Edit EXIF dates embedded in image files and XMP sidecar metadata (description, tags, orientation).
 - **Immich Upload**: Batch upload paired images and videos to Immich with configurable albums, tags, and concurrent
   tasks. immich-go's folder upload includes videos, and the `_exclude` "Do not upload" names apply to them too.
+- **Video Compression (optional)**: Turn on "Compress videos before uploading" in the Immich settings to re-encode
+  each standalone video before the upload, **replacing the original file**. The output follows the recommended
+  settings for digitized tape: MP4, H.265 (CRF 23–26, default 24) or H.264 (CRF 20–23, default 21), the medium or
+  slow preset, the native resolution (never upscaled), the source frame rate as a constant frame rate, and AAC-LC
+  audio at 128–192 kbps (default 160) with the source's channels. A `.mov`/`.mkv`/… becomes `.mp4` and its sidecar
+  is renamed to match; the file date and recording date are kept. An original is replaced only after the new file
+  is complete and smaller. Live photo videos, videos flagged "Do not upload", and videos Image Parser already
+  compressed are skipped. If any video cannot be compressed, the upload does not start.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
 - **Videos and Live Photos**: `.mp4`, `.m4v`, `.mov`, `.webm` and `.mkv` files appear in the grid with a play badge
   and their length, and play in Review with seek-bar previews. An image and a video with the same name in the same

@@ -54,7 +54,13 @@ test("reads duration and codecs from ffprobe output", () => {
             height: 1080,
           },
         ],
-        format: { duration: "12.3456" },
+        format: {
+          duration: "12.3456",
+          tags: {
+            creation_time: "1994-12-25T18:30:00.000000Z",
+            imageparser_compressed: "1",
+          },
+        },
       }),
     ),
     {
@@ -63,6 +69,8 @@ test("reads duration and codecs from ffprobe output", () => {
       audioCodec: "aac",
       width: 1920,
       height: 1080,
+      compressedByImageParser: true,
+      creationTime: "1994-12-25T18:30:00.000000Z",
     },
   );
   assert.deepEqual(parseProbeOutput("not json"), {
@@ -71,6 +79,8 @@ test("reads duration and codecs from ffprobe output", () => {
     audioCodec: null,
     width: null,
     height: null,
+    compressedByImageParser: false,
+    creationTime: null,
   });
 });
 

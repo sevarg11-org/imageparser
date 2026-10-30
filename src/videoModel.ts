@@ -58,6 +58,41 @@ export const buildSeekStoryboard = (
   };
 };
 
+export type VideoCompressionCodec = "h265" | "h264";
+
+/**
+ * Compression applied to standalone videos before an Immich upload, replacing the originals.
+ */
+export type VideoCompressionSettings = {
+  enabled: boolean;
+  codec: VideoCompressionCodec;
+  /** Constant Rate Factor: lower is higher quality and bigger. */
+  crf: number;
+  preset: "medium" | "slow";
+  audioBitrateKbps: number;
+};
+
+/**
+ * The recommended ranges for digitized tape. videoMedia.js validates the same limits on the server, and
+ * videoMedia.test.mjs keeps the two in step.
+ */
+export const VIDEO_COMPRESSION_LIMITS = {
+  h265: { minCrf: 23, maxCrf: 26, defaultCrf: 24 },
+  h264: { minCrf: 20, maxCrf: 23, defaultCrf: 21 },
+  presets: ["medium", "slow"],
+  minAudioBitrateKbps: 128,
+  maxAudioBitrateKbps: 192,
+} as const;
+
+/** Off by default; H.265 at CRF 24, the medium preset, and 160 kbps AAC when turned on. */
+export const DEFAULT_VIDEO_COMPRESSION: VideoCompressionSettings = {
+  enabled: false,
+  codec: "h265",
+  crf: VIDEO_COMPRESSION_LIMITS.h265.defaultCrf,
+  preset: "medium",
+  audioBitrateKbps: 160,
+};
+
 /**
  * The source type to give the player. QuickTime and M4V files are MP4-family containers that browsers play
  * as MP4, and Matroska is read by the WebM demuxer; whether the codec inside plays is up to the browser.

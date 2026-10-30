@@ -940,6 +940,38 @@
   text-align: left;
 }
 
+.video-compression {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(125, 211, 252, 0.22);
+  border-radius: 12px;
+}
+
+.video-compression legend {
+  padding: 0 6px;
+  color: #dfeaf7;
+  font-weight: 700;
+}
+
+.video-compression-help {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.video-compression-help strong {
+  color: #fcd34d;
+}
+
+.video-compression-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+
 .checkbox-field {
   display: flex;
   align-items: center;

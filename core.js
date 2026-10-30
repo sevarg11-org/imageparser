@@ -13,6 +13,9 @@ import {
   createPreviewCache,
 } from "./previewCache.js";
 import {
+  compressVideo,
+  defaultVideoCompression,
+  normalizeVideoCompression,
   probeVideo,
   renderSeekSprite,
   renderVideoFrame,
@@ -207,6 +210,7 @@ const defaultImmichSettings = Object.freeze({
   tags: "",
   pauseImmichJobs: false,
   concurrentTasks: 2,
+  videoCompression: defaultVideoCompression,
 });
 
 /**
@@ -248,6 +252,7 @@ const normalizeImmichSettings = (settings) => {
     tags: normalizeImmichTags(settings?.tags).join(", "),
     pauseImmichJobs: String(settings?.adminApiKey ?? "") !== "",
     concurrentTasks: Number(settings?.concurrentTasks),
+    videoCompression: normalizeVideoCompression(settings?.videoCompression),
   };
 
   let serverUrl;
@@ -453,15 +458,22 @@ const getImmichGoDiagnostics = () =>
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
- * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
- * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
+ * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, the key that serializes uploads (default: one upload at a time), and the confinement check for nested folders that video compression rewrites (see readDirectory).
+ * @returns {{ok: boolean, exitCode: number, output: string, compressedVideos: number}} The result of the upload operation with
+ *   redacted output, and how many videos were compressed (replacing the originals) before it.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
 const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
-  { debug = false, recursive = false, log, lockKey = "default" } = {},
+  {
+    debug = false,
+    recursive = false,
+    log,
+    lockKey = "default",
+    isAllowedPath,
+  } = {},
 ) => {
   if (runningImmichUploads.has(lockKey)) {
     throw new Error("An Immich upload is already running.");
@@ -487,6 +499,47 @@ const runImmichUpload = async (
       { debug, recursive },
     );
     const redact = (text) => redactImmichSecrets(text, normalizedSettings);
+
+    // Videos are compressed first, replacing the originals, so the upload sends the smaller files.
+    let compressionOutput = "";
+    let compressedVideos = 0;
+    if (normalizedSettings.videoCompression.enabled) {
+      reportProgress({
+        phase: "compressing",
+        output: "Looking for videos to compress...",
+      });
+      let lastReported = "";
+      const compression = await compressFolderVideos(
+        normalizedDirectoryPath,
+        normalizedSettings.videoCompression,
+        {
+          recursive,
+          isAllowedPath,
+          onProgress: ({ index, total, filePath, fraction }) => {
+            const message = `Compressing ${path.basename(filePath)} (${index + 1} of ${total}): ${Math.round(fraction * 100)}%`;
+            if (message !== lastReported) {
+              lastReported = message;
+              reportProgress({ phase: "compressing", output: message });
+            }
+          },
+        },
+      );
+      compressionOutput = describeCompressionResult(compression);
+      compressedVideos = compression.compressed.length;
+      log?.info("Video compression finished.", {
+        compressed: compression.compressed.length,
+        skipped: compression.skipped.length,
+        errors: compression.errors,
+      });
+      if (!compression.ok) {
+        return {
+          ok: false,
+          exitCode: -1,
+          compressedVideos,
+          output: `${compressionOutput}\nThe upload did not start because some videos could not be compressed. Fix them, flag them "Do not upload", or turn off video compression.`,
+        };
+      }
+    }
 
     log?.info("Starting immich-go upload.", {
       command: redact(["immich-go", ...uploadArguments].join(" ")),
@@ -550,7 +603,12 @@ const runImmichUpload = async (
         resolve({
           ok,
           exitCode: exitCode ?? -1,
-          output: redact([combinedOutput, ...hints].filter(Boolean).join("\n")),
+          compressedVideos,
+          output: redact(
+            [compressionOutput, combinedOutput, ...hints]
+              .filter(Boolean)
+              .join("\n"),
+          ),
         });
       });
     });
@@ -2031,6 +2089,14 @@ const loadImmichSettings = async (settingsDirectory, secretCodec) => {
       concurrentTasks:
         Number(storedSettings.concurrentTasks) ||
         defaultImmichSettings.concurrentTasks,
+      videoCompression: (() => {
+        try {
+          return normalizeVideoCompression(storedSettings.videoCompression);
+        } catch {
+          // A hand-edited, out-of-range value falls back to the defaults (compression off).
+          return { ...defaultVideoCompression };
+        }
+      })(),
     };
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -2884,6 +2950,8 @@ const emptyVideoInfo = Object.freeze({
   audioCodec: null,
   width: null,
   height: null,
+  compressedByImageParser: false,
+  creationTime: null,
 });
 
 /**
@@ -3804,6 +3872,268 @@ const resetFolderMetadata = async (
 };
 
 /**
+ * Builds the hidden temporary path a video is compressed into, next to the original so the final rename stays
+ * on one filesystem. Its extension is not a media extension, so folder scans and uploads never pick it up.
+ * @param {string} videoPath - The original video.
+ * @returns {string} The temporary path.
+ */
+const buildCompressionTemporaryPath = (videoPath) =>
+  path.join(
+    path.dirname(videoPath),
+    `.${path.basename(videoPath)}.imageparser-compress.tmp`,
+  );
+
+/**
+ * Formats a byte count for messages, such as "1.4 GB".
+ * @param {number} bytes - The size in bytes.
+ * @returns {string} The formatted size.
+ */
+const formatByteSize = (bytes) => {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} bytes` : `${value.toFixed(1)} ${units[unit]}`;
+};
+
+/**
+ * Compresses one standalone video in place, while the caller holds the lock for the video and its new name.
+ * The original is replaced only after the compressed file is complete, about as long as the original, and
+ * smaller; the result is always an .mp4 whose sidecar is renamed to match. The file's modification time is kept,
+ * and so is its recording date (from the source's metadata, or its file date when it has none).
+ * @param {string} videoPath - The original video.
+ * @param {ReturnType<typeof normalizeVideoCompression>} settings - The compression settings.
+ * @param {{signal?: AbortSignal, onProgress?: (fraction: number) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ *   A cancellation signal, a progress listener, and replaceable compression and probe steps, for tests.
+ * @returns {Promise<{status: "compressed", from: string, to: string, originalBytes: number, compressedBytes: number}|{status: "skipped", filePath: string, reason: string}>}
+ * @throws {Error} If the new name is taken, the compression fails or looks incomplete, or a rename fails.
+ */
+const compressVideoInPlaceUnlocked = async (
+  videoPath,
+  settings,
+  { signal, onProgress, compress = compressVideo, probe = probeVideo } = {},
+) => {
+  const sourceStats = await fs.lstat(videoPath);
+  if (!sourceStats.isFile()) {
+    return {
+      status: "skipped",
+      filePath: videoPath,
+      reason: "it is a link or not a regular file",
+    };
+  }
+  const sourceInfo = await probe(path.resolve(videoPath)).catch(() => null);
+  if (!sourceInfo?.videoCodec) {
+    throw new Error("ffprobe could not read the video, so it was left as is.");
+  }
+  if (sourceInfo.compressedByImageParser) {
+    return {
+      status: "skipped",
+      filePath: videoPath,
+      reason: "it was already compressed",
+    };
+  }
+
+  const extension = path.extname(videoPath);
+  const targetPath =
+    extension.toLowerCase() === ".mp4"
+      ? videoPath
+      : `${videoPath.slice(0, videoPath.length - extension.length)}.mp4`;
+  const sourceSidecarPath = buildSidecarPath(videoPath);
+  const targetSidecarPath = buildSidecarPath(targetPath);
+  const hasSidecar = await pathExists(sourceSidecarPath);
+  if (targetPath !== videoPath) {
+    for (const taken of [
+      targetPath,
+      ...(hasSidecar ? [targetSidecarPath] : []),
+    ]) {
+      if (await pathExists(taken)) {
+        throw new Error(
+          `${path.basename(taken)} already exists, so the compressed video has nowhere to go.`,
+        );
+      }
+    }
+  }
+
+  const temporaryPath = buildCompressionTemporaryPath(videoPath);
+  try {
+    await compress(
+      path.resolve(videoPath),
+      path.resolve(temporaryPath),
+      settings,
+      {
+        creationTime:
+          sourceInfo.creationTime ??
+          new Date(
+            sourceStats.birthtimeMs || sourceStats.mtimeMs,
+          ).toISOString(),
+        durationSeconds: sourceInfo.durationSeconds,
+        signal,
+        onProgress,
+      },
+    );
+
+    const result = await probe(path.resolve(temporaryPath)).catch(() => null);
+    const expected = sourceInfo.durationSeconds;
+    const tolerance = expected ? Math.max(1, expected * 0.02) : 0;
+    if (
+      !result?.videoCodec ||
+      (expected &&
+        (!result.durationSeconds ||
+          Math.abs(result.durationSeconds - expected) > tolerance))
+    ) {
+      throw new Error(
+        "The compressed video is incomplete (its length does not match), so the original was kept.",
+      );
+    }
+
+    const compressedBytes = (await fs.stat(temporaryPath)).size;
+    if (compressedBytes >= sourceStats.size) {
+      await fs.rm(temporaryPath, { force: true });
+      return {
+        status: "skipped",
+        filePath: videoPath,
+        reason: `compressing did not make it smaller (${formatByteSize(sourceStats.size)})`,
+      };
+    }
+    await fs.utimes(temporaryPath, sourceStats.atime, sourceStats.mtime);
+
+    if (targetPath === videoPath) {
+      await fs.rename(temporaryPath, videoPath);
+    } else {
+      await fs.rename(temporaryPath, targetPath);
+      if (hasSidecar) {
+        try {
+          await fs.rename(sourceSidecarPath, targetSidecarPath);
+        } catch (error) {
+          // The original and its sidecar are still in place; drop the copy so nothing changes.
+          await fs.rm(targetPath, { force: true });
+          throw error;
+        }
+      }
+      try {
+        await fs.unlink(videoPath);
+      } catch (error) {
+        throw new Error(
+          `The compressed video was saved as ${path.basename(targetPath)}, but the original could not be deleted: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
+    }
+
+    return {
+      status: "compressed",
+      from: videoPath,
+      to: targetPath,
+      originalBytes: sourceStats.size,
+      compressedBytes,
+    };
+  } finally {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+};
+
+/**
+ * Compresses every standalone video in a folder (and, when recursive, its nested folders) in place before an
+ * upload: each original is replaced by a smaller MP4 (see compressVideoInPlaceUnlocked). Images, live photo
+ * videos, videos flagged "Do not upload", and videos already compressed are left alone. Videos are compressed
+ * one at a time, each under the image file lock; one failure does not stop the rest.
+ * @param {string} directoryPath - The folder to compress.
+ * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression).
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ *   Whether to include nested folders and the confinement check for them (see readDirectory), a cancellation
+ *   signal, a progress listener, and replaceable compression and probe steps, for tests.
+ * @returns {Promise<{ok: boolean, compressed: Array<{from: string, to: string, originalBytes: number, compressedBytes: number}>, skipped: Array<{filePath: string, reason: string}>, errors: string[]}>}
+ */
+const compressFolderVideos = async (
+  directoryPath,
+  compressionSettings,
+  {
+    recursive = false,
+    isAllowedPath,
+    signal,
+    onProgress = () => {},
+    compress,
+    probe,
+  } = {},
+) => {
+  const settings = normalizeVideoCompression(compressionSettings);
+  const { files } = await readDirectory(directoryPath, "fileName-asc", {
+    recursive,
+    isAllowedPath,
+  });
+  const videos = files.filter(
+    (pair) => pair.mediaType === "video" && !pair.doNotUpload,
+  );
+
+  const compressed = [];
+  const skipped = [];
+  const errors = [];
+  for (const [index, video] of videos.entries()) {
+    signal?.throwIfAborted();
+    const videoPath = video.frontPath;
+    const report = (fraction) =>
+      onProgress({
+        index,
+        total: videos.length,
+        filePath: videoPath,
+        fraction,
+      });
+    report(0);
+    const extension = path.extname(videoPath);
+    const targetPath = `${videoPath.slice(0, videoPath.length - extension.length)}.mp4`;
+    try {
+      const result = await runImageFileOperation([videoPath, targetPath], () =>
+        compressVideoInPlaceUnlocked(videoPath, settings, {
+          signal,
+          onProgress: report,
+          compress,
+          probe,
+        }),
+      );
+      if (result.status === "compressed") {
+        compressed.push(result);
+      } else {
+        skipped.push(result);
+      }
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
+      errors.push(
+        `${video.imageLabel}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, compressed, skipped, errors };
+};
+
+/**
+ * Summarizes a compression run for the upload log.
+ * @param {Awaited<ReturnType<typeof compressFolderVideos>>} result - The compression result.
+ * @returns {string} One line per video, then the totals.
+ */
+const describeCompressionResult = ({ compressed, skipped, errors }) => {
+  const saved = compressed.reduce(
+    (total, item) => total + item.originalBytes - item.compressedBytes,
+    0,
+  );
+  return [
+    ...compressed.map(
+      (item) =>
+        `Compressed ${path.basename(item.from)}${item.to !== item.from ? ` to ${path.basename(item.to)}` : ""}: ${formatByteSize(item.originalBytes)} -> ${formatByteSize(item.compressedBytes)}`,
+    ),
+    ...skipped.map(
+      (item) => `Kept ${path.basename(item.filePath)} as is: ${item.reason}.`,
+    ),
+    ...errors.map((error) => `Could not compress ${error}`),
+    `Videos compressed: ${compressed.length}, kept as is: ${skipped.length}, failed: ${errors.length}. Space saved: ${formatByteSize(saved)}.`,
+  ].join("\n");
+};
+
+/**
  * Resolves once every queued image file operation (saves, rotations, previews) has finished.
  * @returns {Promise<void>}
  */
@@ -3823,6 +4153,7 @@ export {
   findLiveVideoPath,
   getVideoInfo,
   getVideoSeekSprite,
+  compressFolderVideos,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
   clearThumbnailMemoryCache,
