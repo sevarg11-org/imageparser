@@ -147,9 +147,39 @@ const fetchImmichAlbums = async (settings, fetchImpl = fetch) => {
   return mapPermittedAlbums([...byId.values()], String(me?.id ?? ""));
 };
 
+/**
+ * Reduces Immich tags to their full hierarchical paths (for example "Family/Parents"), without duplicates
+ * (ignoring case), sorted by path.
+ * @param {any[]} tags - The tags from Immich GET /tags.
+ * @returns {string[]} The tag paths.
+ */
+const mapTagValues = (tags) => {
+  const uniqueByLowerCase = new Map();
+  for (const tag of Array.isArray(tags) ? tags : []) {
+    const value = String(tag?.value ?? "").trim();
+    if (value && !uniqueByLowerCase.has(value.toLocaleLowerCase())) {
+      uniqueByLowerCase.set(value.toLocaleLowerCase(), value);
+    }
+  }
+  return [...uniqueByLowerCase.values()].sort((left, right) =>
+    left.localeCompare(right, undefined, { sensitivity: "base" }),
+  );
+};
+
+/**
+ * Loads the user's existing Immich tags.
+ * @param {{serverUrl: string, userApiKey: string}} settings - The Immich URL and the user's API key.
+ * @param {typeof fetch} [fetchImpl] - The fetch implementation (replaced in tests).
+ * @returns {Promise<string[]>} The full tag paths.
+ */
+const fetchImmichTags = async (settings, fetchImpl = fetch) =>
+  mapTagValues(await getImmichJson(settings, "/tags", fetchImpl));
+
 export {
   createLookupCache,
   fetchImmichAlbums,
+  fetchImmichTags,
+  mapTagValues,
   findAlbumByName,
   getImmichJson,
   ImmichLookupError,
