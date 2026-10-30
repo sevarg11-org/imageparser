@@ -1,14 +1,18 @@
 import { useCallback, useEffect, useId, useState } from "react";
 import { buildAlbumOptions, resolveAlbumName } from "./albumOptions";
-import { loadImmichAlbums, type ImmichAlbum } from "./webApi";
+import {
+  loadImmichAlbums,
+  type ImmichAlbum,
+  type ImmichLookupSettings,
+} from "./webApi";
 import "./AlbumCombobox.css";
 
 type AlbumComboboxProps = {
   value: string;
   onChange: (albumName: string) => void;
   disabled: boolean;
-  /** Changing this (for example after saving new Immich settings) reloads the album list. */
-  reloadKey: string;
+  /** The Immich URL and key in the form. The list reloads shortly after either changes. */
+  settings: ImmichLookupSettings;
 };
 
 /**
@@ -19,7 +23,7 @@ function AlbumCombobox({
   value,
   onChange,
   disabled,
-  reloadKey,
+  settings,
 }: AlbumComboboxProps) {
   const id = useId();
   const listboxId = `${id}-listbox`;
@@ -27,6 +31,7 @@ function AlbumCombobox({
   const [albums, setAlbums] = useState<ImmichAlbum[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [isOpen, setIsOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -38,29 +43,38 @@ function AlbumCombobox({
       setAlbums(result);
       setErrorMessage("");
     }
+    setHasLoaded(true);
     setIsLoading(false);
   }, []);
 
   const toResult = (error: unknown) =>
     error instanceof Error ? error : new Error("Albums could not be loaded.");
 
+  const { serverUrl, userApiKey } = settings;
+
   const refresh = () => {
     setIsLoading(true);
-    loadImmichAlbums(true).then(applyResult, (error) =>
-      applyResult(toResult(error)),
+    loadImmichAlbums({ serverUrl, userApiKey }, true).then(
+      applyResult,
+      (error) => applyResult(toResult(error)),
     );
   };
 
+  // Loads when the section appears and again shortly after the URL or key is edited, using the form's
+  // values because they are only saved when an upload starts.
   useEffect(() => {
     let isCurrent = true;
-    loadImmichAlbums(false).then(
-      (result) => isCurrent && applyResult(result),
-      (error) => isCurrent && applyResult(toResult(error)),
-    );
+    const timer = window.setTimeout(() => {
+      loadImmichAlbums({ serverUrl, userApiKey }).then(
+        (result) => isCurrent && applyResult(result),
+        (error) => isCurrent && applyResult(toResult(error)),
+      );
+    }, 600);
     return () => {
       isCurrent = false;
+      window.clearTimeout(timer);
     };
-  }, [applyResult, reloadKey]);
+  }, [applyResult, serverUrl, userApiKey]);
 
   const options = errorMessage ? [] : buildAlbumOptions(albums, value);
   const showList = isOpen && options.length > 0;
@@ -124,6 +138,13 @@ function AlbumCombobox({
       >
         {isLoading ? "Loading albums…" : "Refresh albums"}
       </button>
+      <span role="status" className="field-help">
+        {hasLoaded && !errorMessage && !isLoading
+          ? albums.length
+            ? `${albums.length} album${albums.length === 1 ? "" : "s"} available. Click the field to choose one.`
+            : "No albums found. Type a name to create one."
+          : ""}
+      </span>
       {showList ? (
         <ul id={listboxId} role="listbox" aria-label="Immich albums">
           {options.map((option, index) => (

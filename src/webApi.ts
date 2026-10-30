@@ -190,26 +190,39 @@ export type ImmichAlbum = {
   shared: boolean;
 };
 
+/** The Immich connection values currently in the form, which may not be saved yet. */
+export type ImmichLookupSettings = { serverUrl: string; userApiKey: string };
+
 /**
  * Loads the Immich albums the signed-in user may upload into (web app only).
+ * @param settings - The URL and key in the form; blank values fall back to the saved or managed ones.
  * @param refresh - Skips the server's short-lived cache.
  */
-export const loadImmichAlbums = async (refresh = false) =>
+export const loadImmichAlbums = async (
+  settings: ImmichLookupSettings,
+  refresh = false,
+) =>
   (
-    await requestJson<{ albums: ImmichAlbum[] }>(
-      `api/immich-albums${refresh ? "?refresh=1" : ""}`,
-    )
+    await postJson<{ albums: ImmichAlbum[] }>("api/immich-albums", {
+      settings,
+      refresh,
+    })
   ).albums;
 
 /**
  * Loads the user's existing Immich tags as full hierarchical paths (web app only).
+ * @param settings - The URL and key in the form; blank values fall back to the saved or managed ones.
  * @param refresh - Skips the server's short-lived cache.
  */
-export const loadImmichTags = async (refresh = false) =>
+export const loadImmichTags = async (
+  settings: ImmichLookupSettings,
+  refresh = false,
+) =>
   (
-    await requestJson<{ tags: string[] }>(
-      `api/immich-tags${refresh ? "?refresh=1" : ""}`,
-    )
+    await postJson<{ tags: string[] }>("api/immich-tags", {
+      settings,
+      refresh,
+    })
   ).tags;
 
 export const installWebApi = () => {

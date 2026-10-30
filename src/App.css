@@ -827,6 +827,8 @@
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+  /* Inputs share a top edge even when a neighbour grows (album help text, tag badges). */
+  align-items: start;
 }
 
 .immich-grid label,
@@ -846,8 +848,19 @@
   overflow-wrap: anywhere;
 }
 
+/* Matches the other upload fields: label, then input after the same 8px gap, with the badges below. */
 .immich-tags {
   grid-column: span 2;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #dfeaf7;
+  font-weight: 600;
+  text-align: left;
+}
+
+.immich-tags .selected-tags {
+  margin-top: 4px;
 }
 
 .field-help {

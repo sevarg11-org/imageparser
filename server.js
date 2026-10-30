@@ -1,6 +1,7 @@
 ﻿import {
   createCipheriv,
   createDecipheriv,
+  createHash,
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
@@ -870,16 +871,18 @@ const tagCache = createLookupCache();
  * @param {(settings: Object) => Promise<any>} lookup - The lookup to run.
  * @returns {Promise<any>} The lookup result.
  */
-const runImmichLookup = async (user, secretCodec, immichConfig, lookup) => {
-  const settings = registerImmichSecrets(
-    applyManagedImmichSettings(
-      await loadImmichSettings(
-        await getUserSettingsDirectory(user),
-        secretCodec,
-      ),
-      immichConfig,
-      user,
-    ),
+const runImmichLookup = async (
+  user,
+  secretCodec,
+  immichConfig,
+  lookup,
+  formSettings = {},
+) => {
+  const settings = await resolveLookupSettings(
+    user,
+    secretCodec,
+    immichConfig,
+    formSettings,
   );
   try {
     return await lookup(settings);
@@ -889,6 +892,86 @@ const runImmichLookup = async (user, secretCodec, immichConfig, lookup) => {
     }
     throw error;
   }
+};
+
+/**
+ * Works out the Immich URL and key for a lookup: the values typed in the form win over the saved ones (the
+ * form is only saved when an upload starts), and managed values from the environment or sign-in win over both.
+ * @param {Object} user - The request's user context.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {{serverUrl?: string, userApiKey?: string}} formSettings - The values currently in the form.
+ * @returns {Promise<{serverUrl: string, userApiKey: string}>} The settings to look up with.
+ */
+const resolveLookupSettings = async (
+  user,
+  secretCodec,
+  immichConfig,
+  formSettings,
+) => {
+  const saved = await loadImmichSettings(
+    await getUserSettingsDirectory(user),
+    secretCodec,
+  );
+  const typed = (value) => String(value ?? "").trim();
+  return registerImmichSecrets(
+    applyManagedImmichSettings(
+      {
+        ...saved,
+        serverUrl: typed(formSettings?.serverUrl) || saved.serverUrl,
+        userApiKey: typed(formSettings?.userApiKey) || saved.userApiKey,
+      },
+      immichConfig,
+      user,
+    ),
+  );
+};
+
+/**
+ * Answers an Immich lookup from the short-lived cache. The cache is keyed by user, server and a hash of the key,
+ * so changing either in the form never shows another account's or a stale list.
+ * @param {Object} request - The HTTP request (POST body: {refresh, settings: {serverUrl, userApiKey}}).
+ * @param {{get: Function, set: Function, delete: Function}} cache - The lookup cache.
+ * @param {Object} secretCodec - Object with encrypt and decrypt methods.
+ * @param {Object} immichConfig - Immich settings managed by the environment.
+ * @param {(settings: Object) => Promise<any>} lookup - The lookup to run on a cache miss.
+ * @returns {Promise<any>} The lookup result.
+ */
+const cachedImmichLookup = async (
+  request,
+  cache,
+  secretCodec,
+  immichConfig,
+  lookup,
+) => {
+  const body = await readJsonBody(request);
+  const settings = await resolveLookupSettings(
+    request.user,
+    secretCodec,
+    immichConfig,
+    body?.settings,
+  );
+  const cacheKey = [
+    request.user.userKey || "default",
+    settings.serverUrl,
+    createHash("sha256").update(settings.userApiKey).digest("hex"),
+  ].join("|");
+  if (body?.refresh === true) {
+    cache.delete(cacheKey);
+  }
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const result = await runImmichLookup(
+    request.user,
+    secretCodec,
+    immichConfig,
+    lookup,
+    body?.settings,
+  );
+  cache.set(cacheKey, result);
+  return result;
 };
 
 /**
@@ -922,41 +1005,26 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
       geocoder.rememberPlace(await readJsonBody(request)),
     ),
   }),
-  "GET /api/immich-albums": async (request, url) => {
-    const cacheKey = request.user.userKey || "default";
-    if (url.searchParams.get("refresh") === "1") {
-      albumCache.delete(cacheKey);
-    }
-    const cached = albumCache.get(cacheKey);
-    if (cached) {
-      return { albums: cached };
-    }
-    const albums = await runImmichLookup(
-      request.user,
+  // POST, because the form's (possibly unsaved) URL and key travel in the body, never in a logged URL.
+  "POST /api/immich-albums": async (request) => ({
+    albums: await cachedImmichLookup(
+      request,
+      albumCache,
       secretCodec,
       immichConfig,
       fetchImmichAlbums,
-    );
-    albumCache.set(cacheKey, albums);
-    return { albums };
-  },
-  "GET /api/immich-tags": async (request, url) => {
-    const cacheKey = request.user.userKey || "default";
-    if (url.searchParams.get("refresh") === "1") {
-      tagCache.delete(cacheKey);
-    }
-    const cached = tagCache.get(cacheKey);
-    if (cached) {
-      return { tags: cached };
-    }
-    const tags = await runImmichLookup(
-      request.user,
-      secretCodec,
-      immichConfig,
-      fetchImmichTags,
-    );
-    tagCache.set(cacheKey, tags);
-    return { tags };
+    ),
+  }),
+  "POST /api/immich-tags": async (request) => {
+    return {
+      tags: await cachedImmichLookup(
+        request,
+        tagCache,
+        secretCodec,
+        immichConfig,
+        fetchImmichTags,
+      ),
+    };
   },
   "POST /api/read-directory": async (request) => {
     const body = await readJsonBody(request);
