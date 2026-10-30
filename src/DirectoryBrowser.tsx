@@ -220,7 +220,7 @@ export const DirectoryBrowserDialog = ({ initialPath, loadListing, onClose }: Di
       <footer className="directory-browser-footer">
         <span>
           {listing && isSelectable(listing)
-            ? `${listing.imageCount} image${listing.imageCount === 1 ? '' : 's'} in this folder`
+            ? `${listing.imageCount} image or video file${listing.imageCount === 1 ? '' : 's'} in this folder`
             : ''}
         </span>
         <div className="directory-browser-actions">

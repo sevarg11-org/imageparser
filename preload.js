@@ -17,6 +17,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
       size: String(size),
       v: version,
     }).toString()}`,
+  // Served by the read-only "imageparser-video" protocol registered in main.js.
+  getVideoUrl: (filePath, version) =>
+    `imageparser-video://video/?${new URLSearchParams({
+      path: filePath,
+      v: version,
+    }).toString()}`,
+  getVideoSpriteUrl: (filePath, version) =>
+    `imageparser-video://sprite/?${new URLSearchParams({
+      path: filePath,
+      v: version,
+    }).toString()}`,
   applyImageRotations: (request) =>
     ipcRenderer.invoke("apply-image-rotations", request),
   setFolderDate: (directoryPath, date, recursive) =>

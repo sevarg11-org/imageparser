@@ -450,6 +450,18 @@
   border-color: rgba(125, 211, 252, 0.45);
 }
 
+/* A live photo's Still/Video switch, styled like the Grid/Review view switch. */
+.live-photo-toggle {
+  display: flex;
+  gap: 2px;
+}
+
+.image-actions .live-photo-toggle button[aria-pressed="true"] {
+  border-color: transparent;
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  color: white;
+}
+
 .image-card img {
   display: block;
   width: 100%;

@@ -1,3 +1,6 @@
+// The extension lets the Node tests load this module with type stripping.
+import { formatVideoDuration } from "./videoModel.ts";
+
 /**
  * The long-edge size, in pixels, requested for grid thumbnails.
  */
@@ -23,7 +26,21 @@ export type ThumbnailGridCell = {
   thumbnailUrl: string;
   /** A rotation, in degrees, chosen in the grid but not yet applied to the file. */
   rotation: number;
+  /** "video" for a standalone video, whose thumbnail is its poster frame. */
+  mediaType: "image" | "video";
+  /** True when the image has a live photo video. */
+  isLivePhoto: boolean;
+  /** A standalone video's length, or null when it is unknown or the cell is an image. */
+  durationSeconds: number | null;
 };
+
+/**
+ * Whether a cell can be rotated from the grid: videos never can.
+ * @param cell - The cell.
+ * @returns True for images, including live photo stills.
+ */
+export const canRotateGridCell = (cell: Pick<ThumbnailGridCell, "mediaType">) =>
+  cell.mediaType === "image";
 
 /**
  * The caption shown under a thumbnail.
@@ -34,7 +51,7 @@ export const formatGridDate = (date: string) => date || "No date";
 
 /**
  * Builds a grid cell's accessible name, for example
- * "img001_a.jpg, dated 1991-12-25, paired".
+ * "img001_a.jpg, dated 1991-12-25, paired" or "clip.mp4, video, 1:05, dated 2024-07-04".
  * @param cell - The cell to describe.
  * @returns The accessible name for the cell's button.
  */
@@ -42,10 +59,18 @@ export const describeGridCell = (
   cell: Pick<
     ThumbnailGridCell,
     "imageLabel" | "date" | "isPaired" | "doNotUpload" | "isUnprocessed"
-  >,
+  > &
+    Partial<
+      Pick<ThumbnailGridCell, "mediaType" | "isLivePhoto" | "durationSeconds">
+    >,
 ) =>
   [
     cell.imageLabel,
+    cell.mediaType === "video" ? "video" : "",
+    cell.mediaType === "video"
+      ? formatVideoDuration(cell.durationSeconds ?? null)
+      : "",
+    cell.isLivePhoto ? "live photo" : "",
     cell.date ? `dated ${cell.date}` : "no date",
     cell.isPaired ? "paired" : "",
     cell.doNotUpload ? "do not upload" : "",

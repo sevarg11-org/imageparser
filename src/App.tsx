@@ -60,6 +60,7 @@ import {
 } from "./thumbnailGridModel";
 import TagInput from "./TagInput";
 import { mergeTagSources } from "./tagSuggestions";
+import VideoPlayer from "./VideoPlayer";
 import {
   fetchCurrentUser,
   isWebApp,
@@ -73,10 +74,17 @@ type ImagePair = {
   imageLabel: string;
   /** The pair's folder relative to the loaded folder, with forward slashes; "" for the loaded folder itself. */
   relativeDirectory: string;
+  /** "video" for a standalone video; its frontPath is the video file and it never has a back. */
+  mediaType: "image" | "video";
   frontPath: string;
   backPath: string | null;
+  /** A live photo's video: same folder and stem as the A image, which has no side suffix. */
+  liveVideoPath: string | null;
   frontVersion: string;
   backVersion: string | null;
+  liveVideoVersion: string | null;
+  /** A standalone video's length, or null when it is unknown or the item is an image. */
+  durationSeconds: number | null;
   createdAt: number;
   doNotUpload: boolean;
   excludeMismatch: boolean;
@@ -95,6 +103,8 @@ type SetDoNotUploadResult = Pick<
   | "backPath"
   | "frontVersion"
   | "backVersion"
+  | "liveVideoPath"
+  | "liveVideoVersion"
   | "doNotUpload"
   | "excludeMismatch"
 > & {
@@ -241,6 +251,10 @@ declare global {
         size: number,
         version: string,
       ) => string;
+      /** Streams a video with Range support; never transcoded. */
+      getVideoUrl: (filePath: string, version: string) => string;
+      /** A video's seek-bar sprite, laid out as videoModel.ts SEEK_SPRITE_LAYOUT. */
+      getVideoSpriteUrl: (filePath: string, version: string) => string;
       applyImageRotations: (request: {
         frontPath: string;
         backPath: string | null;
@@ -555,6 +569,53 @@ const useDisplayedPreview = (
 const MAGNIFIER_LENS_SIZE = 160;
 const MAGNIFIER_ZOOM = 2.5;
 const MAGNIFIER_EDGE_BUFFER = 32;
+
+/** The poster size for a standalone video in Review; the largest thumbnail the server renders. */
+const VIDEO_POSTER_SIZE = 640;
+
+/**
+ * Plays the selected standalone video, or a live photo's video when its Video view is chosen. Live photo
+ * videos are a few seconds long, so they autoplay and skip the poster and seek-bar previews.
+ */
+const SelectedVideo = ({
+  pair,
+  isLiveVideo,
+  imageVersions,
+}: {
+  pair: ImagePair;
+  isLiveVideo: boolean;
+  /** File versions changed since the folder was read, by path. */
+  imageVersions: Record<string, string>;
+}) => {
+  const electronApi = window.electronAPI;
+  const videoPath = isLiveVideo ? pair.liveVideoPath : pair.frontPath;
+  if (!electronApi || !videoPath) {
+    return null;
+  }
+  const version =
+    imageVersions[videoPath] ??
+    (isLiveVideo ? pair.liveVideoVersion : pair.frontVersion) ??
+    "";
+  return (
+    <VideoPlayer
+      filePath={videoPath}
+      src={electronApi.getVideoUrl(videoPath, version)}
+      posterUrl={
+        isLiveVideo
+          ? undefined
+          : electronApi.getThumbnailUrl(videoPath, VIDEO_POSTER_SIZE, version)
+      }
+      spriteUrl={
+        isLiveVideo
+          ? undefined
+          : electronApi.getVideoSpriteUrl(videoPath, version)
+      }
+      durationSeconds={isLiveVideo ? null : pair.durationSeconds}
+      autoPlay={isLiveVideo}
+      title={`${pair.imageLabel}${isLiveVideo ? " (live photo video)" : ""}`}
+    />
+  );
+};
 
 const MagnifiedImage = ({
   filePath,
@@ -1039,6 +1100,15 @@ function App() {
     () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
+  // The live photo whose video is shown instead of its still; moving to another item shows its still again.
+  const [liveVideoPairId, setLiveVideoPairId] = useState<string | null>(null);
+  const isSelectedVideo = selectedPair?.mediaType === "video";
+  const isShowingLiveVideo =
+    selectedPair !== null &&
+    selectedPair.liveVideoPath !== null &&
+    liveVideoPairId === selectedPair.id;
+  // Videos are never rotated, and a live photo's still is rotated only while it is shown.
+  const canRotateSelectedFront = !isSelectedVideo && !isShowingLiveVideo;
 
   const gridCells = useMemo<ThumbnailGridCell[]>(() => {
     const electronApi = window.electronAPI;
@@ -1059,6 +1129,9 @@ function App() {
         imageVersions[pair.frontPath] ?? pair.frontVersion,
       ),
       rotation: gridRotations.get(pair.id) ?? 0,
+      mediaType: pair.mediaType,
+      isLivePhoto: pair.liveVideoPath !== null,
+      durationSeconds: pair.durationSeconds,
     }));
   }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
 
@@ -1820,7 +1893,12 @@ function App() {
    */
   const rotateImage = useCallback(
     (field: RotationField, delta: number) => {
-      if (isPersistingRotation || isUploading || !isHydrated) {
+      if (
+        isPersistingRotation ||
+        isUploading ||
+        !isHydrated ||
+        (field === "front" && !canRotateSelectedFront)
+      ) {
         return;
       }
 
@@ -1830,7 +1908,13 @@ function App() {
         [field]: normalizeRotation(current[field] + delta),
       }));
     },
-    [isHydrated, isPersistingRotation, isUploading, markUserChanged],
+    [
+      canRotateSelectedFront,
+      isHydrated,
+      isPersistingRotation,
+      isUploading,
+      markUserChanged,
+    ],
   );
 
   /**
@@ -1896,6 +1980,8 @@ function App() {
                 backPath: result.backPath,
                 frontVersion: result.frontVersion,
                 backVersion: result.backVersion,
+                liveVideoPath: result.liveVideoPath,
+                liveVideoVersion: result.liveVideoVersion,
                 doNotUpload: result.doNotUpload,
                 excludeMismatch: result.excludeMismatch,
               }
@@ -3615,7 +3701,11 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       <div className="image-card">
                         <div className="image-card-header">
                           <div className="image-label">
-                            Front image
+                            {isSelectedVideo
+                              ? "Video"
+                              : selectedPair?.liveVideoPath
+                                ? "Live photo"
+                                : "Front image"}
                             {selectedPair?.doNotUpload ? (
                               <span className="do-not-upload-badge">
                                 Do not upload
@@ -3623,20 +3713,48 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                             ) : null}
                           </div>
                           <div className="image-actions">
-                            <button
-                              type="button"
-                              onClick={() => rotateImage("front", -90)}
-                              disabled={isImageControlLocked}
-                            >
-                              Rotate left
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => rotateImage("front", 90)}
-                              disabled={isImageControlLocked}
-                            >
-                              Rotate right
-                            </button>
+                            {selectedPair?.liveVideoPath ? (
+                              <div
+                                className="live-photo-toggle"
+                                role="group"
+                                aria-label="Show the live photo's"
+                              >
+                                <button
+                                  type="button"
+                                  aria-pressed={!isShowingLiveVideo}
+                                  onClick={() => setLiveVideoPairId(null)}
+                                >
+                                  Still
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-pressed={isShowingLiveVideo}
+                                  onClick={() =>
+                                    setLiveVideoPairId(selectedPair.id)
+                                  }
+                                >
+                                  Video
+                                </button>
+                              </div>
+                            ) : null}
+                            {canRotateSelectedFront ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => rotateImage("front", -90)}
+                                  disabled={isImageControlLocked}
+                                >
+                                  Rotate left
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => rotateImage("front", 90)}
+                                  disabled={isImageControlLocked}
+                                >
+                                  Rotate right
+                                </button>
+                              </>
+                            ) : null}
                             <button
                               type="button"
                               onClick={toggleExpanded}
@@ -3646,24 +3764,36 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                             </button>
                           </div>
                         </div>
-                        <MagnifiedImage
-                          filePath={
-                            selectedPair && readyPairId === selectedPair.id
-                              ? selectedPair.frontPath
-                              : ""
-                          }
-                          version={getDisplayedVersion(
-                            selectedPair?.frontPath ?? null,
-                            selectedPair?.frontVersion ?? null,
-                          )}
-                          altText={`${selectedPair?.imageLabel ?? ""}`}
-                          rotation={normalizeRotation(
-                            rotations.front +
-                              (gridRotations.get(selectedPair?.id ?? "") ?? 0),
-                          )}
-                          isExpanded={isExpanded}
-                          collapsedHeight={collapsedImageHeight}
-                        />
+                        {selectedPair &&
+                        (isSelectedVideo || isShowingLiveVideo) &&
+                        window.electronAPI ? (
+                          <SelectedVideo
+                            key={`${selectedPair.id}-${isShowingLiveVideo ? "live" : "video"}`}
+                            pair={selectedPair}
+                            isLiveVideo={isShowingLiveVideo}
+                            imageVersions={imageVersions}
+                          />
+                        ) : (
+                          <MagnifiedImage
+                            filePath={
+                              selectedPair && readyPairId === selectedPair.id
+                                ? selectedPair.frontPath
+                                : ""
+                            }
+                            version={getDisplayedVersion(
+                              selectedPair?.frontPath ?? null,
+                              selectedPair?.frontVersion ?? null,
+                            )}
+                            altText={`${selectedPair?.imageLabel ?? ""}`}
+                            rotation={normalizeRotation(
+                              rotations.front +
+                                (gridRotations.get(selectedPair?.id ?? "") ??
+                                  0),
+                            )}
+                            isExpanded={isExpanded}
+                            collapsedHeight={collapsedImageHeight}
+                          />
+                        )}
                       </div>
 
                       {selectedPair && selectedPair.backPath ? (
