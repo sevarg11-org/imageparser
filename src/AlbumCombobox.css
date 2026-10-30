@@ -15,9 +15,9 @@
   padding: 0.25rem 0;
   overflow-y: auto;
   list-style: none;
-  background: Canvas;
-  color: CanvasText;
-  border: 1px solid GrayText;
+  background: #0f172a;
+  color: #f8fafc;
+  border: 1px solid #334155;
   border-radius: 6px;
 }
 
@@ -30,8 +30,8 @@
 }
 
 .album-combobox li.active {
-  background: Highlight;
-  color: HighlightText;
+  background: rgba(14, 116, 144, 0.6);
+  color: #f8fafc;
 }
 
 .album-combobox-meta {

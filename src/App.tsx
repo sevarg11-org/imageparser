@@ -1935,7 +1935,12 @@ function App() {
       const isRotationHotkeyBlocked =
         target === descriptionInputRef.current ||
         target === tagInputRef.current ||
-        Boolean(target?.closest(".immich-content input"));
+        // Text fields in the Additional Details row (tag typeahead, location search) keep their keystrokes.
+        Boolean(
+          target?.closest(
+            ".immich-content input, .additional-details input[type='text'], .additional-details textarea",
+          ),
+        );
 
       // Review shortcuts act on the selected image, which the grid does not show.
       if (
@@ -3371,91 +3376,109 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                     />
                   </label>
 
-                  <details
-                    className="metadata-details"
-                    open={isMetadataEntryExpanded}
-                    onToggle={(event) =>
-                      setIsMetadataEntryExpanded(event.currentTarget.open)
+                  <button
+                    type="button"
+                    className="metadata-details-toggle"
+                    aria-expanded={isMetadataEntryExpanded}
+                    aria-controls="additional-details"
+                    onClick={() =>
+                      setIsMetadataEntryExpanded((current) => !current)
                     }
                   >
-                    <summary className="metadata-details-summary">
-                      <span>Tags</span>
-                      <span className="metadata-details-action">
-                        {isMetadataEntryExpanded ? "Collapse" : "Expand"}
-                      </span>
-                    </summary>
-                    <div className="metadata-details-content">
-                      <div className="metadata-tags">
-                        <label htmlFor="new-tag">Tags</label>
-                        <TagInput
-                          id="new-tag"
-                          inputRef={tagInputRef}
-                          suggestions={tagSuggestions}
-                          selectedTags={metadata.tags}
-                          onAdd={addTag}
-                          placeholder="Type a new tag"
-                          disabled={isPersistingRotation || isUploading}
-                          lookupError={immichTagError}
-                        />
-                      </div>
+                    <span>Additional Details</span>
+                    <span className="metadata-details-action">
+                      {isMetadataEntryExpanded ? "Collapse" : "Expand"}
+                    </span>
+                  </button>
 
-                      {metadata.tags.length ? (
-                        <div
-                          className="selected-tags"
-                          aria-label="Selected tags"
-                        >
-                          {metadata.tags.map((tag) => (
-                            <button
-                              key={tag.toLocaleLowerCase()}
-                              type="button"
-                              onClick={() => toggleTag(tag)}
-                              disabled={isPersistingRotation || isUploading}
-                              aria-label={`Remove ${tag}`}
+                  {isMetadataEntryExpanded ? (
+                    <div id="additional-details" className="additional-details">
+                      <section
+                        className="detail-box metadata-tags"
+                        aria-labelledby="tags-heading"
+                      >
+                        <h3 id="tags-heading">
+                          <label htmlFor="new-tag">Tags</label>
+                        </h3>
+                        <div className="detail-box-row">
+                          <TagInput
+                            id="new-tag"
+                            inputRef={tagInputRef}
+                            suggestions={tagSuggestions}
+                            selectedTags={metadata.tags}
+                            onAdd={addTag}
+                            placeholder="Type a new tag"
+                            disabled={isPersistingRotation || isUploading}
+                            lookupError={immichTagError}
+                          />
+                          {metadata.tags.length ? (
+                            <div
+                              className="selected-tags"
+                              aria-label="Selected tags"
                             >
-                              {tag} <span aria-hidden="true">&times;</span>
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      <fieldset className="recent-tags">
-                        <legend>Recent tags</legend>
-                        {recentTags.length ? (
-                          <div className="recent-tag-options">
-                            {recentTags.map((tag) => (
-                              <label key={tag.toLocaleLowerCase()}>
-                                <input
-                                  type="checkbox"
-                                  checked={metadata.tags.some(
-                                    (selectedTag) =>
-                                      selectedTag.toLocaleLowerCase() ===
-                                      tag.toLocaleLowerCase(),
-                                  )}
-                                  onChange={() => toggleTag(tag)}
+                              {metadata.tags.map((tag) => (
+                                <button
+                                  key={tag.toLocaleLowerCase()}
+                                  type="button"
+                                  onClick={() => toggleTag(tag)}
                                   disabled={isPersistingRotation || isUploading}
-                                />
-                                <span>{tag}</span>
-                              </label>
-                            ))}
-                          </div>
-                        ) : (
-                          <span className="field-help">
-                            Tags from recently modified XMP files appear here.
-                          </span>
-                        )}
-                      </fieldset>
-                    </div>
-                  </details>
+                                  aria-label={`Remove ${tag}`}
+                                >
+                                  {tag} <span aria-hidden="true">&times;</span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="field-help">No tags yet.</p>
+                          )}
+                        </div>
 
-                  <div className="metadata-location">
-                    <label htmlFor="image-location">Location</label>
-                    <LocationPicker
-                      id="image-location"
-                      value={metadata.location}
-                      onChange={updateLocation}
-                      disabled={isPersistingRotation || isUploading}
-                    />
-                  </div>
+                        <fieldset className="recent-tags">
+                          <legend>Recent tags</legend>
+                          {recentTags.length ? (
+                            <div className="recent-tag-options">
+                              {recentTags.map((tag) => (
+                                <label key={tag.toLocaleLowerCase()}>
+                                  <input
+                                    type="checkbox"
+                                    checked={metadata.tags.some(
+                                      (selectedTag) =>
+                                        selectedTag.toLocaleLowerCase() ===
+                                        tag.toLocaleLowerCase(),
+                                    )}
+                                    onChange={() => toggleTag(tag)}
+                                    disabled={
+                                      isPersistingRotation || isUploading
+                                    }
+                                  />
+                                  <span>{tag}</span>
+                                </label>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="field-help">
+                              Tags from recently modified XMP files appear here.
+                            </span>
+                          )}
+                        </fieldset>
+                      </section>
+
+                      <section
+                        className="detail-box metadata-location"
+                        aria-labelledby="location-heading"
+                      >
+                        <h3 id="location-heading">
+                          <label htmlFor="image-location">Location</label>
+                        </h3>
+                        <LocationPicker
+                          id="image-location"
+                          value={metadata.location}
+                          onChange={updateLocation}
+                          disabled={isPersistingRotation || isUploading}
+                        />
+                      </section>
+                    </div>
+                  ) : null}
 
                   <div className="do-not-upload">
                     <button

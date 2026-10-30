@@ -13,6 +13,8 @@ type LocationPickerProps = {
   value: PlaceLocation | null;
   onChange: (location: PlaceLocation | null) => void;
   disabled: boolean;
+  /** Puts the search field above the chosen place instead of beside it, for narrow dialogs. */
+  stacked?: boolean;
 };
 
 /**
@@ -25,6 +27,7 @@ function LocationPicker({
   value,
   onChange,
   disabled,
+  stacked = false,
 }: LocationPickerProps) {
   const generatedId = useId();
   const resultsId = `${generatedId}-results`;
@@ -124,53 +127,53 @@ function LocationPicker({
   );
 
   return (
-    <div className="location-picker">
-      {value ? (
-        <p className="location-picker-current">
-          <span>
-            <strong>Location:</strong> {value.name || "Chosen place"}{" "}
-            <span className="location-picker-detail">
-              ({value.latitude.toFixed(4)}, {value.longitude.toFixed(4)})
-            </span>
-          </span>
+    <div
+      className={`location-picker${stacked ? " location-picker--stacked" : ""}`}
+    >
+      <div className="detail-box-row">
+        <div className="tag-entry location-picker-search">
+          <input
+            id={id}
+            type="text"
+            value={query}
+            placeholder="Search for a place"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void search();
+              }
+            }}
+            disabled={disabled}
+            aria-describedby={`${generatedId}-status`}
+            aria-controls={results ? resultsId : undefined}
+          />
           <button
             type="button"
             className="secondary-button"
-            onClick={() => onChange(null)}
-            disabled={disabled}
+            onClick={() => void search()}
+            disabled={disabled || isSearching || query.trim().length < 3}
           >
-            Clear
+            {isSearching ? "Searching…" : "Search"}
           </button>
-        </p>
-      ) : (
-        <p className="field-help">No location set.</p>
-      )}
+        </div>
 
-      <div className="location-picker-search">
-        <input
-          id={id}
-          type="text"
-          value={query}
-          placeholder="Search for a school, church, town…"
-          onChange={(event) => setQuery(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              void search();
-            }
-          }}
-          disabled={disabled}
-          aria-describedby={`${generatedId}-status`}
-          aria-controls={results ? resultsId : undefined}
-        />
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() => void search()}
-          disabled={disabled || isSearching || query.trim().length < 3}
-        >
-          {isSearching ? "Searching…" : "Search"}
-        </button>
+        {value ? (
+          <div className="selected-tags" aria-label="Chosen location">
+            <button
+              type="button"
+              onClick={() => onChange(null)}
+              disabled={disabled}
+              aria-label={`Clear location ${value.name || "chosen place"}`}
+              title={`${value.latitude.toFixed(4)}, ${value.longitude.toFixed(4)}`}
+            >
+              {value.name || "Chosen place"}{" "}
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+        ) : (
+          <p className="field-help">No location set.</p>
+        )}
       </div>
 
       <div

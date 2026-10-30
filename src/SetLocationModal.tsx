@@ -89,6 +89,7 @@ const SetLocationDialogContent = ({
         <label htmlFor="set-location-search">Place</label>
         <LocationPicker
           id="set-location-search"
+          stacked
           value={location}
           onChange={(next) => {
             setLocation(next);
