@@ -6,8 +6,22 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
 
 - **A/B Pair Comparison**: Review paired images with A/B side-by-side comparison, supporting common scan naming conventions (`*_a.*` / `*_b.*`, `*_front.*` / `*_back.*`).
 - **Metadata Editing**: Edit EXIF dates embedded in image files and XMP sidecar metadata (description, tags, orientation).
-- **Immich Upload**: Batch upload paired images to Immich with configurable albums, tags, and concurrent tasks.
+- **Immich Upload**: Batch upload paired images and videos to Immich with configurable albums, tags, and concurrent
+  tasks. immich-go's folder upload includes videos, and the `_exclude` "Do not upload" names apply to them too.
+- **Video Compression (optional)**: Turn on "Compress videos before uploading" in the Immich settings to re-encode
+  each standalone video before the upload, **replacing the original file**. The output follows the recommended
+  settings for digitized tape: MP4, H.265 (CRF 23–26, default 24) or H.264 (CRF 20–23, default 21), the medium or
+  slow preset, the native resolution (never upscaled), the source frame rate as a constant frame rate, and AAC-LC
+  audio at 128–192 kbps (default 160) with the source's channels. A `.mov`/`.mkv`/… becomes `.mp4` and its sidecar
+  is renamed to match; the file date and recording date are kept. An original is replaced only after the new file
+  is complete and smaller. Live photo videos, videos flagged "Do not upload", and videos Image Parser already
+  compressed are skipped. If any video cannot be compressed, the upload does not start.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
+- **Videos and Live Photos**: `.mp4`, `.m4v`, `.mov`, `.webm` and `.mkv` files appear in the grid with a play badge
+  and their length, and play in Review with seek-bar previews. An image and a video with the same name in the same
+  folder (`IMG_1.jpg` + `IMG_1.mov`) form a live photo: the grid shows the still with a "Live" mark, and Review has a
+  Still/Video switch. Scanned A/B pairs are never matched with videos. Videos play as stored (never transcoded); a
+  codec the browser cannot play shows a message with a download link. Videos cannot be rotated.
 - **Processed Folders**: Mark a folder (optionally with all its subfolders) as processed from the main screen or after an Immich upload; the folder browser shows a checkmark next to processed folders.
 - **Cross-Platform**: Desktop app for Windows/macOS/Linux via Electron; web server version for TrueNAS/Docker or local deployment.
 
@@ -333,6 +347,15 @@ The shared core logic handles:
 - **XMP Sidecars**: Create/update `.xmp` files containing description, tags, EXIF dates, and Adobe Photoshop date fields.
 - **Embedded EXIF**: Write creation date directly into image files (`.jpg`, `.tif`, etc.) using ExifTool.
 - **Rotation**: Apply orientation to metadata (`Orientation` tag) or rotate pixel data for PNG/WebP formats.
+- **Video sidecars**: Video files are never edited. A standalone video's metadata is saved only to `name.ext.xmp`
+  (for example `clip.mp4.xmp`; the `clip.xmp` form is never used for videos, because it belongs to a live photo's
+  image). Saving a live photo writes `IMG_1.jpg.xmp` and an identical `IMG_1.mov.xmp`; the image sidecar is the
+  source of truth when reading. Bulk dates, tags, places, "Reset processing" and "Do not upload" renames cover the
+  video and its sidecar too.
+- **Video previews**: ffmpeg/ffprobe read video lengths and render poster frames and seek-bar sprites, cached with
+  the image previews. The binaries are found through `FFMPEG_PATH` / `FFPROBE_PATH`, then the `ffmpeg-static` /
+  `ffprobe-static` packages installed for development and Electron, then `PATH` (the Docker image installs
+  `ffmpeg` with apt). Without ffmpeg, videos still play but show no poster, length, or seek-bar previews.
 - **Folder State**: Store the processed mark, with who set it and when, in a hidden `.imageparser.json` file inside the folder, so every user and both apps see the same state. A missing or unreadable file means the folder is not processed.
 
 ## Testing

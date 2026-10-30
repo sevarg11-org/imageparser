@@ -1,10 +1,13 @@
 import { app, BrowserWindow, ipcMain, protocol, safeStorage } from "electron";
+import { createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
-  allowedExtensions,
   applyImageRotations,
+  getVideoSeekSprite,
+  mediaExtensions,
   configurePreviewCache,
   defaultSortBy,
   getImagePreview,
@@ -31,6 +34,7 @@ import {
 } from "./core.js";
 import fs from "node:fs/promises";
 import { createGeocoder } from "./geocoder.js";
+import { parseByteRange, videoContentTypes } from "./videoMedia.js";
 
 /**
  * The absolute file path of the current module.
@@ -111,14 +115,30 @@ const getSettingsDirectory = () => app.getPath("userData");
  */
 const thumbnailScheme = "imageparser-thumb";
 
+/**
+ * The read-only URL scheme that streams videos to the player, with Range support for seeking, and serves
+ * their seek-bar preview sprites. The preload script builds its URLs.
+ * @type {string}
+ */
+const videoScheme = "imageparser-video";
+
 // Custom schemes must be registered before the app is ready.
 protocol.registerSchemesAsPrivileged([
   { scheme: thumbnailScheme, privileges: { standard: true, secure: true } },
+  {
+    scheme: videoScheme,
+    privileges: {
+      standard: true,
+      secure: true,
+      stream: true,
+      supportFetchAPI: true,
+    },
+  },
 ]);
 
 /**
- * Serves a cached WebP thumbnail for a supported image file. Only GET requests for
- * absolute paths to regular image files are answered; nothing can be written.
+ * Serves a cached WebP thumbnail for a supported image file, or the poster frame of a video. Only GET
+ * requests for absolute paths to regular image or video files are answered; nothing can be written.
  * @param {Request} request - The protocol request; `path` and `size` are query parameters.
  * @returns {Promise<Response>} The thumbnail, or an empty error response.
  */
@@ -128,7 +148,7 @@ const handleThumbnailRequest = async (request) => {
   if (
     request.method !== "GET" ||
     !path.isAbsolute(filePath) ||
-    !allowedExtensions.has(path.extname(filePath).toLowerCase())
+    !mediaExtensions.has(path.extname(filePath).toLowerCase())
   ) {
     return new Response(null, { status: 400 });
   }
@@ -153,6 +173,81 @@ const handleThumbnailRequest = async (request) => {
       status: error?.code === "ENOENT" ? 404 : 500,
     });
   }
+};
+
+/**
+ * Streams a video (imageparser-video://video/) or its seek-bar sprite (imageparser-video://sprite/). Only
+ * GET and HEAD requests for absolute paths to existing regular video files are answered; nothing can be
+ * written. Video requests honour a single-range Range header, so the player can seek.
+ * @param {Request} request - The protocol request; `path` is a query parameter.
+ * @returns {Promise<Response>} The video bytes, the sprite, or an empty error response.
+ */
+const handleVideoRequest = async (request) => {
+  const url = new URL(request.url);
+  const filePath = url.searchParams.get("path") ?? "";
+  const contentType = videoContentTypes[path.extname(filePath).toLowerCase()];
+  if (
+    (request.method !== "GET" && request.method !== "HEAD") ||
+    !path.isAbsolute(filePath) ||
+    !contentType
+  ) {
+    return new Response(null, { status: 400 });
+  }
+
+  let stats;
+  try {
+    stats = await fs.stat(filePath);
+  } catch {
+    return new Response(null, { status: 404 });
+  }
+  if (!stats.isFile()) {
+    return new Response(null, { status: 404 });
+  }
+
+  if (url.hostname === "sprite") {
+    try {
+      const sprite = await getVideoSeekSprite(filePath, {
+        signal: request.signal,
+      });
+      return new Response(sprite.buffer, {
+        headers: {
+          "Content-Type": "image/webp",
+          "Cache-Control": "private, max-age=31536000, immutable",
+        },
+      });
+    } catch {
+      return new Response(null, { status: 500 });
+    }
+  }
+  if (url.hostname !== "video") {
+    return new Response(null, { status: 404 });
+  }
+
+  const headers = { "Accept-Ranges": "bytes", "Content-Type": contentType };
+  const range = parseByteRange(request.headers.get("range"), stats.size);
+  if (range === "unsatisfiable") {
+    return new Response(null, {
+      status: 416,
+      headers: { ...headers, "Content-Range": `bytes */${stats.size}` },
+    });
+  }
+  const start = range?.start ?? 0;
+  const end = range?.end ?? stats.size - 1;
+  const responseHeaders = {
+    ...headers,
+    "Content-Length": String(Math.max(0, end - start + 1)),
+    ...(range
+      ? { "Content-Range": `bytes ${start}-${end}/${stats.size}` }
+      : {}),
+  };
+  const body =
+    request.method === "HEAD" || stats.size === 0
+      ? null
+      : Readable.toWeb(createReadStream(filePath, { start, end }));
+  return new Response(body, {
+    status: range ? 206 : 200,
+    headers: responseHeaders,
+  });
 };
 
 /**
@@ -293,6 +388,7 @@ const createMainWindow = () => {
  */
 app.whenReady().then(() => {
   protocol.handle(thumbnailScheme, handleThumbnailRequest);
+  protocol.handle(videoScheme, handleVideoRequest);
   configurePreviewCache({
     directory: path.join(getSettingsDirectory(), "preview-cache"),
   });

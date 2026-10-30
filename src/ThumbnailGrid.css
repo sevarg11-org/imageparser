@@ -203,3 +203,63 @@
   outline: 3px solid #38bdf8;
   outline-offset: -3px;
 }
+
+/* A standalone video: a play badge in the middle of its poster, and its length in the corner. */
+.thumbnail-video-marks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.thumbnail-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding-left: 4px;
+  border: 2px solid rgba(226, 232, 240, 0.85);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.7);
+  color: #f8fafc;
+  font-size: 1.1rem;
+  transform: translate(-50%, -50%);
+}
+
+.thumbnail-duration {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.82);
+  color: #f8fafc;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A live photo: the "has video" mark sits in the top-right corner, so both rotate buttons move left. */
+.thumbnail-live {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 5px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.82);
+  color: #fde68a;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+.thumbnail-cell--live .thumbnail-rotate--right {
+  right: auto;
+  left: 50px;
+}

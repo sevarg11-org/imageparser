@@ -9,8 +9,17 @@ import {
   buildImageVersion,
   buildPreviewCacheKey,
   buildThumbnailCacheKey,
+  buildVideoSpriteCacheKey,
   createPreviewCache,
 } from "./previewCache.js";
+import {
+  compressVideo,
+  defaultVideoCompression,
+  normalizeVideoCompression,
+  probeVideo,
+  renderSeekSprite,
+  renderVideoFrame,
+} from "./videoMedia.js";
 
 /**
  * The set of supported image file extensions.
@@ -23,6 +32,27 @@ const allowedExtensions = new Set([
   ".tif",
   ".tiff",
 ]);
+
+/**
+ * The set of supported video file extensions. Videos are played as they are (never transcoded) and never
+ * edited: their metadata lives only in a `name.ext.xmp` sidecar.
+ */
+const videoExtensions = new Set([".mp4", ".m4v", ".mov", ".webm", ".mkv"]);
+
+/**
+ * Every extension a folder scan picks up: images and videos. Image-only paths (rotation, embedded
+ * metadata, previews) keep using allowedExtensions.
+ */
+const mediaExtensions = new Set([...allowedExtensions, ...videoExtensions]);
+
+/**
+ * Checks whether a file is a supported video.
+ * @param {string|null|undefined} filePath - The file path or name.
+ * @returns {boolean} True for a supported video extension.
+ */
+const isVideoPath = (filePath) =>
+  Boolean(filePath) &&
+  videoExtensions.has(path.extname(String(filePath)).toLowerCase());
 
 /**
  * Matches the `_a`/`_b` (or front/back) side suffix at the end of a file stem.
@@ -180,6 +210,7 @@ const defaultImmichSettings = Object.freeze({
   tags: "",
   pauseImmichJobs: false,
   concurrentTasks: 2,
+  videoCompression: defaultVideoCompression,
 });
 
 /**
@@ -221,6 +252,7 @@ const normalizeImmichSettings = (settings) => {
     tags: normalizeImmichTags(settings?.tags).join(", "),
     pauseImmichJobs: String(settings?.adminApiKey ?? "") !== "",
     concurrentTasks: Number(settings?.concurrentTasks),
+    videoCompression: normalizeVideoCompression(settings?.videoCompression),
   };
 
   let serverUrl;
@@ -426,15 +458,22 @@ const getImmichGoDiagnostics = () =>
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
- * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, and the key that serializes uploads (default: one upload at a time).
- * @returns {{ok: boolean, exitCode: number, output: string}} The result of the upload operation with redacted output.
+ * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, the key that serializes uploads (default: one upload at a time), and the confinement check for nested folders that video compression rewrites (see readDirectory).
+ * @returns {{ok: boolean, exitCode: number, output: string, compressedVideos: number}} The result of the upload operation with
+ *   redacted output, and how many videos were compressed (replacing the originals) before it.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
 const runImmichUpload = async (
   settings,
   directoryPath,
   reportProgress = () => {},
-  { debug = false, recursive = false, log, lockKey = "default" } = {},
+  {
+    debug = false,
+    recursive = false,
+    log,
+    lockKey = "default",
+    isAllowedPath,
+  } = {},
 ) => {
   if (runningImmichUploads.has(lockKey)) {
     throw new Error("An Immich upload is already running.");
@@ -460,6 +499,47 @@ const runImmichUpload = async (
       { debug, recursive },
     );
     const redact = (text) => redactImmichSecrets(text, normalizedSettings);
+
+    // Videos are compressed first, replacing the originals, so the upload sends the smaller files.
+    let compressionOutput = "";
+    let compressedVideos = 0;
+    if (normalizedSettings.videoCompression.enabled) {
+      reportProgress({
+        phase: "compressing",
+        output: "Looking for videos to compress...",
+      });
+      let lastReported = "";
+      const compression = await compressFolderVideos(
+        normalizedDirectoryPath,
+        normalizedSettings.videoCompression,
+        {
+          recursive,
+          isAllowedPath,
+          onProgress: ({ index, total, filePath, fraction }) => {
+            const message = `Compressing ${path.basename(filePath)} (${index + 1} of ${total}): ${Math.round(fraction * 100)}%`;
+            if (message !== lastReported) {
+              lastReported = message;
+              reportProgress({ phase: "compressing", output: message });
+            }
+          },
+        },
+      );
+      compressionOutput = describeCompressionResult(compression);
+      compressedVideos = compression.compressed.length;
+      log?.info("Video compression finished.", {
+        compressed: compression.compressed.length,
+        skipped: compression.skipped.length,
+        errors: compression.errors,
+      });
+      if (!compression.ok) {
+        return {
+          ok: false,
+          exitCode: -1,
+          compressedVideos,
+          output: `${compressionOutput}\nThe upload did not start because some videos could not be compressed. Fix them, flag them "Do not upload", or turn off video compression.`,
+        };
+      }
+    }
 
     log?.info("Starting immich-go upload.", {
       command: redact(["immich-go", ...uploadArguments].join(" ")),
@@ -523,7 +603,12 @@ const runImmichUpload = async (
         resolve({
           ok,
           exitCode: exitCode ?? -1,
-          output: redact([combinedOutput, ...hints].filter(Boolean).join("\n")),
+          compressedVideos,
+          output: redact(
+            [compressionOutput, combinedOutput, ...hints]
+              .filter(Boolean)
+              .join("\n"),
+          ),
         });
       });
     });
@@ -844,6 +929,10 @@ const buildLegacySidecarPath = (filePath) => {
 };
 
 const getSidecarCandidatePaths = (filePath) => {
+  // A video's legacy name (IMG_1.xmp) belongs to the live photo's image, so videos use only IMG_1.mov.xmp.
+  if (isVideoPath(filePath)) {
+    return [buildSidecarPath(filePath)];
+  }
   return [buildSidecarPath(filePath), buildLegacySidecarPath(filePath)].filter(
     (candidatePath, index, candidates) =>
       candidates.indexOf(candidatePath) === index,
@@ -904,6 +993,66 @@ const getSideFromFileName = (fileName) => {
 };
 
 /**
+ * Builds the key that matches a live photo's image to its video: the folder-free stem, ignoring case and
+ * the exclude marker, so IMG_1.jpg matches IMG_1.MOV and a half-flagged IMG_1_exclude.jpg still matches.
+ * @param {string} fileName - The image or video file name.
+ * @returns {string} The live photo key.
+ */
+const getLivePhotoKey = (fileName) =>
+  getStem(fileName)
+    .replace(/[_-]exclude$/i, "")
+    .toLowerCase();
+
+/**
+ * Checks whether an image can be a live photo. Scanned A/B pairs never have videos, so only images without
+ * an `_a`/`_b`/front/back suffix are matched.
+ * @param {string} fileName - The image file name.
+ * @returns {boolean} True when the image can have a live video.
+ */
+const canHaveLiveVideo = (fileName) =>
+  allowedExtensions.has(path.extname(fileName).toLowerCase()) &&
+  !sideSuffixPattern.test(getStem(fileName));
+
+/**
+ * Orders video candidates for one live photo, so the folder listing and later writes pick the same video
+ * when several share the image's stem.
+ * @param {string} left - A video file name.
+ * @param {string} right - Another video file name.
+ * @returns {number} The sort order.
+ */
+const compareLiveVideoNames = (left, right) =>
+  left < right ? -1 : left > right ? 1 : 0;
+
+/**
+ * Finds the video of a live photo: a video in the image's folder with the same stem, ignoring case.
+ * @param {string|null|undefined} imagePath - The live photo's image.
+ * @returns {Promise<string|null>} The video path, or null when the image is not a live photo.
+ */
+const findLiveVideoPath = async (imagePath) => {
+  if (!imagePath || !canHaveLiveVideo(path.basename(imagePath))) {
+    return null;
+  }
+  const directory = path.dirname(imagePath);
+  const key = getLivePhotoKey(path.basename(imagePath));
+  let entries;
+  try {
+    entries = await fs.readdir(directory, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  const match = entries
+    .filter(
+      (entry) =>
+        !entry.isDirectory() &&
+        isVideoPath(entry.name) &&
+        getLivePhotoKey(entry.name) === key,
+    )
+    .map((entry) => entry.name)
+    .sort(compareLiveVideoNames)[0];
+  return match ? path.join(directory, match) : null;
+};
+
+/**
  * Rewrites the part of an image or sidecar file name that sits before the side suffix.
  * Sidecars named `name.ext.xmp` are rewritten through the image name they wrap; legacy
  * `name.xmp` sidecars and images are rewritten directly.
@@ -915,7 +1064,7 @@ const transformImageBaseName = (fileName, transform) => {
   const sidecarMatch = fileName.match(/^(.+)(\.xmp)$/i);
   if (
     sidecarMatch &&
-    allowedExtensions.has(path.extname(sidecarMatch[1]).toLowerCase())
+    mediaExtensions.has(path.extname(sidecarMatch[1]).toLowerCase())
   ) {
     return transformImageBaseName(sidecarMatch[1], transform) + sidecarMatch[2];
   }
@@ -1118,9 +1267,15 @@ const toSidecarDay = (rawDate) => {
  * @param {string|null} backPath - The path to the back (B) image, if any.
  * @param {string} [relativeDirectory=""] - The pair's folder relative to the scanned folder, with forward
  *   slashes; it scopes the id and prefixes the label so equal names in different folders stay apart.
- * @returns {{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
+ * @param {string|null} [liveVideoPath=null] - The live photo's video, if any.
+ * @returns {{id: string, imageLabel: string, relativeDirectory: string, mediaType: "image"|"video", frontPath: string, backPath: string|null, liveVideoPath: string|null, doNotUpload: boolean, excludeMismatch: boolean}}
  */
-const describePair = (frontPath, backPath, relativeDirectory = "") => {
+const describePair = (
+  frontPath,
+  backPath,
+  relativeDirectory = "",
+  liveVideoPath = null,
+) => {
   const frontName = path.basename(frontPath);
   const doNotUpload = isExcludedName(frontName);
   const folderPrefix = relativeDirectory ? `${relativeDirectory}/` : "";
@@ -1128,27 +1283,33 @@ const describePair = (frontPath, backPath, relativeDirectory = "") => {
     id: `${folderPrefix}${getGroupKey(frontName)}-${frontName}`,
     imageLabel: `${folderPrefix}${frontName}`,
     relativeDirectory,
+    mediaType: isVideoPath(frontPath) ? "video" : "image",
     frontPath,
     backPath,
+    liveVideoPath,
     doNotUpload,
-    excludeMismatch: backPath
-      ? isExcludedName(path.basename(backPath)) !== doNotUpload
-      : false,
+    excludeMismatch: [backPath, liveVideoPath].some(
+      (otherPath) =>
+        otherPath && isExcludedName(path.basename(otherPath)) !== doNotUpload,
+    ),
   };
 };
 
 /**
- * Groups image files by their base name and creates front/back pairs.
+ * Groups image and video files into grid items. Images group by their base name into front/back pairs; a
+ * video with the same stem as a single image without a side suffix is that image's live video, and every
+ * other video is an item of its own.
  * Supports date-taken sorting when available, falling back to file creation time.
  * Files only pair with files in the same folder.
- * @param {string[]} filePaths - The image file paths.
+ * @param {string[]} filePaths - The image and video file paths.
  * @param {*} [sortBy=defaultSortBy] - The sort field and direction (default: createdAt-asc).
  * @param {string} [baseDirectory] - The scanned folder; when given, each pair records its folder relative to it.
- * @returns {Promise<Array<{id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
+ * @returns {Promise<Array<{id: string, imageLabel: string, relativeDirectory: string, mediaType: "image"|"video", frontPath: string, backPath: string|null, liveVideoPath: string|null, frontVersion: string, backVersion: string|null, liveVideoVersion: string|null, durationSeconds: number|null, createdAt: number, dateTaken: number|null, hasSidecar: boolean, sidecarDate: string}>>}
  */
 const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
   const shouldReadDateTaken = normalizeSortBy(sortBy).field === "dateTaken";
   const grouped = new Map();
+  const videosByLiveKey = new Map();
 
   for (const filePath of filePaths) {
     const fileName = path.basename(filePath);
@@ -1158,28 +1319,66 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
           .split(path.sep)
           .join("/")
       : "";
-    const key = `${relativeDirectory}/${getGroupKey(fileName)}`;
-    const group = grouped.get(key) ?? [];
-    group.push({
+    const item = {
       filePath,
       fileName,
       relativeDirectory,
       side: getSideFromFileName(fileName),
-    });
+    };
+    if (isVideoPath(fileName)) {
+      const liveKey = `${relativeDirectory}/${getLivePhotoKey(fileName)}`;
+      videosByLiveKey.set(liveKey, [
+        ...(videosByLiveKey.get(liveKey) ?? []),
+        item,
+      ]);
+      continue;
+    }
+    const key = `${relativeDirectory}/${getGroupKey(fileName)}`;
+    const group = grouped.get(key) ?? [];
+    group.push(item);
     grouped.set(key, group);
   }
 
+  const groups = Array.from(grouped.values()).map((items) => {
+    const frontCandidate = items.find((item) => item.side === "a") ?? items[0];
+    const backCandidate = items.find((item) => item.side === "b") ?? null;
+    let liveVideo = null;
+    if (!backCandidate && canHaveLiveVideo(frontCandidate.fileName)) {
+      const candidates = videosByLiveKey.get(
+        `${frontCandidate.relativeDirectory}/${getLivePhotoKey(frontCandidate.fileName)}`,
+      );
+      if (candidates?.length) {
+        candidates.sort((left, right) =>
+          compareLiveVideoNames(left.fileName, right.fileName),
+        );
+        liveVideo = candidates.shift();
+      }
+    }
+    return { frontCandidate, backCandidate, liveVideo };
+  });
+  // Videos no live photo claimed are items of their own.
+  for (const videos of videosByLiveKey.values()) {
+    for (const video of videos) {
+      groups.push({
+        frontCandidate: video,
+        backCandidate: null,
+        liveVideo: null,
+      });
+    }
+  }
+
   const pairs = await Promise.all(
-    Array.from(grouped.values()).map(async (items) => {
-      const frontCandidate =
-        items.find((item) => item.side === "a") ?? items[0];
-      const backCandidate = items.find((item) => item.side === "b") ?? null;
+    groups.map(async ({ frontCandidate, backCandidate, liveVideo }) => {
+      const isVideo = isVideoPath(frontCandidate.fileName);
       // The A sidecar is read once: it is the source of truth for the grid date and filters.
-      const [frontStats, backStats, frontSidecar] = await Promise.all([
-        fs.stat(frontCandidate.filePath),
-        backCandidate ? fs.stat(backCandidate.filePath) : null,
-        readSidecarSummary(frontCandidate.filePath),
-      ]);
+      const [frontStats, backStats, liveVideoStats, frontSidecar, videoInfo] =
+        await Promise.all([
+          fs.stat(frontCandidate.filePath),
+          backCandidate ? fs.stat(backCandidate.filePath) : null,
+          liveVideo ? fs.stat(liveVideo.filePath) : null,
+          readSidecarSummary(frontCandidate.filePath),
+          isVideo ? getVideoInfo(frontCandidate.filePath) : null,
+        ]);
       const frontSidecarDateTaken = toDateTakenTimestamp(frontSidecar.rawDate);
       const backSidecarDateTaken =
         shouldReadDateTaken && frontSidecarDateTaken === null && backCandidate
@@ -1204,9 +1403,14 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
           frontCandidate.filePath,
           backCandidate ? backCandidate.filePath : null,
           frontCandidate.relativeDirectory,
+          liveVideo ? liveVideo.filePath : null,
         ),
         frontVersion: buildImageVersion(frontStats),
         backVersion: backStats ? buildImageVersion(backStats) : null,
+        liveVideoVersion: liveVideoStats
+          ? buildImageVersion(liveVideoStats)
+          : null,
+        durationSeconds: videoInfo?.durationSeconds ?? null,
         createdAt:
           frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
         dateTaken: shouldReadDateTaken ? dateTaken : null,
@@ -1495,7 +1699,8 @@ const readSidecarMetadata = async (filePath) => {
  * @param {string[]} [tags=[]] - An optional array of tag strings.
  * @param {SidecarLocation|null} [location] - The place to save: omit it to keep the place already in the
  *   sidecar, or pass null to remove it.
- * @returns {Promise<{sidecarPath: string, written: boolean}>} The sidecar path and whether it changed.
+ * @returns {Promise<{sidecarPath: string, written: boolean, xml: string}>} The sidecar path, whether it changed,
+ *   and the document it holds.
  */
 const writeSidecarFile = async (
   filePath,
@@ -1521,10 +1726,27 @@ const writeSidecarFile = async (
 
   if (existingSidecarPath) {
     if (currentXml === xml) {
-      return { sidecarPath, written: false };
+      return { sidecarPath, written: false, xml };
     }
   }
 
+  await fs.writeFile(sidecarPath, xml, "utf8");
+  return { sidecarPath, written: true, xml };
+};
+
+/**
+ * Writes a live photo's video sidecar (IMG_1.mov.xmp) with the same document as the image's sidecar, so
+ * tools that read the video alone see the same values. The image sidecar stays the source of truth.
+ * @param {string} videoPath - The live photo's video.
+ * @param {string} xml - The image sidecar's document.
+ * @returns {Promise<{sidecarPath: string, written: boolean}>} The sidecar path and whether it changed.
+ */
+const writeLiveVideoSidecar = async (videoPath, xml) => {
+  const sidecarPath = buildSidecarPath(videoPath);
+  const currentXml = await fs.readFile(sidecarPath, "utf8").catch(() => null);
+  if (currentXml === xml) {
+    return { sidecarPath, written: false };
+  }
   await fs.writeFile(sidecarPath, xml, "utf8");
   return { sidecarPath, written: true };
 };
@@ -1867,6 +2089,14 @@ const loadImmichSettings = async (settingsDirectory, secretCodec) => {
       concurrentTasks:
         Number(storedSettings.concurrentTasks) ||
         defaultImmichSettings.concurrentTasks,
+      videoCompression: (() => {
+        try {
+          return normalizeVideoCompression(storedSettings.videoCompression);
+        } catch {
+          // A hand-edited, out-of-range value falls back to the defaults (compression off).
+          return { ...defaultVideoCompression };
+        }
+      })(),
     };
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -2196,10 +2426,11 @@ const listDirectory = async (directoryPath) => {
       readFolderEntry(entry.name, path.join(directoryPath, entry.name)),
   );
   directories.sort(compareFolderNames);
+  // Images and videos both count: the folder browser reports how many items a folder holds.
   const imageCount = entries.filter(
     (entry) =>
       entry.isFile() &&
-      allowedExtensions.has(path.extname(entry.name).toLowerCase()),
+      mediaExtensions.has(path.extname(entry.name).toLowerCase()),
   ).length;
 
   return {
@@ -2284,7 +2515,8 @@ const classifyDirectoryEntries = async (directoryPath, entries) => {
       continue;
     }
     const extension = path.extname(entry.name).toLowerCase();
-    if (allowedExtensions.has(extension)) {
+    // imageFiles holds every supported media file: images and videos.
+    if (mediaExtensions.has(extension)) {
       imageFiles.push(entryPath);
     } else if (extension === ".xmp" && entry.isFile()) {
       sidecarFiles.push(entryPath);
@@ -2469,86 +2701,126 @@ const withCurrentTimeOfDay = async (frontPath, dateValue, requestedDate) => {
  * Writes the A-file sidecar and embeds the date in each image, combining a rotation with the date in one
  * ExifTool write per file. Writes whose stored values already match are skipped.
  * Holds the lock for both images so reads and writes of the same files stay ordered.
+ * A video is never edited: only its sidecar is written. A live photo's video gets a copy of the image's
+ * sidecar, found by name (see findLiveVideoPath), so every caller keeps the two in step.
  * @param {{frontPath: string, backPath: string|null, date: string, description: string, tags: string[], frontRotation?: number, backRotation?: number}} metadata - The metadata update request containing paths, values, and rotations.
- * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string, sidecarWritten: boolean, results: Array<{field: "front"|"back", filePath: string, ok: boolean, dateWritten: boolean, rotated: boolean, version?: string, error?: string}>}>} The per-image results; ok is false when any image could not be updated.
- * @throws {Error} If no image is selected, the date is invalid, or the sidecar cannot be written.
+ * @returns {Promise<{ok: boolean, updatedFiles: number, sidecarFile: string, sidecarWritten: boolean, liveVideoSidecarFile: string|null, liveVideoSidecarWritten: boolean, results: Array<{field: "front"|"back", filePath: string, ok: boolean, dateWritten: boolean, rotated: boolean, version?: string, error?: string}>}>} The per-image results; ok is false when any image could not be updated.
+ * @throws {Error} If no image is selected, the date is invalid, a video is rotated, or the sidecar cannot be written.
  */
-const saveMetadata = (metadata) =>
-  runImageFileOperation([metadata?.frontPath, metadata?.backPath], async () => {
-    if (!metadata?.frontPath) {
-      throw new Error("No image selected for metadata update.");
+const saveMetadata = async (metadata) => {
+  const liveVideoPath = metadata?.backPath
+    ? null
+    : await findLiveVideoPath(metadata?.frontPath);
+  return runImageFileOperation(
+    [metadata?.frontPath, metadata?.backPath, liveVideoPath],
+    () => saveMetadataUnlocked(metadata, liveVideoPath),
+  );
+};
+
+/**
+ * Saves metadata while the caller holds the lock for every file of the group (see saveMetadata).
+ * @param {Object} metadata - The metadata update request.
+ * @param {string|null} liveVideoPath - The live photo's video, if any.
+ * @returns {ReturnType<typeof saveMetadata>} The save result.
+ */
+const saveMetadataUnlocked = async (metadata, liveVideoPath) => {
+  if (!metadata?.frontPath) {
+    throw new Error("No image selected for metadata update.");
+  }
+  if (isVideoPath(metadata.frontPath)) {
+    if (metadata.backPath) {
+      throw new Error("A video cannot have a back image.");
     }
+    if (normalizeRotationValue(metadata.frontRotation) !== 0) {
+      throw new Error("Videos cannot be rotated.");
+    }
+  }
 
-    const dateValue = await withCurrentTimeOfDay(
-      metadata.frontPath,
-      normalizeDateValue(metadata.date),
-      metadata.date,
-    );
-    normalizeExifDate(dateValue);
+  const dateValue = await withCurrentTimeOfDay(
+    metadata.frontPath,
+    normalizeDateValue(metadata.date),
+    metadata.date,
+  );
+  normalizeExifDate(dateValue);
 
-    const { sidecarPath, written } = await writeSidecarFile(
-      metadata.frontPath,
-      dateValue,
-      metadata.description,
-      metadata.tags,
-      metadata.location,
-    );
+  const { sidecarPath, written, xml } = await writeSidecarFile(
+    metadata.frontPath,
+    dateValue,
+    metadata.description,
+    metadata.tags,
+    metadata.location,
+  );
+  const liveVideoSidecar = liveVideoPath
+    ? await writeLiveVideoSidecar(liveVideoPath, xml)
+    : null;
 
-    const images = [
-      {
-        field: "front",
-        filePath: metadata.frontPath,
-        rotation: metadata.frontRotation,
-      },
-      {
-        field: "back",
-        filePath: metadata.backPath,
-        rotation: metadata.backRotation,
-      },
-    ].filter(({ filePath }) => filePath);
+  const images = [
+    {
+      field: "front",
+      filePath: metadata.frontPath,
+      rotation: metadata.frontRotation,
+    },
+    {
+      field: "back",
+      filePath: metadata.backPath,
+      rotation: metadata.backRotation,
+    },
+  ].filter(({ filePath }) => filePath);
 
-    const results = await Promise.all(
-      images.map(async ({ field, filePath, rotation }) => {
-        try {
-          const { dateWritten, rotated } = await writeEmbeddedImageMetadata(
-            filePath,
-            dateValue,
-            rotation,
-          );
-          return {
-            field,
-            filePath,
-            ok: true,
-            dateWritten,
-            rotated,
-            version: buildImageVersion(await fs.stat(filePath)),
-          };
-        } catch (error) {
-          return {
-            field,
-            filePath,
-            ok: false,
-            dateWritten: false,
-            rotated: false,
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unable to update the image metadata.",
-          };
-        }
-      }),
-    );
+  const results = await Promise.all(
+    images.map(async ({ field, filePath, rotation }) => {
+      if (isVideoPath(filePath)) {
+        return {
+          field,
+          filePath,
+          ok: true,
+          dateWritten: false,
+          rotated: false,
+          version: buildImageVersion(await fs.stat(filePath)),
+        };
+      }
+      try {
+        const { dateWritten, rotated } = await writeEmbeddedImageMetadata(
+          filePath,
+          dateValue,
+          rotation,
+        );
+        return {
+          field,
+          filePath,
+          ok: true,
+          dateWritten,
+          rotated,
+          version: buildImageVersion(await fs.stat(filePath)),
+        };
+      } catch (error) {
+        return {
+          field,
+          filePath,
+          ok: false,
+          dateWritten: false,
+          rotated: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to update the image metadata.",
+        };
+      }
+    }),
+  );
 
-    return {
-      ok: results.every((result) => result.ok),
-      updatedFiles: results.filter(
-        (result) => result.ok && (result.dateWritten || result.rotated),
-      ).length,
-      sidecarFile: sidecarPath,
-      sidecarWritten: written,
-      results,
-    };
-  });
+  return {
+    ok: results.every((result) => result.ok),
+    updatedFiles: results.filter(
+      (result) => result.ok && (result.dateWritten || result.rotated),
+    ).length,
+    sidecarFile: sidecarPath,
+    sidecarWritten: written,
+    liveVideoSidecarFile: liveVideoSidecar?.sidecarPath ?? null,
+    liveVideoSidecarWritten: liveVideoSidecar?.written ?? false,
+    results,
+  };
+};
 
 /**
  * Reads metadata from an image's sidecar file or returns empty defaults if not found.
@@ -2652,6 +2924,140 @@ const withPreviewRenderSlot = createRenderLimiter(maxConcurrentPreviewRenders);
 const withThumbnailRenderSlot = createRenderLimiter(
   maxConcurrentThumbnailRenders,
 );
+
+/**
+ * Runs an ffprobe once one of the limited probe slots is free, so a large folder of videos does not start
+ * hundreds of processes at once.
+ */
+const withVideoProbeSlot = createRenderLimiter(4);
+
+/**
+ * The most video probe results kept in memory.
+ * @type {number}
+ */
+const maxVideoInfoEntries = 5000;
+
+/**
+ * Video probe results by path and version. Failed probes are kept too, so a video that cannot be read
+ * (or a missing ffprobe) is not probed again on every folder load.
+ * @type {Map<string, {durationSeconds: number|null, videoCodec: string|null, audioCodec: string|null, width: number|null, height: number|null}>}
+ */
+const videoInfoCache = new Map();
+
+const emptyVideoInfo = Object.freeze({
+  durationSeconds: null,
+  videoCodec: null,
+  audioCodec: null,
+  width: null,
+  height: null,
+  compressedByImageParser: false,
+  creationTime: null,
+});
+
+/**
+ * Reads a video's duration and codecs, from memory when this version was probed before. The caller must
+ * hold the video's lock, or use getVideoInfo.
+ * @param {string} filePath - The path to the video.
+ * @param {import("node:fs").Stats} stats - The video's current stats.
+ * @returns {Promise<typeof emptyVideoInfo>} The video details; unknown values are null.
+ */
+const readVideoInfoUnlocked = async (filePath, stats) => {
+  const key = `${path.resolve(filePath)}|${buildImageVersion(stats)}`;
+  const cached = videoInfoCache.get(key);
+  if (cached) {
+    return cached;
+  }
+  const info = await withVideoProbeSlot(() =>
+    probeVideo(path.resolve(filePath)),
+  ).catch(() => emptyVideoInfo);
+  if (videoInfoCache.size >= maxVideoInfoEntries) {
+    videoInfoCache.delete(videoInfoCache.keys().next().value);
+  }
+  videoInfoCache.set(key, info);
+  return info;
+};
+
+/**
+ * Reads a video's duration and codecs in the image file queue. Never throws: a video that cannot be probed
+ * has null values.
+ * @param {string} filePath - The path to the video.
+ * @returns {Promise<typeof emptyVideoInfo>} The video details.
+ */
+const getVideoInfo = async (filePath) => {
+  try {
+    const stats = await fs.stat(filePath);
+    const cached = videoInfoCache.get(
+      `${path.resolve(filePath)}|${buildImageVersion(stats)}`,
+    );
+    if (cached) {
+      return cached;
+    }
+    return await runImageFileOperation([filePath], async () =>
+      readVideoInfoUnlocked(filePath, await fs.stat(filePath)),
+    );
+  } catch {
+    return emptyVideoInfo;
+  }
+};
+
+/**
+ * Renders a video's poster frame, one second in (or the first frame of a very short video). The caller
+ * must hold the video's lock.
+ * @param {string} filePath - The path to the video.
+ * @param {import("node:fs").Stats} stats - The video's current stats.
+ * @param {number} size - The long-edge size in pixels.
+ * @param {AbortSignal} [signal] - Stops the render when aborted.
+ * @returns {Promise<Buffer>} The WebP poster.
+ */
+const renderVideoPoster = async (filePath, stats, size, signal) => {
+  const { durationSeconds } = await readVideoInfoUnlocked(filePath, stats);
+  return renderVideoFrame(path.resolve(filePath), {
+    size,
+    atSeconds: durationSeconds && durationSeconds > 2 ? 1 : 0,
+    signal,
+  });
+};
+
+/**
+ * Returns a video's seek-bar preview sprite (see videoMedia.js seekSpriteLayout), from the on-disk preview
+ * cache when possible. Renders while holding the video's lock and a preview render slot.
+ * @param {string} filePath - The path to the video.
+ * @param {{signal?: AbortSignal}} [options] - Stops a render that has not started when aborted.
+ * @returns {Promise<{buffer: Buffer, version: string, durationSeconds: number}>} The WebP sprite, the video's
+ *   version, and the duration the sprite was laid out for.
+ * @throws {Error} If the path is not a video, its duration is unknown, or ffmpeg fails.
+ */
+const getVideoSeekSprite = (filePath, { signal } = {}) => {
+  if (!isVideoPath(filePath)) {
+    return Promise.reject(new Error("Unsupported video type."));
+  }
+  return runImageFileOperation([filePath], async () => {
+    signal?.throwIfAborted();
+    const stats = await fs.stat(filePath);
+    const version = buildImageVersion(stats);
+    const { durationSeconds } = await readVideoInfoUnlocked(filePath, stats);
+    if (!durationSeconds) {
+      throw new Error("The video's length could not be read.");
+    }
+    const cache = previewCache;
+    const cacheKey = cache ? buildVideoSpriteCacheKey(filePath, stats) : null;
+    const cached = cacheKey ? await cache.get(cacheKey) : null;
+    if (cached) {
+      return { buffer: cached, version, durationSeconds };
+    }
+    const buffer = await withPreviewRenderSlot(() => {
+      signal?.throwIfAborted();
+      return renderSeekSprite(path.resolve(filePath), {
+        durationSeconds,
+        signal,
+      });
+    });
+    if (cacheKey) {
+      void cache.put(cacheKey, buffer);
+    }
+    return { buffer, version, durationSeconds };
+  });
+};
 
 /**
  * Returns a resized WebP preview of an image, from the preview cache when possible.
@@ -2844,7 +3250,10 @@ const readStoredThumbnail = async (filePath, stats, size, rotation) => {
  */
 const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
   const thumbnailSize = normalizeThumbnailSize(size);
-  const normalizedRotation = normalizeRotationValue(rotation);
+  // A video's poster is never rotated.
+  const normalizedRotation = isVideoPath(filePath)
+    ? 0
+    : normalizeRotationValue(rotation);
   const cached = await readStoredThumbnail(
     filePath,
     await fs.stat(filePath),
@@ -2877,6 +3286,9 @@ const getThumbnail = async (filePath, { size, rotation, signal } = {}) => {
       : null;
     const buffer = await withThumbnailRenderSlot(() => {
       signal?.throwIfAborted();
+      if (isVideoPath(filePath)) {
+        return renderVideoPoster(filePath, stats, thumbnailSize, signal);
+      }
       return preview
         ? renderThumbnailFromPreview(preview, thumbnailSize)
         : renderThumbnail(filePath, {
@@ -2982,13 +3394,18 @@ const planDoNotUploadRenames = async (imagePaths, value) => {
  * Flags an image group "Do not upload" by renaming its images and sidecars to carry the
  * exclude marker, or clears the flag by removing it. Nothing is renamed when a target name
  * already exists, and renames already done are undone if a later one fails.
+ * A live photo's video and its sidecar are renamed with the image.
  * @param {{frontPath: string, backPath: string|null, value: boolean, relativeDirectory?: string}} request - The group,
  *   the flag value, and the group's folder relative to the loaded folder, used only for the returned id and label.
- * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
- * @returns {Promise<{ok: boolean, id: string, imageLabel: string, relativeDirectory: string, frontPath: string, backPath: string|null, frontVersion: string, backVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
+ * @param {{rename?: (from: string, to: string) => Promise<void>, liveVideoPath?: string|null}} [options] - Overrides
+ *   the rename function (for tests), and the live photo's video when the caller already found it.
+ * @returns {Promise<{ok: boolean, id: string, imageLabel: string, relativeDirectory: string, mediaType: "image"|"video", frontPath: string, backPath: string|null, liveVideoPath: string|null, frontVersion: string, backVersion: string|null, liveVideoVersion: string|null, doNotUpload: boolean, excludeMismatch: boolean, renamed: Array<{from: string, to: string}>}>}
  * @throws {Error} If the request is invalid, a target exists, or a rename fails.
  */
-const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
+const setDoNotUpload = async (
+  request,
+  { rename = fs.rename, liveVideoPath: knownLiveVideoPath } = {},
+) => {
   const frontPath = String(request?.frontPath ?? "");
   const backPath = request?.backPath ? String(request.backPath) : null;
   const value = request?.value;
@@ -3003,12 +3420,29 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
     throw new Error("Choose whether the image group should be uploaded.");
   }
 
-  const imagePaths = [frontPath, backPath].filter(Boolean);
-  for (const imagePath of imagePaths) {
-    if (!allowedExtensions.has(path.extname(imagePath).toLowerCase())) {
-      throw new Error(`${path.basename(imagePath)} is not a supported image.`);
-    }
+  // The front may be an image or a standalone video; a back is always an image.
+  const unsupportedPath = !mediaExtensions.has(
+    path.extname(frontPath).toLowerCase(),
+  )
+    ? frontPath
+    : backPath && !allowedExtensions.has(path.extname(backPath).toLowerCase())
+      ? backPath
+      : null;
+  if (unsupportedPath) {
+    throw new Error(
+      `${path.basename(unsupportedPath)} is not a supported image or video.`,
+    );
   }
+  if (backPath && isVideoPath(frontPath)) {
+    throw new Error("A video cannot have a back image.");
+  }
+  const liveVideoPath =
+    knownLiveVideoPath === undefined
+      ? backPath
+        ? null
+        : await findLiveVideoPath(frontPath)
+      : knownLiveVideoPath;
+  const imagePaths = [frontPath, backPath, liveVideoPath].filter(Boolean);
   if (
     backPath &&
     (path.dirname(backPath) !== path.dirname(frontPath) ||
@@ -3078,11 +3512,20 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
     renamed.find(({ from }) => from === filePath)?.to ?? filePath;
   const nextFrontPath = renamedPath(frontPath);
   const nextBackPath = backPath && renamedPath(backPath);
+  const nextLiveVideoPath = liveVideoPath && renamedPath(liveVideoPath);
   return {
     ok: true,
-    ...describePair(nextFrontPath, nextBackPath, relativeDirectory),
+    ...describePair(
+      nextFrontPath,
+      nextBackPath,
+      relativeDirectory,
+      nextLiveVideoPath,
+    ),
     frontVersion: await getImageVersion(nextFrontPath),
     backVersion: nextBackPath ? await getImageVersion(nextBackPath) : null,
+    liveVideoVersion: nextLiveVideoPath
+      ? await getImageVersion(nextLiveVideoPath)
+      : null,
     renamed,
   };
 };
@@ -3093,10 +3536,16 @@ const setDoNotUpload = async (request, { rename = fs.rename } = {}) => {
  * @param {{rename?: (from: string, to: string) => Promise<void>}} [options] - Overrides the rename function (for tests).
  * @returns {ReturnType<typeof setDoNotUpload>} The renamed group.
  */
-const setDoNotUploadQueued = (request, options) =>
-  runImageFileOperation([request?.frontPath, request?.backPath], () =>
-    setDoNotUpload(request, options),
+const setDoNotUploadQueued = async (request, options) => {
+  const liveVideoPath =
+    request?.backPath || typeof request?.frontPath !== "string"
+      ? null
+      : await findLiveVideoPath(request.frontPath);
+  return runImageFileOperation(
+    [request?.frontPath, request?.backPath, liveVideoPath],
+    () => setDoNotUpload(request, { ...options, liveVideoPath }),
   );
+};
 
 /**
  * Sets the date on every image pair in a directory that does not already have
@@ -3363,8 +3812,8 @@ const setLocationForPairs = async (
 
 /**
  * Resets the processing state of every image in a directory by deleting its XMP sidecar files.
- * Only sidecars belonging to the folder's images are deleted (both naming conventions, for the A and B
- * images), never other .xmp files. Images and the folder's own processed marker are left untouched.
+ * Only sidecars belonging to the folder's images and videos are deleted (both naming conventions for the A
+ * and B images, `name.ext.xmp` for videos), never other .xmp files. Images and the folder's own processed marker are left untouched.
  * With recursive set, every nested folder is covered, within the same limits as the nested scan.
  * @param {string} directoryPath - The path to the directory.
  * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
@@ -3385,7 +3834,12 @@ const resetFolderMetadata = async (
   let resetPairs = 0;
 
   for (const pair of pairs) {
-    const imagePaths = [pair.frontPath, pair.backPath].filter(Boolean);
+    // A live photo's video sidecar is reset with the image's.
+    const imagePaths = [
+      pair.frontPath,
+      pair.backPath,
+      pair.liveVideoPath,
+    ].filter(Boolean);
     try {
       const deleted = await runImageFileOperation(imagePaths, async () => {
         let count = 0;
@@ -3418,6 +3872,268 @@ const resetFolderMetadata = async (
 };
 
 /**
+ * Builds the hidden temporary path a video is compressed into, next to the original so the final rename stays
+ * on one filesystem. Its extension is not a media extension, so folder scans and uploads never pick it up.
+ * @param {string} videoPath - The original video.
+ * @returns {string} The temporary path.
+ */
+const buildCompressionTemporaryPath = (videoPath) =>
+  path.join(
+    path.dirname(videoPath),
+    `.${path.basename(videoPath)}.imageparser-compress.tmp`,
+  );
+
+/**
+ * Formats a byte count for messages, such as "1.4 GB".
+ * @param {number} bytes - The size in bytes.
+ * @returns {string} The formatted size.
+ */
+const formatByteSize = (bytes) => {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} bytes` : `${value.toFixed(1)} ${units[unit]}`;
+};
+
+/**
+ * Compresses one standalone video in place, while the caller holds the lock for the video and its new name.
+ * The original is replaced only after the compressed file is complete, about as long as the original, and
+ * smaller; the result is always an .mp4 whose sidecar is renamed to match. The file's modification time is kept,
+ * and so is its recording date (from the source's metadata, or its file date when it has none).
+ * @param {string} videoPath - The original video.
+ * @param {ReturnType<typeof normalizeVideoCompression>} settings - The compression settings.
+ * @param {{signal?: AbortSignal, onProgress?: (fraction: number) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ *   A cancellation signal, a progress listener, and replaceable compression and probe steps, for tests.
+ * @returns {Promise<{status: "compressed", from: string, to: string, originalBytes: number, compressedBytes: number}|{status: "skipped", filePath: string, reason: string}>}
+ * @throws {Error} If the new name is taken, the compression fails or looks incomplete, or a rename fails.
+ */
+const compressVideoInPlaceUnlocked = async (
+  videoPath,
+  settings,
+  { signal, onProgress, compress = compressVideo, probe = probeVideo } = {},
+) => {
+  const sourceStats = await fs.lstat(videoPath);
+  if (!sourceStats.isFile()) {
+    return {
+      status: "skipped",
+      filePath: videoPath,
+      reason: "it is a link or not a regular file",
+    };
+  }
+  const sourceInfo = await probe(path.resolve(videoPath)).catch(() => null);
+  if (!sourceInfo?.videoCodec) {
+    throw new Error("ffprobe could not read the video, so it was left as is.");
+  }
+  if (sourceInfo.compressedByImageParser) {
+    return {
+      status: "skipped",
+      filePath: videoPath,
+      reason: "it was already compressed",
+    };
+  }
+
+  const extension = path.extname(videoPath);
+  const targetPath =
+    extension.toLowerCase() === ".mp4"
+      ? videoPath
+      : `${videoPath.slice(0, videoPath.length - extension.length)}.mp4`;
+  const sourceSidecarPath = buildSidecarPath(videoPath);
+  const targetSidecarPath = buildSidecarPath(targetPath);
+  const hasSidecar = await pathExists(sourceSidecarPath);
+  if (targetPath !== videoPath) {
+    for (const taken of [
+      targetPath,
+      ...(hasSidecar ? [targetSidecarPath] : []),
+    ]) {
+      if (await pathExists(taken)) {
+        throw new Error(
+          `${path.basename(taken)} already exists, so the compressed video has nowhere to go.`,
+        );
+      }
+    }
+  }
+
+  const temporaryPath = buildCompressionTemporaryPath(videoPath);
+  try {
+    await compress(
+      path.resolve(videoPath),
+      path.resolve(temporaryPath),
+      settings,
+      {
+        creationTime:
+          sourceInfo.creationTime ??
+          new Date(
+            sourceStats.birthtimeMs || sourceStats.mtimeMs,
+          ).toISOString(),
+        durationSeconds: sourceInfo.durationSeconds,
+        signal,
+        onProgress,
+      },
+    );
+
+    const result = await probe(path.resolve(temporaryPath)).catch(() => null);
+    const expected = sourceInfo.durationSeconds;
+    const tolerance = expected ? Math.max(1, expected * 0.02) : 0;
+    if (
+      !result?.videoCodec ||
+      (expected &&
+        (!result.durationSeconds ||
+          Math.abs(result.durationSeconds - expected) > tolerance))
+    ) {
+      throw new Error(
+        "The compressed video is incomplete (its length does not match), so the original was kept.",
+      );
+    }
+
+    const compressedBytes = (await fs.stat(temporaryPath)).size;
+    if (compressedBytes >= sourceStats.size) {
+      await fs.rm(temporaryPath, { force: true });
+      return {
+        status: "skipped",
+        filePath: videoPath,
+        reason: `compressing did not make it smaller (${formatByteSize(sourceStats.size)})`,
+      };
+    }
+    await fs.utimes(temporaryPath, sourceStats.atime, sourceStats.mtime);
+
+    if (targetPath === videoPath) {
+      await fs.rename(temporaryPath, videoPath);
+    } else {
+      await fs.rename(temporaryPath, targetPath);
+      if (hasSidecar) {
+        try {
+          await fs.rename(sourceSidecarPath, targetSidecarPath);
+        } catch (error) {
+          // The original and its sidecar are still in place; drop the copy so nothing changes.
+          await fs.rm(targetPath, { force: true });
+          throw error;
+        }
+      }
+      try {
+        await fs.unlink(videoPath);
+      } catch (error) {
+        throw new Error(
+          `The compressed video was saved as ${path.basename(targetPath)}, but the original could not be deleted: ${error instanceof Error ? error.message : "Unknown error"}`,
+        );
+      }
+    }
+
+    return {
+      status: "compressed",
+      from: videoPath,
+      to: targetPath,
+      originalBytes: sourceStats.size,
+      compressedBytes,
+    };
+  } finally {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+};
+
+/**
+ * Compresses every standalone video in a folder (and, when recursive, its nested folders) in place before an
+ * upload: each original is replaced by a smaller MP4 (see compressVideoInPlaceUnlocked). Images, live photo
+ * videos, videos flagged "Do not upload", and videos already compressed are left alone. Videos are compressed
+ * one at a time, each under the image file lock; one failure does not stop the rest.
+ * @param {string} directoryPath - The folder to compress.
+ * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression).
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ *   Whether to include nested folders and the confinement check for them (see readDirectory), a cancellation
+ *   signal, a progress listener, and replaceable compression and probe steps, for tests.
+ * @returns {Promise<{ok: boolean, compressed: Array<{from: string, to: string, originalBytes: number, compressedBytes: number}>, skipped: Array<{filePath: string, reason: string}>, errors: string[]}>}
+ */
+const compressFolderVideos = async (
+  directoryPath,
+  compressionSettings,
+  {
+    recursive = false,
+    isAllowedPath,
+    signal,
+    onProgress = () => {},
+    compress,
+    probe,
+  } = {},
+) => {
+  const settings = normalizeVideoCompression(compressionSettings);
+  const { files } = await readDirectory(directoryPath, "fileName-asc", {
+    recursive,
+    isAllowedPath,
+  });
+  const videos = files.filter(
+    (pair) => pair.mediaType === "video" && !pair.doNotUpload,
+  );
+
+  const compressed = [];
+  const skipped = [];
+  const errors = [];
+  for (const [index, video] of videos.entries()) {
+    signal?.throwIfAborted();
+    const videoPath = video.frontPath;
+    const report = (fraction) =>
+      onProgress({
+        index,
+        total: videos.length,
+        filePath: videoPath,
+        fraction,
+      });
+    report(0);
+    const extension = path.extname(videoPath);
+    const targetPath = `${videoPath.slice(0, videoPath.length - extension.length)}.mp4`;
+    try {
+      const result = await runImageFileOperation([videoPath, targetPath], () =>
+        compressVideoInPlaceUnlocked(videoPath, settings, {
+          signal,
+          onProgress: report,
+          compress,
+          probe,
+        }),
+      );
+      if (result.status === "compressed") {
+        compressed.push(result);
+      } else {
+        skipped.push(result);
+      }
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
+      errors.push(
+        `${video.imageLabel}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, compressed, skipped, errors };
+};
+
+/**
+ * Summarizes a compression run for the upload log.
+ * @param {Awaited<ReturnType<typeof compressFolderVideos>>} result - The compression result.
+ * @returns {string} One line per video, then the totals.
+ */
+const describeCompressionResult = ({ compressed, skipped, errors }) => {
+  const saved = compressed.reduce(
+    (total, item) => total + item.originalBytes - item.compressedBytes,
+    0,
+  );
+  return [
+    ...compressed.map(
+      (item) =>
+        `Compressed ${path.basename(item.from)}${item.to !== item.from ? ` to ${path.basename(item.to)}` : ""}: ${formatByteSize(item.originalBytes)} -> ${formatByteSize(item.compressedBytes)}`,
+    ),
+    ...skipped.map(
+      (item) => `Kept ${path.basename(item.filePath)} as is: ${item.reason}.`,
+    ),
+    ...errors.map((error) => `Could not compress ${error}`),
+    `Videos compressed: ${compressed.length}, kept as is: ${skipped.length}, failed: ${errors.length}. Space saved: ${formatByteSize(saved)}.`,
+  ].join("\n");
+};
+
+/**
  * Resolves once every queued image file operation (saves, rotations, previews) has finished.
  * @returns {Promise<void>}
  */
@@ -3431,6 +4147,13 @@ const shutdownCore = () => exiftool.end();
 
 export {
   allowedExtensions,
+  videoExtensions,
+  mediaExtensions,
+  isVideoPath,
+  findLiveVideoPath,
+  getVideoInfo,
+  getVideoSeekSprite,
+  compressFolderVideos,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
   clearThumbnailMemoryCache,

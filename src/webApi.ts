@@ -58,6 +58,10 @@ const createWebApi = (): ImageParserApi => ({
       thumb: String(size),
       v: version,
     }).toString()}`,
+  getVideoUrl: (filePath, version) =>
+    `api/video?${new URLSearchParams({ path: filePath, v: version }).toString()}`,
+  getVideoSpriteUrl: (filePath, version) =>
+    `api/video-sprite?${new URLSearchParams({ path: filePath, v: version }).toString()}`,
   applyImageRotations: (request) =>
     postJson("api/apply-image-rotations", request),
   setFolderDate: (directoryPath, date, recursive) =>

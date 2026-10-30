@@ -9,6 +9,7 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
   buildUserContext,
@@ -28,6 +29,9 @@ import {
   getImageVersion,
   getImmichGoDiagnostics,
   getThumbnail,
+  getVideoInfo,
+  getVideoSeekSprite,
+  isVideoPath,
   listDirectory,
   loadImmichSettings,
   normalizeRotationValue,
@@ -71,6 +75,7 @@ import {
   ImmichLookupError,
 } from "./immichLookup.js";
 import { createServerLogger } from "./serverLogger.js";
+import { parseByteRange, videoContentTypes } from "./videoMedia.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.join(__dirname, "dist");
@@ -791,6 +796,11 @@ const handleImage = async (request, response, url) => {
     url.searchParams.get("path"),
   );
   const extension = path.extname(filePath).toLowerCase();
+  // A video's thumbnail is its poster frame; the video itself is served by /api/video.
+  if (url.searchParams.has("thumb") && isVideoPath(filePath)) {
+    await sendThumbnail(request, response, filePath, url);
+    return;
+  }
   if (!allowedExtensions.has(extension)) {
     throw new HttpError(400, "Unsupported image type.");
   }
@@ -824,6 +834,137 @@ const handleImage = async (request, response, url) => {
     "Content-Length": preview.buffer.length,
   });
   response.end(preview.buffer);
+};
+
+/**
+ * Streams a video as it is, with HTTP Range support so the player can seek. Videos are never transcoded;
+ * a format the browser cannot play is reported by the player.
+ * @param {ClientRequest} request - The HTTP request object (GET or HEAD).
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {URL} url - The parsed URL; `path` is the video and `v` its version.
+ * @returns {Promise<void>}
+ * @throws {HttpError} 400 for an unsupported type, 403/404 from path confinement.
+ */
+const handleVideo = async (request, response, url) => {
+  const filePath = await resolvePathForUser(
+    request.user,
+    url.searchParams.get("path"),
+  );
+  const contentType = videoContentTypes[path.extname(filePath).toLowerCase()];
+  if (!contentType) {
+    throw new HttpError(400, "Unsupported video type.");
+  }
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    throw new HttpError(404, "The requested path is not a video file.");
+  }
+
+  const version = await getImageVersion(filePath);
+  const headers = {
+    "Accept-Ranges": "bytes",
+    "Content-Type": contentType,
+    ETag: `"video-${version}"`,
+    "Cache-Control":
+      url.searchParams.get("v") === version
+        ? "private, max-age=31536000, immutable"
+        : "private, no-cache",
+    "X-Content-Type-Options": "nosniff",
+  };
+  const range = parseByteRange(request.headers.range, stats.size);
+  if (range === "unsatisfiable") {
+    response.writeHead(416, {
+      ...headers,
+      "Content-Range": `bytes */${stats.size}`,
+      "Content-Length": 0,
+    });
+    response.end();
+    return;
+  }
+
+  const start = range?.start ?? 0;
+  const end = range?.end ?? stats.size - 1;
+  response.writeHead(range ? 206 : 200, {
+    ...headers,
+    "Content-Length": Math.max(0, end - start + 1),
+    ...(range
+      ? { "Content-Range": `bytes ${start}-${end}/${stats.size}` }
+      : {}),
+  });
+  if (request.method === "HEAD" || stats.size === 0) {
+    response.end();
+    return;
+  }
+
+  try {
+    await pipeline(fsSync.createReadStream(filePath, { start, end }), response);
+  } catch (error) {
+    // Players drop connections whenever they seek; only real read errors are worth logging.
+    if (error?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+      logger.warn(`Streaming ${path.basename(filePath)} failed.`, error);
+    }
+    response.destroy();
+  }
+};
+
+/**
+ * Sends a video's seek-bar preview sprite (see videoMedia.js seekSpriteLayout). Like thumbnails, a request
+ * whose `v` matches the video on disk may be cached indefinitely.
+ * @param {ClientRequest} request - The HTTP request object.
+ * @param {ServerResponse} response - The HTTP response object.
+ * @param {URL} url - The parsed URL; `path` is the video and `v` its version.
+ * @returns {Promise<void>}
+ * @throws {HttpError} 400 for an unsupported type, 404 when the video's length is unknown.
+ */
+const handleVideoSprite = async (request, response, url) => {
+  const filePath = await resolvePathForUser(
+    request.user,
+    url.searchParams.get("path"),
+  );
+  if (!isVideoPath(filePath)) {
+    throw new HttpError(400, "Unsupported video type.");
+  }
+  if (!(await getVideoInfo(filePath)).durationSeconds) {
+    throw new HttpError(404, "This video has no seek-bar previews.");
+  }
+  const version = await getImageVersion(filePath);
+  const cacheHeaders = {
+    ETag: `"sprite-${version}"`,
+    "Cache-Control":
+      url.searchParams.get("v") === version
+        ? "private, max-age=31536000, immutable"
+        : "private, no-cache",
+  };
+  if (request.headers["if-none-match"] === cacheHeaders.ETag) {
+    response.writeHead(304, cacheHeaders);
+    response.end();
+    return;
+  }
+
+  const controller = new AbortController();
+  const abortIfUnanswered = () => {
+    if (!response.writableEnded) {
+      controller.abort();
+    }
+  };
+  response.once("close", abortIfUnanswered);
+  let sprite;
+  try {
+    sprite = await getVideoSeekSprite(filePath, { signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      return;
+    }
+    throw error;
+  } finally {
+    response.off("close", abortIfUnanswered);
+  }
+
+  response.writeHead(200, {
+    ...cacheHeaders,
+    "Content-Type": "image/webp",
+    "Content-Length": sprite.buffer.length,
+  });
+  response.end(sprite.buffer);
 };
 
 /**
@@ -1191,6 +1332,10 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
         recursive: body.recursive === true,
         log: logger,
         lockKey: request.user.userKey || "default",
+        // Video compression rewrites files, so nested folders stay confined to the user's folders.
+        isAllowedPath: (
+          await getScanOptionsForUser(request.user, body.recursive === true)
+        ).isAllowedPath,
       },
     );
   },
@@ -1458,6 +1603,19 @@ const createRequestHandler = ({
 
       if (request.method === "GET" && url.pathname === "/api/image") {
         await handleImage(request, response, url);
+        return;
+      }
+
+      if (
+        (request.method === "GET" || request.method === "HEAD") &&
+        url.pathname === "/api/video"
+      ) {
+        await handleVideo(request, response, url);
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/video-sprite") {
+        await handleVideoSprite(request, response, url);
         return;
       }
 
