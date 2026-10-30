@@ -87,6 +87,29 @@ const applyManagedImmichSettings = (settings, config, user) => {
 };
 
 /**
+ * Chooses the Immich URL and user key for an album or tag lookup. Precedence, highest first: the key from the
+ * identity provider's claim (and IMMICH_URL), then the values typed in the form, then the saved values. The form's
+ * key is used only when the provider supplies none.
+ * @param {{serverUrl?: string, userApiKey?: string}} saved - The user's saved settings.
+ * @param {{serverUrl?: string, userApiKey?: string}|undefined} form - The values currently in the form.
+ * @param {{serverUrl: string, adminApiKey: string}} config - The managed environment settings.
+ * @param {{immichApiKey?: string}} user - The request's user context.
+ * @returns {Object} The settings to look up with.
+ */
+const resolveImmichLookupSettings = (saved, form, config, user) => {
+  const typed = (value) => String(value ?? "").trim();
+  return applyManagedImmichSettings(
+    {
+      ...saved,
+      serverUrl: typed(form?.serverUrl) || saved.serverUrl,
+      userApiKey: typed(form?.userApiKey) || saved.userApiKey,
+    },
+    config,
+    user,
+  );
+};
+
+/**
  * Prepares Immich settings for the browser: managed keys are blanked, the managed URL (not a secret) is shown,
  * and `managed` flags tell the settings panel which fields to hide or lock.
  * @param {Object} settings - The user's settings.
@@ -112,5 +135,6 @@ export {
   getManagedImmichFields,
   listManagedFields,
   readManagedImmichConfig,
+  resolveImmichLookupSettings,
   toClientImmichSettings,
 };
