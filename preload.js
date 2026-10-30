@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("set-folder-date", { directoryPath, date, recursive }),
   setPairsDate: (pairs, date) =>
     ipcRenderer.invoke("set-pairs-date", { pairs, date }),
+  addTagsToPairs: (pairs, tags) =>
+    ipcRenderer.invoke("add-tags-to-pairs", { pairs, tags }),
   resetFolderMetadata: (directoryPath, recursive) =>
     ipcRenderer.invoke("reset-folder-metadata", { directoryPath, recursive }),
   setDoNotUpload: (request) => ipcRenderer.invoke("set-do-not-upload", request),

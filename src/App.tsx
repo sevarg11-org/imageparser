@@ -47,6 +47,7 @@ import {
   isPairProcessed,
   type ImageFilter,
 } from "./imageFilters";
+import { AddTagsModal } from "./AddTagsModal";
 import AlbumCombobox from "./AlbumCombobox";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { ThumbnailGrid } from "./ThumbnailGrid";
@@ -233,6 +234,15 @@ declare global {
       setPairsDate: (
         pairs: { frontPath: string; backPath: string | null }[],
         date: string,
+      ) => Promise<{
+        ok: boolean;
+        updatedPairs: number;
+        failedFrontPaths: string[];
+        errors: string[];
+      }>;
+      addTagsToPairs: (
+        pairs: { frontPath: string; backPath: string | null }[],
+        tags: string[],
       ) => Promise<{
         ok: boolean;
         updatedPairs: number;
@@ -898,6 +908,9 @@ function App() {
     () => new Set(),
   );
   const [isSelectedDateModalOpen, setIsSelectedDateModalOpen] = useState(false);
+  const [isAddTagsModalOpen, setIsAddTagsModalOpen] = useState(false);
+  const [isAddingTags, setIsAddingTags] = useState(false);
+  const [addTagsFailures, setAddTagsFailures] = useState<string[]>([]);
   const [isSetFolderDateModalOpen, setIsSetFolderDateModalOpen] =
     useState(false);
   const [isTogglingDoNotUpload, setIsTogglingDoNotUpload] = useState(false);
@@ -1043,7 +1056,9 @@ function App() {
       (error) => {
         if (isMounted) {
           setImmichTagError(
-            error instanceof Error ? error.message : "Tags could not be loaded.",
+            error instanceof Error
+              ? error.message
+              : "Tags could not be loaded.",
           );
         }
       },
@@ -2762,6 +2777,72 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
     }
   };
   /**
+   * Adds tags to the groups selected in the grid. Existing tags are kept; groups that fail stay selected and
+   * are listed in the dialog so the tags can be added again.
+   * @param tags - The tags chosen in the modal.
+   */
+  const handleConfirmAddTags = async (tags: string[]) => {
+    const chosenPairs = pairs.filter((pair) => selectedGridIds.has(pair.id));
+    if (!chosenPairs.length || !tags.length) {
+      setIsAddTagsModalOpen(false);
+      return;
+    }
+
+    setIsAddingTags(true);
+    setAddTagsFailures([]);
+    setStatus(`Adding tags to ${chosenPairs.length} selected groups...`);
+
+    try {
+      const electronApi = window.electronAPI;
+      if (!electronApi) {
+        throw new Error("API is not available.");
+      }
+
+      await waitForPendingSaves();
+      const result = await electronApi.addTagsToPairs(
+        chosenPairs.map(({ frontPath, backPath }) => ({ frontPath, backPath })),
+        tags,
+      );
+      const failedPaths = new Set(result.failedFrontPaths);
+      markPairsSaved(
+        chosenPairs
+          .filter((pair) => !failedPaths.has(pair.frontPath))
+          .map((pair) => pair.id),
+      );
+      setRecentTags((current) => mergeTagSources(tags, current));
+      setSelectedGridIds(
+        new Set(
+          chosenPairs
+            .filter((pair) => failedPaths.has(pair.frontPath))
+            .map((pair) => pair.id),
+        ),
+      );
+      setStatus(
+        result.ok
+          ? `Added ${tags.length} tag${tags.length === 1 ? "" : "s"} to ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}.`
+          : `Tags added to ${result.updatedPairs} image group${result.updatedPairs === 1 ? "" : "s"}; ${result.errors.length} failed.`,
+      );
+      if (result.ok) {
+        setIsAddTagsModalOpen(false);
+      } else {
+        setAddTagsFailures(result.errors);
+      }
+      sidecarPrefetchRef.current.clear();
+      setIsHydrated(false);
+      setPairReloadToken((current) => current + 1);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unable to add tags to the selected images.";
+      setStatus(message);
+      setAddTagsFailures([message]);
+    } finally {
+      setIsAddingTags(false);
+    }
+  };
+
+  /**
    * Marks the open folder, and optionally every subfolder, as processed or not processed.
    * @param value - Whether the folder is processed.
    * @param includeSubfolders - Whether to mark every subfolder the same way.
@@ -2874,6 +2955,18 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                 title="Set a date for the selected images, replacing any date already saved"
               >
                 Set date for selected ({selectedGridIds.size})
+              </button>
+              <button
+                type="button"
+                className="primary-button"
+                onClick={() => {
+                  setAddTagsFailures([]);
+                  setIsAddTagsModalOpen(true);
+                }}
+                disabled={isTransitionLocked}
+                title="Add tags to the selected images, keeping the tags they already have"
+              >
+                Add tags to selected ({selectedGridIds.size})
               </button>
             </>
           ) : null}
@@ -3723,6 +3816,16 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
         onConfirm={(date) => void handleConfirmSetFolderDate(date)}
         onClose={() => setIsSetFolderDateModalOpen(false)}
         isSubmitting={isSettingFolderDate}
+      />
+      <AddTagsModal
+        isOpen={isAddTagsModalOpen}
+        selectedCount={selectedGridIds.size}
+        suggestions={tagSuggestions}
+        lookupError={immichTagError}
+        isSubmitting={isAddingTags}
+        failures={addTagsFailures}
+        onConfirm={(tags) => void handleConfirmAddTags(tags)}
+        onClose={() => setIsAddTagsModalOpen(false)}
       />
       <SetFolderDateModal
         isOpen={isSelectedDateModalOpen}

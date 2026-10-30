@@ -21,6 +21,7 @@ import {
   setDoNotUpload,
   setFolderDate,
   resetFolderMetadata,
+  addTagsToPairs,
   setPairsDate,
   setFolderProcessed,
   shutdownCore,
@@ -401,6 +402,9 @@ ipcMain.handle(
  */
 ipcMain.handle("set-pairs-date", (_event, { pairs, date }) =>
   setPairsDate(pairs, date),
+);
+ipcMain.handle("add-tags-to-pairs", (_event, { pairs, tags }) =>
+  addTagsToPairs(pairs, tags),
 );
 ipcMain.handle("save-metadata", (_event, metadata) => saveMetadata(metadata));
 
