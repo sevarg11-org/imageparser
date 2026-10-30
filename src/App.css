@@ -753,9 +753,10 @@
   accent-color: #38bdf8;
 }
 
+/* Not clipped: the album and tag dropdowns extend past the panel and the page scrolls to show them. */
 .immich-panel {
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .immich-panel-summary,
