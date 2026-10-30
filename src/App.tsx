@@ -3055,51 +3055,6 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
               </a>
             </>
           ) : null}
-          {directoryPath && viewMode === "grid" && selectedGridIds.size > 0 ? (
-            <>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setSelectedGridIds(new Set())}
-                disabled={isTransitionLocked}
-              >
-                Clear selection
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => setIsSelectedDateModalOpen(true)}
-                disabled={isTransitionLocked}
-                title="Set a date for the selected images, replacing any date already saved"
-              >
-                Set date for selected ({selectedGridIds.size})
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => {
-                  setAddTagsFailures([]);
-                  setIsAddTagsModalOpen(true);
-                }}
-                disabled={isTransitionLocked}
-                title="Add tags to the selected images, keeping the tags they already have"
-              >
-                Add tags to selected ({selectedGridIds.size})
-              </button>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => {
-                  setSetLocationFailures([]);
-                  setIsSetLocationModalOpen(true);
-                }}
-                disabled={isTransitionLocked}
-                title="Set one location for the selected images"
-              >
-                Set location for selected ({selectedGridIds.size})
-              </button>
-            </>
-          ) : null}
           {directoryPath ? (
             <button
               type="button"
@@ -3143,6 +3098,58 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
           <span className="save-indicator" role="status">
             Saving {pendingSaveCount} image{pendingSaveCount === 1 ? "" : "s"}…
           </span>
+        ) : null}
+        {directoryPath && viewMode === "grid" && selectedGridIds.size > 0 ? (
+          <div
+            className="selection-actions"
+            role="group"
+            aria-label="Actions for the selected images"
+          >
+            <span className="selection-count">
+              {selectedGridIds.size} selected
+            </span>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setSelectedGridIds(new Set())}
+              disabled={isTransitionLocked}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => setIsSelectedDateModalOpen(true)}
+              disabled={isTransitionLocked}
+              title="Set a date for the selected images, replacing any date already saved"
+            >
+              Set date
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                setAddTagsFailures([]);
+                setIsAddTagsModalOpen(true);
+              }}
+              disabled={isTransitionLocked}
+              title="Add tags to the selected images, keeping the tags they already have"
+            >
+              Add tags
+            </button>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                setSetLocationFailures([]);
+                setIsSetLocationModalOpen(true);
+              }}
+              disabled={isTransitionLocked}
+              title="Set one location for the selected images"
+            >
+              Set location
+            </button>
+          </div>
         ) : null}
         {directoryPath ? (
           <div className="folder-processed">

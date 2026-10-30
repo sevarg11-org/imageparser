@@ -98,6 +98,7 @@
 
 .status-bar {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   gap: 16px;
   align-items: center;
@@ -108,6 +109,26 @@
   margin-bottom: 24px;
   color: #cbd5e1;
   min-width: 300px;
+}
+
+/* Selection actions sit in the status bar, between the image status and the folder name. */
+.selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.selection-actions .primary-button,
+.selection-actions .secondary-button {
+  padding: 0.4rem 0.8rem;
+  font-size: 0.9rem;
+}
+
+.selection-count {
+  font-weight: 600;
+  color: #e2e8f0;
 }
 
 .status-bar strong {
