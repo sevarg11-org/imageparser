@@ -59,6 +59,7 @@ import {
   isInsideDirectory,
   isPathAllowed,
 } from "./pathAccess.js";
+import { createGeocoder, GeocoderError } from "./geocoder.js";
 import {
   createLookupCache,
   fetchImmichAlbums,
@@ -833,6 +834,28 @@ const validateMetadataPaths = async (user, payload) => ({
   backPath: await resolveOptionalPathForUser(user, payload?.backPath),
 });
 
+const geocoderUrl = process.env.IMAGEPARSER_GEOCODER_URL || "";
+const geocoder = createGeocoder({
+  baseUrl: geocoderUrl || undefined,
+  cacheFile: path.join(configDirectory, "geocode-cache.json"),
+});
+
+/**
+ * Runs a geocoder call, turning its errors into HTTP errors the browser can show.
+ * @param {() => Promise<any>} call - The geocoder call.
+ * @returns {Promise<any>} The call's result.
+ */
+const runGeocoder = async (call) => {
+  try {
+    return await call();
+  } catch (error) {
+    if (error instanceof GeocoderError) {
+      throw new HttpError(error.statusCode, error.message);
+    }
+    throw error;
+  }
+};
+
 const albumCache = createLookupCache();
 const tagCache = createLookupCache();
 
@@ -884,6 +907,19 @@ const createApiRoutes = (secretCodec, immichConfig) => ({
     authMode: oidcEnabled ? "oidc" : authPassword ? "basic" : "none",
   }),
   "GET /api/browse": async (request, url) => handleBrowse(request.user, url),
+  // The browser calls this only on an explicit search; the geocoder adds the cache and rate limits.
+  "GET /api/geocode": async (_request, url) => ({
+    places: await runGeocoder(() => geocoder.search(url.searchParams.get("q"))),
+  }),
+  // Recent places come from the local store and never reach the network.
+  "GET /api/recent-places": async () => ({
+    places: await geocoder.getRecentPlaces(),
+  }),
+  "POST /api/recent-places": async (request) => ({
+    place: await runGeocoder(async () =>
+      geocoder.rememberPlace(await readJsonBody(request)),
+    ),
+  }),
   "GET /api/immich-albums": async (request, url) => {
     const cacheKey = request.user.userKey || "default";
     if (url.searchParams.get("refresh") === "1") {
@@ -1423,6 +1459,11 @@ const createOidcContext = (masterKey) => {
  * Starts the Image Parser server on the configured port and host.
  */
 const start = async () => {
+  if (geocoderUrl && !/^https?:\/\//i.test(geocoderUrl)) {
+    throw new Error(
+      "IMAGEPARSER_GEOCODER_URL must be an http:// or https:// URL.",
+    );
+  }
   if (authPassword && !authUsername) {
     throw new Error(
       "IMAGEPARSER_USERNAME must be set when IMAGEPARSER_PASSWORD is set.",

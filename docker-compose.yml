@@ -16,6 +16,8 @@ services:
       # TrueNAS SCALE's built-in "apps" user is 568:568. Match the photo dataset owner when different.
       PUID: ${PUID:-568}
       PGID: ${PGID:-568}
+      # Optional place-search service for tagging photo locations (Photon API). Defaults to the public Photon server.
+      IMAGEPARSER_GEOCODER_URL: ${IMAGEPARSER_GEOCODER_URL:-}
       # Optional HTTP Basic auth. Strongly recommended, because the UI can read the saved Immich API keys.
       # With OpenID Connect sign-in below, these are ignored and act only as backup credentials for OIDC_DISABLED.
       IMAGEPARSER_USERNAME: ${IMAGEPARSER_USERNAME:-}
