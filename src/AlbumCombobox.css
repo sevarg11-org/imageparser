@@ -30,7 +30,8 @@
 }
 
 .album-combobox li.active {
-  background: rgba(14, 116, 144, 0.6);
+  box-shadow: inset 3px 0 0 #38bdf8;
+  background: rgba(56, 189, 248, 0.28);
   color: #f8fafc;
 }
 

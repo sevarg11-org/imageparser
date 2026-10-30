@@ -78,6 +78,15 @@ function AlbumCombobox({
 
   const options = errorMessage ? [] : buildAlbumOptions(albums, value);
   const showList = isOpen && options.length > 0;
+
+  // Keeps the highlighted option visible when arrow keys move past the edge of a scrolling list.
+  useEffect(() => {
+    if (showList) {
+      document
+        .getElementById(`${id}-option-${activeIndex}`)
+        ?.scrollIntoView({ block: "nearest" });
+    }
+  }, [showList, activeIndex, id]);
   const activeOption = options[Math.min(activeIndex, options.length - 1)];
 
   const choose = (albumName: string) => {
@@ -154,6 +163,8 @@ function AlbumCombobox({
               role="option"
               aria-selected={index === activeIndex}
               className={index === activeIndex ? "active" : undefined}
+              // Pointer movement (not mere presence) moves the highlight, so keyboard scrolling is not hijacked.
+              onMouseMove={() => setActiveIndex(index)}
               // mousedown keeps focus in the input so blur does not close the list before the click lands.
               onMouseDown={(event) => {
                 event.preventDefault();
