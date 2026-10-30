@@ -3039,6 +3039,106 @@ const setFolderDate = async (
 };
 
 /**
+ * Sets the date on the chosen image groups, following the rules of saving one image: the A-file sidecar is
+ * created or rewritten, a plain day keeps the group's time of day, and the date is embedded in each image.
+ * A group's saved description and tags are kept. Unlike setFolderDate, groups that already have a sidecar are
+ * updated too, because the user chose them.
+ * @param {Array<{frontPath: string, backPath: string|null}>} pairs - The groups to date.
+ * @param {string} date - The date to apply (e.g. "1991-12-31").
+ * @returns {Promise<{ok: boolean, updatedPairs: number, failedFrontPaths: string[], errors: string[]}>}
+ */
+const setPairsDate = async (pairs, date) => {
+  const errors = [];
+  const failedFrontPaths = [];
+  let updatedPairs = 0;
+
+  for (const pair of pairs) {
+    try {
+      const { description, tags } = await readSidecarMetadata(pair.frontPath);
+      const result = await saveMetadata({
+        frontPath: pair.frontPath,
+        backPath: pair.backPath,
+        date,
+        description,
+        tags,
+      });
+      if (!result.ok) {
+        throw new Error(
+          result.results
+            .filter((imageResult) => !imageResult.ok)
+            .map((imageResult) => imageResult.error)
+            .join(" "),
+        );
+      }
+      updatedPairs += 1;
+    } catch (error) {
+      failedFrontPaths.push(pair.frontPath);
+      errors.push(
+        `${path.basename(pair.frontPath)}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, updatedPairs, failedFrontPaths, errors };
+};
+
+/**
+ * Resets the processing state of every image in a directory by deleting its XMP sidecar files.
+ * Only sidecars belonging to the folder's images are deleted (both naming conventions, for the A and B
+ * images), never other .xmp files. Images and the folder's own processed marker are left untouched.
+ * With recursive set, every nested folder is covered, within the same limits as the nested scan.
+ * @param {string} directoryPath - The path to the directory.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean}} [options] - Whether to include
+ *   nested folders, and the confinement check for them (see readDirectory).
+ * @returns {Promise<{ok: boolean, deletedFiles: number, resetPairs: number, errors: string[]}>}
+ */
+const resetFolderMetadata = async (
+  directoryPath,
+  { recursive = false, isAllowedPath } = {},
+) => {
+  const { files: pairs } = await readDirectory(directoryPath, defaultSortBy, {
+    recursive,
+    isAllowedPath,
+  });
+
+  const errors = [];
+  let deletedFiles = 0;
+  let resetPairs = 0;
+
+  for (const pair of pairs) {
+    const imagePaths = [pair.frontPath, pair.backPath].filter(Boolean);
+    try {
+      const deleted = await runImageFileOperation(imagePaths, async () => {
+        let count = 0;
+        for (const imagePath of imagePaths) {
+          for (const sidecarPath of getSidecarCandidatePaths(imagePath)) {
+            try {
+              await fs.unlink(sidecarPath);
+              count += 1;
+            } catch (error) {
+              if (error?.code !== "ENOENT") {
+                throw error;
+              }
+            }
+          }
+        }
+        return count;
+      });
+      deletedFiles += deleted;
+      if (deleted > 0) {
+        resetPairs += 1;
+      }
+    } catch (error) {
+      errors.push(
+        `${pair.imageLabel}: ${error instanceof Error ? error.message : "Unknown error"}`,
+      );
+    }
+  }
+
+  return { ok: errors.length === 0, deletedFiles, resetPairs, errors };
+};
+
+/**
  * Resolves once every queued image file operation (saves, rotations, previews) has finished.
  * @returns {Promise<void>}
  */
@@ -3083,6 +3183,8 @@ export {
   scanImageFiles,
   setDoNotUploadQueued as setDoNotUpload,
   setFolderDate,
+  resetFolderMetadata,
+  setPairsDate,
   setFolderProcessed,
   shutdownCore,
   toExcludedName,

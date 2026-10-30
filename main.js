@@ -20,6 +20,8 @@ import {
   saveMetadata,
   setDoNotUpload,
   setFolderDate,
+  resetFolderMetadata,
+  setPairsDate,
   setFolderProcessed,
   shutdownCore,
   whenImageFileOperationsIdle,
@@ -397,6 +399,9 @@ ipcMain.handle(
  * @param {Object} metadata - The metadata object to save.
  * @returns {Promise<void>} Resolves when all metadata has been saved.
  */
+ipcMain.handle("set-pairs-date", (_event, { pairs, date }) =>
+  setPairsDate(pairs, date),
+);
 ipcMain.handle("save-metadata", (_event, metadata) => saveMetadata(metadata));
 
 /**
@@ -474,6 +479,16 @@ ipcMain.handle(
   "set-folder-date",
   (_event, { directoryPath, date, recursive }) =>
     setFolderDate(directoryPath, date, { recursive: recursive === true }),
+);
+
+/**
+ * IPC handler for deleting the XMP sidecar files of every image in a directory.
+ * @param {{directoryPath: string, recursive?: boolean}} payload
+ */
+ipcMain.handle(
+  "reset-folder-metadata",
+  (_event, { directoryPath, recursive }) =>
+    resetFolderMetadata(directoryPath, { recursive: recursive === true }),
 );
 
 /**

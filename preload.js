@@ -21,6 +21,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("apply-image-rotations", request),
   setFolderDate: (directoryPath, date, recursive) =>
     ipcRenderer.invoke("set-folder-date", { directoryPath, date, recursive }),
+  setPairsDate: (pairs, date) =>
+    ipcRenderer.invoke("set-pairs-date", { pairs, date }),
+  resetFolderMetadata: (directoryPath, recursive) =>
+    ipcRenderer.invoke("reset-folder-metadata", { directoryPath, recursive }),
   setDoNotUpload: (request) => ipcRenderer.invoke("set-do-not-upload", request),
   setFolderProcessed: (directoryPath, value, includeSubfolders) =>
     ipcRenderer.invoke("set-folder-processed", {
