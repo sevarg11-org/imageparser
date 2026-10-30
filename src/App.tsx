@@ -47,6 +47,7 @@ import {
   isPairProcessed,
   type ImageFilter,
 } from "./imageFilters";
+import AlbumCombobox from "./AlbumCombobox";
 import { SetFolderDateModal } from "./SetFolderDateModal";
 import { ThumbnailGrid } from "./ThumbnailGrid";
 import {
@@ -3523,18 +3524,29 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   </label>
                 )}
 
-                <label>
-                  Target album
-                  <input
-                    type="text"
+                {isWebApp() ? (
+                  <AlbumCombobox
                     value={immichSettings.albumName}
-                    onChange={(event) =>
-                      updateImmichSetting("albumName", event.target.value)
+                    onChange={(albumName) =>
+                      updateImmichSetting("albumName", albumName)
                     }
-                    required
                     disabled={isUploading}
+                    reloadKey={immichSettings.serverUrl}
                   />
-                </label>
+                ) : (
+                  <label>
+                    Target album
+                    <input
+                      type="text"
+                      value={immichSettings.albumName}
+                      onChange={(event) =>
+                        updateImmichSetting("albumName", event.target.value)
+                      }
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
                 <label className="immich-tags">
                   Tags
