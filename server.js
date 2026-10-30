@@ -1003,16 +1003,15 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
       }
 
       let user;
+      let claims;
       try {
-        user = buildUserContext(
-          await oidcClient.finishLogin(url.searchParams, checks),
-          {
-            foldersClaim: oidcFoldersClaim,
-            adminGroup: oidcAdminGroup,
-            adminClaim: oidcAdminClaim,
-            immichApiKeyClaim: oidcImmichApiKeyClaim,
-          },
-        );
+        claims = await oidcClient.finishLogin(url.searchParams, checks);
+        user = buildUserContext(claims, {
+          foldersClaim: oidcFoldersClaim,
+          adminGroup: oidcAdminGroup,
+          adminClaim: oidcAdminClaim,
+          immichApiKeyClaim: oidcImmichApiKeyClaim,
+        });
       } catch (error) {
         // openid-client wraps the specific reason (e.g. a bad signature or unexpected "alg") in `cause`.
         const reason = error?.cause?.message ?? error?.message;
@@ -1047,6 +1046,24 @@ const createAuthRoutes = ({ oidcClient, sessionCodec, loginCodec }) => {
         folders: user.folders.length,
         immichApiKey: Boolean(user.immichApiKey),
       });
+      if (!user.immichApiKey) {
+        // Names and types only, never values, so a missing or mistyped Immich key can be diagnosed.
+        const immichApiKeyValue = claims[oidcImmichApiKeyClaim];
+        logger.info(
+          `No Immich API key in the "${oidcImmichApiKeyClaim}" claim for ${user.username}; they enter their own.`,
+          {
+            claim:
+              immichApiKeyValue === undefined
+                ? "missing"
+                : typeof immichApiKeyValue === "string"
+                  ? immichApiKeyValue.trim()
+                    ? "too long"
+                    : "empty"
+                  : `not a string (${Array.isArray(immichApiKeyValue) ? "array" : typeof immichApiKeyValue})`,
+            receivedClaims: Object.keys(claims).sort(),
+          },
+        );
+      }
       sendRedirect(response, appLocation, [
         serializeCookie(cookieNames.session, session, {
           maxAgeSeconds: sessionMaxAgeSeconds,

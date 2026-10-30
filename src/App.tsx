@@ -3254,30 +3254,36 @@ function App() {
               ) : null}
 
               <div className="immich-grid">
-                <label>
-                  Server URL
-                  <input
-                    type="url"
-                    value={immichSettings.serverUrl}
-                    onChange={(event) =>
-                      updateImmichSetting("serverUrl", event.target.value)
-                    }
-                    placeholder="https://photos.example.com"
-                    required
-                    readOnly={managedImmichFields?.serverUrl}
-                    disabled={isUploading}
-                    aria-describedby={
-                      managedImmichFields?.serverUrl
-                        ? "immich-server-url-help"
-                        : undefined
-                    }
-                  />
-                  {managedImmichFields?.serverUrl ? (
-                    <span id="immich-server-url-help" className="field-help">
+                {managedImmichFields?.serverUrl ? (
+                  // Shown as text, not a read-only input, so it does not look editable.
+                  <div
+                    className="immich-managed-field"
+                    role="group"
+                    aria-labelledby="immich-server-url-label"
+                  >
+                    <span id="immich-server-url-label">Server URL</span>
+                    <span className="immich-managed-value">
+                      {immichSettings.serverUrl}
+                    </span>
+                    <span className="field-help">
                       Set by your administrator.
                     </span>
-                  ) : null}
-                </label>
+                  </div>
+                ) : (
+                  <label>
+                    Server URL
+                    <input
+                      type="url"
+                      value={immichSettings.serverUrl}
+                      onChange={(event) =>
+                        updateImmichSetting("serverUrl", event.target.value)
+                      }
+                      placeholder="https://photos.example.com"
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
                 {managedImmichFields?.userApiKey ? null : (
                   <label>

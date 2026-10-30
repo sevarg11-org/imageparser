@@ -784,13 +784,21 @@
   gap: 14px;
 }
 
-.immich-grid label {
+.immich-grid label,
+.immich-managed-field {
   display: flex;
   flex-direction: column;
   gap: 8px;
   color: #dfeaf7;
   font-weight: 600;
   text-align: left;
+}
+
+/* A value set by the administrator: plain text, so it does not look like an editable input. */
+.immich-managed-value {
+  color: #f8fafc;
+  font-weight: 400;
+  overflow-wrap: anywhere;
 }
 
 .immich-tags {

@@ -749,6 +749,15 @@ test("Immich settings managed by the environment and Authentik are never exposed
       );
     }
     assert.doesNotMatch(managed.output(), /dave-claim-key|env-admin-key/);
+    // A user without the key is logged with the claim names received, so a mapping problem can be diagnosed.
+    assert.match(
+      managed.output(),
+      /No Immich API key in the "immich_api_key" claim for erin[\s\S]*claim: 'missing'[\s\S]*receivedClaims/,
+    );
+    assert.doesNotMatch(
+      managed.output(),
+      /No Immich API key in the "immich_api_key" claim for dave/,
+    );
   } finally {
     appUrl = previousAppUrl;
   }
