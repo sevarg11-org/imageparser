@@ -39,8 +39,8 @@ Placeholders used below:
 
 ## Step 1: Create the scope mapping
 
-The scope mapping sends two pieces of information to Image Parser: the user's folder grants (merged from the user
-and all their groups) and whether the user is an admin.
+The scope mapping sends three pieces of information to Image Parser: the user's folder grants (merged from the
+user and all their groups), whether the user is an admin, and, optionally, the user's own Immich API key.
 
 1. Go to **Customization → Property Mappings → Create**.
 2. Choose **Scope Mapping** (some versions call it _OAuth2/OpenID Scope Mapping_).
@@ -65,6 +65,7 @@ and all their groups) and whether the user is an admin.
    return {
        "imageparser_folders": sorted(set(folders)),
        "imageparser_admin": request.user.attributes.get("imageparser_admin") is True,
+       "immich_api_key": request.user.attributes.get("immich_api_key", ""),
    }
    ```
 
@@ -74,7 +75,7 @@ and all their groups) and whether the user is an admin.
 > Without that, folders granted to a group would be ignored.
 
 **Check:** open the mapping and use **Test** with a user. The result should look like
-`{"imageparser_folders": ["family"], "imageparser_admin": false}`.
+`{"imageparser_folders": ["family"], "imageparser_admin": false, "immich_api_key": ""}`.
 
 ---
 
@@ -201,6 +202,27 @@ What users see in the folder browser:
 
 ---
 
+## Step 5b: Provide Immich API keys (optional)
+
+To spare users from entering their Immich API key, set it as a user attribute (**Directory → Users** → edit →
+**Attributes**):
+
+```yaml
+immich_api_key: <the API key created in Immich for this user>
+```
+
+- Users with the attribute upload without entering a key, and the **User API key** field is hidden for them. Users
+  without it (or with an empty value) still enter and save their own key.
+- The key reaches Image Parser in the server-side code exchange (userinfo) and never reaches the browser. It is
+  kept only in the user's encrypted session cookie and is **never saved**, not even encrypted, and never logged.
+- Like folder grants, a changed key applies at the user's next sign-in.
+- The provider must use a **Signing Key** (step 2), as it already must for sign-in.
+
+To set the Immich server and the admin key (used to pause Immich jobs during uploads) for everyone, set
+`IMMICH_URL` and `IMMICH_ADMIN_API_KEY` (or `IMMICH_ADMIN_API_KEY_FILE`) in step 6.
+
+---
+
 ## Step 6: Configure Image Parser
 
 In the stack's `.env` file (Dockge: the **.env** editor), set:
@@ -224,6 +246,10 @@ Optional settings (defaults shown):
 | `OIDC_ADMIN_GROUP`             | `imageparser-admin`                | Admin group name (step 4, option A)                              |
 | `OIDC_ADMIN_CLAIM`             | `imageparser_admin`                | Admin claim name (step 4, option B)                              |
 | `OIDC_FOLDERS_CLAIM`           | `imageparser_folders`              | Folder claim name (step 5)                                       |
+| `OIDC_IMMICH_API_KEY_CLAIM`    | `immich_api_key`                   | Immich API key claim name (step 5b)                              |
+| `IMMICH_URL`                   | _(none)_                           | Immich server for every user; the field becomes read-only        |
+| `IMMICH_ADMIN_API_KEY`         | _(none)_                           | Admin key for pausing jobs; use a dedicated Immich admin account |
+| `IMMICH_ADMIN_API_KEY_FILE`    | _(none)_                           | File holding the admin key; takes precedence over the variable   |
 | `OIDC_SESSION_HOURS`           | `8`                                | How long a sign-in lasts                                         |
 | `OIDC_ALLOW_INSECURE_REQUESTS` | `false`                            | Set `true` only if Authentik is plain `http://` on a trusted LAN |
 | `OIDC_DISABLED`                | `false`                            | Emergency bypass (see [below](#emergency-access))                |
@@ -293,20 +319,21 @@ If Authentik is down or misconfigured and you need Image Parser anyway:
 Sign-in errors show a short "Sign-in failed" page in the browser. The specific reason is in the container log,
 on a line starting with `OpenID Connect sign-in failed:`.
 
-| Symptom / log message                                                                  | Cause and fix                                                                                                                                                                                                         |
-| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unsupported JWS algorithm` or `unexpected JWT "alg" header parameter`                 | The provider has no signing key, so tokens are HS256. Select a **Signing Key** (step 2), then restart the container so it re-reads the provider's configuration                                                       |
-| `JWT signature verification failed` or `no applicable keys found`                      | The token wasn't signed by a key Authentik currently publishes. If you just changed the provider's signing key, restart the container                                                                                 |
-| Authentik shows **Redirect URI Error**                                                 | `OIDC_REDIRECT_URI` doesn't match the provider's redirect URI exactly (scheme, host, path, trailing slash)                                                                                                            |
-| Opening Image Parser shows a JSON error; the log has `Request failed: GET /auth/login` | Discovery failed. With `"issuer" property does not match the expected value`, `OIDC_ISSUER_URL` differs from the provider's issuer (often the trailing `/`). Otherwise the container can't reach Authentik (step 7.1) |
-| `unable to verify the first certificate` / `self-signed certificate`                   | Authentik uses a private CA. Set `NODE_EXTRA_CA_CERTS` (step 6)                                                                                                                                                       |
-| `only requests to HTTPS are allowed`                                                   | The issuer is `http://`. Use HTTPS, or set `OIDC_ALLOW_INSECURE_REQUESTS=true` on a trusted LAN                                                                                                                       |
-| "The sign-in attempt expired or was started in another browser"                        | The user opened Image Parser on a different host than the redirect URI (e.g. the IP address), cookies are blocked, or more than 10 minutes passed on the Authentik page. Use the public HTTPS address                 |
-| "No folders are shared with your account"                                              | No `imageparser_folders` attribute; the **Image Parser** scope isn't added to the provider (step 2.3); `OIDC_SCOPES` is missing `imageparser`; or the folder doesn't exist under `/data`                              |
-| An admin only sees their own folders                                                   | Check the group name matches `OIDC_ADMIN_GROUP`, the `profile` scope is still on the provider, the attribute is boolean `true`, and the user has signed in again                                                      |
-| "Your account has too many shared folders…"                                            | More grants than fit in a session cookie. Grant parent folders instead of many subfolders                                                                                                                             |
-| A user's Immich settings disappeared                                                   | The provider's subject mode or the Authentik user changed, so the user has a new ID. Re-enter the settings                                                                                                            |
-| Log warns `OIDC_REDIRECT_URI does not use HTTPS`                                       | Cookies are sent without `Secure`. Use an `https://` redirect URI behind your reverse proxy                                                                                                                           |
+| Symptom / log message                                                                  | Cause and fix                                                                                                                                                                                                                                                                                                                               |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unsupported JWS algorithm` or `unexpected JWT "alg" header parameter`                 | The provider has no signing key, so tokens are HS256. Select a **Signing Key** (step 2), then restart the container so it re-reads the provider's configuration                                                                                                                                                                             |
+| `JWT signature verification failed` or `no applicable keys found`                      | The token wasn't signed by a key Authentik currently publishes. If you just changed the provider's signing key, restart the container                                                                                                                                                                                                       |
+| Authentik shows **Redirect URI Error**                                                 | `OIDC_REDIRECT_URI` doesn't match the provider's redirect URI exactly (scheme, host, path, trailing slash)                                                                                                                                                                                                                                  |
+| Opening Image Parser shows a JSON error; the log has `Request failed: GET /auth/login` | Discovery failed. With `"issuer" property does not match the expected value`, `OIDC_ISSUER_URL` differs from the provider's issuer (often the trailing `/`). Otherwise the container can't reach Authentik (step 7.1)                                                                                                                       |
+| `unable to verify the first certificate` / `self-signed certificate`                   | Authentik uses a private CA. Set `NODE_EXTRA_CA_CERTS` (step 6)                                                                                                                                                                                                                                                                             |
+| `only requests to HTTPS are allowed`                                                   | The issuer is `http://`. Use HTTPS, or set `OIDC_ALLOW_INSECURE_REQUESTS=true` on a trusted LAN                                                                                                                                                                                                                                             |
+| "The sign-in attempt expired or was started in another browser"                        | The user opened Image Parser on a different host than the redirect URI (e.g. the IP address), cookies are blocked, or more than 10 minutes passed on the Authentik page. Use the public HTTPS address                                                                                                                                       |
+| "No folders are shared with your account"                                              | No `imageparser_folders` attribute; the **Image Parser** scope isn't added to the provider (step 2.3); `OIDC_SCOPES` is missing `imageparser`; or the folder doesn't exist under `/data`                                                                                                                                                    |
+| An admin only sees their own folders                                                   | Check the group name matches `OIDC_ADMIN_GROUP`, the `profile` scope is still on the provider, the attribute is boolean `true`, and the user has signed in again                                                                                                                                                                            |
+| "Your account has too many shared folders…"                                            | More grants than fit in a session cookie. Grant parent folders instead of many subfolders                                                                                                                                                                                                                                                   |
+| A user's Immich settings disappeared                                                   | The provider's subject mode or the Authentik user changed, so the user has a new ID. Re-enter the settings                                                                                                                                                                                                                                  |
+| The **User API key** field still shows for a user with `immich_api_key`                | The log line `No Immich API key in the "immich_api_key" claim for <user>` says why: `missing` (the attribute isn't on the user, the step 1 mapping wasn't updated, or the user hasn't signed out and back in), `empty`, or `not a string`. It also lists the claim names received. Also check the container runs an image with this feature |
+| Log warns `OIDC_REDIRECT_URI does not use HTTPS`                                       | Cookies are sent without `Secure`. Use an `https://` redirect URI behind your reverse proxy                                                                                                                                                                                                                                                 |
 
 To test the scope mapping's output for a specific user, use **Test** on the property mapping (step 1). To see the
 full server log in the browser, set `IMAGEPARSER_DEBUG=true` and sign in as an admin. Turn it off again afterwards.
@@ -322,5 +349,6 @@ full server log in the browser, set `IMAGEPARSER_DEBUG=true` and sign in as an a
 | `groups`              | `profile` scope              | Admin group membership                                       |
 | `imageparser_folders` | `imageparser` scope (step 1) | Folder grants                                                |
 | `imageparser_admin`   | `imageparser` scope (step 1) | Per-user admin flag                                          |
+| `immich_api_key`      | `imageparser` scope (step 1) | The user's own Immich API key (step 5b); never saved         |
 
 For the security design behind this setup, see [authentik-service-provider-plan.md](authentik-service-provider-plan.md).

@@ -108,7 +108,7 @@ test("normalizeThumbnailSize defaults invalid sizes and clamps large ones", () =
   assert.equal(normalizeThumbnailSize(1), 64);
 });
 
-test("readDirectory returns sidecarDate from both sidecar namings, or an empty string", async () => {
+test("readDirectory returns sidecarDate from both sidecar namings, or the image's own date", async () => {
   const { dir, cleanup } = await makeTestDirectory();
   try {
     const files = {
@@ -128,6 +128,13 @@ test("readDirectory returns sidecarDate from both sidecar namings, or an empty s
       await fs.writeFile(path.join(dir, name), content);
     }
 
+    // Without a sidecar date, these names hold no date, so the A file's created date is shown.
+    const createdDay = async (name) => {
+      const stats = await fs.stat(path.join(dir, name));
+      const created = new Date(stats.birthtimeMs || stats.ctimeMs);
+      return `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, "0")}-${String(created.getDate()).padStart(2, "0")}`;
+    };
+
     const { files: pairs } = await readDirectory(dir);
     const byLabel = Object.fromEntries(
       pairs.map((pair) => [
@@ -138,9 +145,18 @@ test("readDirectory returns sidecarDate from both sidecar namings, or an empty s
     assert.deepEqual(byLabel, {
       "one_a.jpg": { sidecarDate: "1991-12-25", hasSidecar: true },
       "two_a.jpg": { sidecarDate: "1985-07-04", hasSidecar: true },
-      "three_a.jpg": { sidecarDate: "", hasSidecar: false },
-      "four_a.jpg": { sidecarDate: "", hasSidecar: true },
-      "five_a.jpg": { sidecarDate: "", hasSidecar: false },
+      "three_a.jpg": {
+        sidecarDate: await createdDay("three_a.jpg"),
+        hasSidecar: false,
+      },
+      "four_a.jpg": {
+        sidecarDate: await createdDay("four_a.jpg"),
+        hasSidecar: true,
+      },
+      "five_a.jpg": {
+        sidecarDate: await createdDay("five_a.jpg"),
+        hasSidecar: false,
+      },
     });
     for (const pair of pairs) {
       assert.equal(typeof pair.frontVersion, "string");

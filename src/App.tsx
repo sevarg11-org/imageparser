@@ -114,6 +114,13 @@ type MetadataForm = {
   tags: string[];
 };
 
+/** Immich settings the web server provides (environment or sign-in), which the user cannot edit. */
+type ImmichManagedFields = {
+  serverUrl: boolean;
+  userApiKey: boolean;
+  adminApiKey: boolean;
+};
+
 type ImmichSettings = {
   serverUrl: string;
   userApiKey: string;
@@ -122,6 +129,8 @@ type ImmichSettings = {
   tags: string;
   pauseImmichJobs: boolean;
   concurrentTasks: number;
+  /** Set by the web server only; managed keys are never sent to the browser. */
+  managed?: ImmichManagedFields;
 };
 
 type SetFolderDateResult = {
@@ -1419,13 +1428,7 @@ function App() {
         setIsPersistingRotation(false);
       }
     },
-    [
-      isHydrated,
-      metadata,
-      rotations,
-      selectedPair,
-      startPairSave,
-    ],
+    [isHydrated, metadata, rotations, selectedPair, startPairSave],
   );
 
   /**
@@ -2597,10 +2600,13 @@ function App() {
       setIsSettingFolderProcessed(false);
     }
   };
+  const managedImmichFields = immichSettings.managed;
   const canUploadToImmich =
     Boolean(directoryPath) &&
-    Boolean(immichSettings.serverUrl.trim()) &&
-    Boolean(immichSettings.userApiKey.trim());
+    (Boolean(managedImmichFields?.serverUrl) ||
+      Boolean(immichSettings.serverUrl.trim())) &&
+    (Boolean(managedImmichFields?.userApiKey) ||
+      Boolean(immichSettings.userApiKey.trim()));
   const isTransitionLocked =
     isBusy ||
     isPersistingRotation ||
@@ -2678,9 +2684,7 @@ function App() {
           <div className="folder-processed">
             <strong>{directoryPath}</strong>
             {includeNested ? (
-              <span className="folder-nested">
-                {folderNestedDescription}
-              </span>
+              <span className="folder-nested">{folderNestedDescription}</span>
             ) : null}
             <button
               type="button"
@@ -3250,51 +3254,72 @@ function App() {
               ) : null}
 
               <div className="immich-grid">
-                <label>
-                  Server URL
-                  <input
-                    type="url"
-                    value={immichSettings.serverUrl}
-                    onChange={(event) =>
-                      updateImmichSetting("serverUrl", event.target.value)
-                    }
-                    placeholder="https://photos.example.com"
-                    required
-                    disabled={isUploading}
-                  />
-                </label>
+                {managedImmichFields?.serverUrl ? (
+                  // Shown as text, not a read-only input, so it does not look editable.
+                  <div
+                    className="immich-managed-field"
+                    role="group"
+                    aria-labelledby="immich-server-url-label"
+                  >
+                    <span id="immich-server-url-label">Server URL</span>
+                    <span className="immich-managed-value">
+                      {immichSettings.serverUrl}
+                    </span>
+                    <span className="field-help">
+                      Set by your administrator.
+                    </span>
+                  </div>
+                ) : (
+                  <label>
+                    Server URL
+                    <input
+                      type="url"
+                      value={immichSettings.serverUrl}
+                      onChange={(event) =>
+                        updateImmichSetting("serverUrl", event.target.value)
+                      }
+                      placeholder="https://photos.example.com"
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
-                <label>
-                  User API key
-                  <input
-                    type="password"
-                    value={immichSettings.userApiKey}
-                    onChange={(event) =>
-                      updateImmichSetting("userApiKey", event.target.value)
-                    }
-                    autoComplete="new-password"
-                    required
-                    disabled={isUploading}
-                  />
-                </label>
+                {managedImmichFields?.userApiKey ? null : (
+                  <label>
+                    User API key
+                    <input
+                      type="password"
+                      value={immichSettings.userApiKey}
+                      onChange={(event) =>
+                        updateImmichSetting("userApiKey", event.target.value)
+                      }
+                      autoComplete="new-password"
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                )}
 
-                <label>
-                  Admin API key
-                  <input
-                    type="password"
-                    value={immichSettings.adminApiKey}
-                    onChange={(event) =>
-                      updateImmichSetting("adminApiKey", event.target.value)
-                    }
-                    autoComplete="new-password"
-                    required={immichSettings.pauseImmichJobs}
-                    disabled={isUploading}
-                    aria-describedby="admin-api-key-help"
-                  />
-                  <span id="admin-api-key-help" className="field-help">
-                    Required when pausing Immich jobs.
-                  </span>
-                </label>
+                {managedImmichFields?.adminApiKey ? null : (
+                  <label>
+                    Admin API key
+                    <input
+                      type="password"
+                      value={immichSettings.adminApiKey}
+                      onChange={(event) =>
+                        updateImmichSetting("adminApiKey", event.target.value)
+                      }
+                      autoComplete="new-password"
+                      required={immichSettings.pauseImmichJobs}
+                      disabled={isUploading}
+                      aria-describedby="admin-api-key-help"
+                    />
+                    <span id="admin-api-key-help" className="field-help">
+                      Required when pausing Immich jobs.
+                    </span>
+                  </label>
+                )}
 
                 <label>
                   Target album

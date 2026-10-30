@@ -1081,13 +1081,24 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
         backCandidate ? fs.stat(backCandidate.filePath) : null,
         readSidecarSummary(frontCandidate.filePath),
       ]);
-      const frontDateTaken = toDateTakenTimestamp(frontSidecar.rawDate);
-      const dateTaken =
-        shouldReadDateTaken && frontDateTaken === null && backCandidate
+      const frontSidecarDateTaken = toDateTakenTimestamp(frontSidecar.rawDate);
+      const backSidecarDateTaken =
+        shouldReadDateTaken && frontSidecarDateTaken === null && backCandidate
           ? toDateTakenTimestamp(
               await readSidecarRawDate(backCandidate.filePath),
             )
-          : frontDateTaken;
+          : null;
+      // Without a sidecar date, the date comes from the A image itself and is shown and sorted on instead.
+      const frontRawDate =
+        toSidecarDay(frontSidecar.rawDate) === ""
+          ? await resolveImageDateWithoutSidecar(frontCandidate.filePath, {
+              stats: frontStats,
+            })
+          : frontSidecar.rawDate;
+      const dateTaken =
+        frontSidecarDateTaken ??
+        backSidecarDateTaken ??
+        toDateTakenTimestamp(frontRawDate);
 
       return {
         ...describePair(
@@ -1101,7 +1112,7 @@ const pairFiles = async (filePaths, sortBy = defaultSortBy, baseDirectory) => {
           frontStats.birthtimeMs || frontStats.ctimeMs || frontStats.mtimeMs,
         dateTaken: shouldReadDateTaken ? dateTaken : null,
         hasSidecar: frontSidecar.hasSidecar,
-        sidecarDate: toSidecarDay(frontSidecar.rawDate),
+        sidecarDate: toSidecarDay(frontRawDate),
       };
     }),
   );
@@ -1181,15 +1192,144 @@ ${blocks}
 };
 
 /**
+ * Builds an ISO date-time from date and time parts, rejecting impossible dates and times.
+ * Years before 1800 or more than a year ahead are rejected, so EXIF's "0000:00:00" and stray digits in file
+ * names are not mistaken for dates.
+ * @param {string[]} parts - Year, month, day, and optionally hour, minute, and second, as digit strings.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss (midnight without a time), or an empty string when invalid.
+ */
+const buildIsoDateTime = ([year, month, day, hour, minute, second]) => {
+  const [y, m, d] = [year, month, day].map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (
+    y < 1800 ||
+    y > new Date().getFullYear() + 1 ||
+    date.getUTCMonth() !== m - 1 ||
+    date.getUTCDate() !== d
+  ) {
+    return "";
+  }
+  const hasValidTime =
+    hour !== undefined &&
+    Number(hour) < 24 &&
+    Number(minute) < 60 &&
+    Number(second) < 60;
+  return `${year}-${month}-${day}T${hasValidTime ? `${hour}:${minute}:${second}` : "00:00:00"}`;
+};
+
+/**
+ * Converts an embedded date ("YYYY:MM:DD HH:mm:ss", as ExifTool prints EXIF and XMP dates) to an ISO date-time.
+ * @param {*} value - The raw tag value.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss, or an empty string when it is not a real date.
+ */
+const toIsoEmbeddedDate = (value) => {
+  const match = String(value ?? "")
+    .trim()
+    .match(/^(\d{4})[-:](\d{2})[-:](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?/);
+  return match ? buildIsoDateTime(match.slice(1)) : "";
+};
+
+/**
+ * File name date formats, tried in order: "2007-07-03", "2007_07_03 17.27.14", "2007.07.03", and the compact
+ * camera and phone forms "20070703" and "IMG_20070703_172714". A date must not touch other digits.
+ * @type {Array<RegExp>}
+ */
+const fileNameDatePatterns = [
+  /(?<!\d)(\d{4})[-_.](\d{2})[-_.](\d{2})(?:[ T_.-](\d{2})[-_.:h]?(\d{2})[-_.:m]?(\d{2}))?(?!\d)/i,
+  /(?<!\d)(\d{4})(\d{2})(\d{2})(?:[ T_-]?(\d{2})(\d{2})(\d{2}))?(?!\d)/,
+];
+
+/**
+ * Parses the date (and time, when present) from an image file name.
+ * @param {string} filePath - The image file's path; only its name is parsed.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss, or an empty string when the name holds no valid date.
+ */
+const parseDateFromFileName = (filePath) => {
+  const fileName = path.basename(filePath, path.extname(filePath));
+  for (const pattern of fileNameDatePatterns) {
+    const match = fileName.match(pattern);
+    const isoDate = match ? buildIsoDateTime(match.slice(1)) : "";
+    if (isoDate) {
+      return isoDate;
+    }
+  }
+  return "";
+};
+
+/**
+ * Formats a file's created time as a local ISO date-time, the way cameras record the date taken.
+ * Falls back to the change and modified times on file systems that do not record a creation time.
+ * @param {import("node:fs").Stats} stats - The file's stats.
+ * @returns {string} The date as YYYY-MM-DDTHH:mm:ss in local time.
+ */
+const toFileCreatedDate = (stats) => {
+  const created = new Date(stats.birthtimeMs || stats.ctimeMs || stats.mtimeMs);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${created.getFullYear()}-${pad(created.getMonth() + 1)}-${pad(created.getDate())}T${pad(created.getHours())}:${pad(created.getMinutes())}:${pad(created.getSeconds())}`;
+};
+
+/**
+ * Reads the date an image was taken from its embedded metadata ("Date taken" in Windows Explorer), without
+ * taking the image file lock. Callers must already hold the lock, or use readEmbeddedDateTaken.
+ * Prefers DateTimeOriginal over CreateDate, and EXIF over embedded XMP, as ExifTool does.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<string>} The date as an ISO date-time, or an empty string when the image has no valid date.
+ */
+const readEmbeddedDateTakenUnlocked = async (filePath) => {
+  try {
+    const tags = await exiftool.readRaw(filePath, {
+      readArgs: ["-fast", "-DateTimeOriginal", "-CreateDate"],
+    });
+    return (
+      [tags?.DateTimeOriginal, tags?.CreateDate]
+        .map(toIsoEmbeddedDate)
+        .find(Boolean) ?? ""
+    );
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * Reads the embedded date taken in the image file queue, so it never reads an image while a save rewrites it.
+ * @param {string} filePath - The path to the image file.
+ * @returns {Promise<string>} The date as an ISO date-time, or an empty string when the image has no valid date.
+ */
+const readEmbeddedDateTaken = (filePath) =>
+  runImageFileOperation([filePath], () =>
+    readEmbeddedDateTakenUnlocked(filePath),
+  );
+
+/**
+ * Finds the date of an image whose sidecar has no date, in this order: the date taken embedded in the image,
+ * a date in the file name, then the file's created date. Always returns a date.
+ * @param {string} filePath - The path to the image file.
+ * @param {{stats?: import("node:fs").Stats, readEmbeddedDate?: (filePath: string) => Promise<string>}} [options] -
+ *   The file's stats when already known, and the embedded date reader (the unlocked one inside a save).
+ * @returns {Promise<string>} The date as YYYY-MM-DDTHH:mm:ss.
+ */
+const resolveImageDateWithoutSidecar = async (
+  filePath,
+  { stats, readEmbeddedDate = readEmbeddedDateTaken } = {},
+) =>
+  (await readEmbeddedDate(filePath)) ||
+  parseDateFromFileName(filePath) ||
+  toFileCreatedDate(stats ?? (await fs.stat(filePath)));
+
+/**
  * Reads image metadata (date, description, tags, rotation) from a sidecar file.
- * Falls back to EXIF tool if date is missing from XMP, returning empty metadata if not found.
+ * When the sidecar is missing or has no date, the date comes from the image itself (embedded date taken, then
+ * the file name, then the file's created date). The A-file sidecar stays the source of truth whenever it has one.
  * @param {string} filePath - The path to the image file whose sidecar metadata is being read.
  * @returns {Promise<Object>} An object with date, description, tags, rotation (default: 0), and whether a sidecar exists.
  */
 const readSidecarMetadata = async (filePath) => {
   const sidecarPath = await resolveExistingSidecarPath(filePath);
   if (!sidecarPath) {
-    return emptySidecarMetadata();
+    return {
+      ...emptySidecarMetadata(),
+      date: toSidecarDay(await resolveImageDateWithoutSidecar(filePath)),
+    };
   }
 
   try {
@@ -1206,14 +1346,9 @@ const readSidecarMetadata = async (filePath) => {
       return "";
     };
 
-    let date = getTagValue(...sidecarDatePatterns) || "";
-
-    if (!date) {
-      const tags = await exiftool.read(filePath);
-      const dateTaken =
-        tags["EXIF:DateTimeOriginal"] || tags["EXIF:CreateDate"];
-      date = dateTaken || "";
-    }
+    const date =
+      toSidecarDay(getTagValue(...sidecarDatePatterns)) ||
+      toSidecarDay(await resolveImageDateWithoutSidecar(filePath));
 
     const description = getTagValue(
       /<rdf:li[^>]*xml:lang="x-default"[^>]*>([\s\S]*?)<\/rdf:li>/i,
@@ -1221,7 +1356,7 @@ const readSidecarMetadata = async (filePath) => {
     );
 
     return {
-      date: date ? date.slice(0, 10) : "",
+      date,
       description,
       tags: readTagsFromXmp(rawXml),
       rotation: 0,
@@ -1618,16 +1753,29 @@ const loadImmichSettings = async (settingsDirectory, secretCodec) => {
  * @param {string} settingsDirectory - The path to the user's application data directory.
  * @param {{encrypt: (value: string) => string, decrypt: (value: string) => string}} secretCodec - An object with encrypt and decrypt functions for secure storage.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The normalized settings to save (may contain unencrypted keys).
+ * @param {{managedFields?: Array<"serverUrl"|"userApiKey"|"adminApiKey">}} [options] - Fields provided by the server
+ *   (environment or sign-in session). They are validated with the rest but always stored empty, so a managed key is
+ *   never written to disk, not even encrypted.
+ * @returns {Promise<Object>} The normalized settings, including any managed values.
  */
-const saveImmichSettings = async (settingsDirectory, secretCodec, settings) => {
+const saveImmichSettings = async (
+  settingsDirectory,
+  secretCodec,
+  settings,
+  { managedFields = [] } = {},
+) => {
   const normalizedSettings = normalizeImmichSettings(settings);
+  const unmanagedSettings = { ...normalizedSettings };
+  for (const field of managedFields) {
+    unmanagedSettings[field] = "";
+  }
   const storedSettings = {
-    ...normalizedSettings,
-    userApiKey: normalizedSettings.userApiKey
-      ? secretCodec.encrypt(normalizedSettings.userApiKey)
+    ...unmanagedSettings,
+    userApiKey: unmanagedSettings.userApiKey
+      ? secretCodec.encrypt(unmanagedSettings.userApiKey)
       : "",
-    adminApiKey: normalizedSettings.adminApiKey
-      ? secretCodec.encrypt(normalizedSettings.adminApiKey)
+    adminApiKey: unmanagedSettings.adminApiKey
+      ? secretCodec.encrypt(unmanagedSettings.adminApiKey)
       : "",
   };
 
@@ -2161,6 +2309,31 @@ const readDirectory = async (
 };
 
 /**
+ * Keeps an image's time of day when the form sends only a calendar day, because the editor edits only the day.
+ * The time comes from the A image's current date: its sidecar, or else the image itself (embedded date taken,
+ * file name, created date). Must run while the caller holds the A image's lock.
+ * @param {string} frontPath - The path to the A image.
+ * @param {string} dateValue - The normalized date to save ("YYYY-MM-DD HH:mm:ss").
+ * @param {*} requestedDate - The date as sent; only a plain "YYYY-MM-DD" day takes the current time.
+ * @returns {Promise<string>} The date to save, with the current time of day when it applies.
+ */
+const withCurrentTimeOfDay = async (frontPath, dateValue, requestedDate) => {
+  const day = String(requestedDate ?? "").trim();
+  // An impossible day is left as is, so saving still rejects it.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !buildIsoDateTime(day.split("-"))) {
+    return dateValue;
+  }
+  const currentDate =
+    normalizeXmpDate(await readSidecarRawDate(frontPath)) ||
+    (await resolveImageDateWithoutSidecar(frontPath, {
+      readEmbeddedDate: readEmbeddedDateTakenUnlocked,
+    }));
+  const time = currentDate.match(/T(\d{2}:\d{2}:\d{2})/)?.[1];
+  // Built directly: parsing it with Date would shift the photo's local time by the UTC offset.
+  return time ? `${day} ${time}` : dateValue;
+};
+
+/**
  * Updates image metadata with provided date, description, and tags, and applies any requested rotations.
  * Writes the A-file sidecar and embeds the date in each image, combining a rotation with the date in one
  * ExifTool write per file. Writes whose stored values already match are skipped.
@@ -2175,7 +2348,11 @@ const saveMetadata = (metadata) =>
       throw new Error("No image selected for metadata update.");
     }
 
-    const dateValue = normalizeDateValue(metadata.date);
+    const dateValue = await withCurrentTimeOfDay(
+      metadata.frontPath,
+      normalizeDateValue(metadata.date),
+      metadata.date,
+    );
     normalizeExifDate(dateValue);
 
     const { sidecarPath, written } = await writeSidecarFile(
