@@ -462,7 +462,7 @@
   color: white;
 }
 
-.image-card img {
+.image-card .magnifier-frame img {
   display: block;
   width: 100%;
   height: auto;
@@ -476,7 +476,7 @@
     max-height 0.3s ease-out;
 }
 
-.image-stack--expanded .image-card img {
+.image-stack--expanded .image-card .magnifier-frame img {
   width: 100%;
   max-height: none;
   transition:
@@ -484,7 +484,7 @@
     max-height 0.3s ease-out;
 }
 
-.image-stack:not(.image-stack--expanded) .image-card img {
+.image-stack:not(.image-stack--expanded) .image-card .magnifier-frame img {
   width: auto;
   max-width: 100%;
   height: var(--collapsed-image-height, 600px);
