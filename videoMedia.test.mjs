@@ -12,6 +12,7 @@ import {
   buildSeekStoryboard,
   formatVideoDuration,
   getPlayerSourceType,
+  applyVideoCompressionProgress,
   getSeekSpriteFrameCount as getClientFrameCount,
   hasMissingPicture,
   SEEK_SPRITE_LAYOUT,
@@ -181,5 +182,57 @@ test("a video that plays only its sound is reported as having no picture", () =>
       true,
     ),
     false,
+  );
+});
+
+test("the compression list starts pending and follows each video's progress", () => {
+  let items = applyVideoCompressionProgress([], {
+    type: "plan",
+    files: ["a.mov", "nested/b.mp4"],
+  });
+  assert.deepEqual(
+    items.map((item) => [item.name, item.status, item.fraction]),
+    [
+      ["a.mov", "pending", 0],
+      ["nested/b.mp4", "pending", 0],
+    ],
+  );
+  items = applyVideoCompressionProgress(items, {
+    type: "item",
+    index: 0,
+    status: "in-progress",
+    fraction: 0.42,
+  });
+  assert.equal(items[0].status, "in-progress");
+  assert.equal(items[0].fraction, 0.42);
+  assert.equal(items[1].status, "pending");
+  items = applyVideoCompressionProgress(items, {
+    type: "item",
+    index: 0,
+    status: "complete",
+    fraction: 1,
+    detail: "16.4 MB -> 3.3 MB",
+  });
+  assert.equal(items[0].status, "complete");
+  assert.equal(items[0].detail, "16.4 MB -> 3.3 MB");
+  // Updates for videos the list does not have (a page that missed the plan) are ignored.
+  assert.deepEqual(
+    applyVideoCompressionProgress(items, {
+      type: "item",
+      index: 5,
+      status: "failed",
+      fraction: 0,
+    }),
+    items,
+  );
+  // Fractions stay between 0 and 1.
+  assert.equal(
+    applyVideoCompressionProgress(items, {
+      type: "item",
+      index: 1,
+      status: "in-progress",
+      fraction: 3,
+    })[1].fraction,
+    1,
   );
 });

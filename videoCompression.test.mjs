@@ -339,6 +339,39 @@ test("videos can be compressed without Immich settings or an upload", async () =
   }
 });
 
+test("compression progress lists the videos, then each one's progress and outcome", async () => {
+  const { dir, cleanup } = await makeTestDirectory({
+    "a.mov": 100,
+    "b.mp4": 5,
+    "c_exclude.mp4": 100,
+  });
+  const fakes = makeFakes({ outputBytes: 10 });
+  const plans = [];
+  const events = [];
+  try {
+    await compressFolderVideos(dir, settings, {
+      ...fakes,
+      onPlan: (filePaths) => plans.push(filePaths.map((p) => path.basename(p))),
+      onProgress: ({ index, fraction }) =>
+        events.push(["progress", index, fraction]),
+      onItemDone: ({ index, status }) => events.push(["done", index, status]),
+    });
+    // The excluded video is not listed; the others are, in order.
+    assert.deepEqual(plans, [["a.mov", "b.mp4"]]);
+    assert.deepEqual(events, [
+      ["progress", 0, 0],
+      ["progress", 0, 0.5],
+      ["done", 0, "complete"],
+      ["progress", 1, 0],
+      ["progress", 1, 0.5],
+      // b.mp4 is 5 bytes, so the 10-byte result is not smaller and the original is kept.
+      ["done", 1, "skipped"],
+    ]);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("compressing a folder without videos succeeds and changes nothing", async () => {
   const { dir, list, cleanup } = await makeTestDirectory({ "photo.jpg": 5 });
   try {

@@ -148,3 +148,77 @@ export const hasMissingPicture = (
   }
   return hasPlayed && video.getVideoPlaybackQuality?.().totalVideoFrames === 0;
 };
+
+/** Where one video is in a compression run. */
+export type VideoCompressionStatus =
+  "pending" | "in-progress" | "complete" | "skipped" | "failed";
+
+/** One row of the compression progress list. */
+export type VideoCompressionItem = {
+  /** The video's path relative to the loaded folder. */
+  name: string;
+  status: VideoCompressionStatus;
+  /** How much of the video is encoded, from 0 to 1. */
+  fraction: number;
+  /** The size change, or why the video was kept or failed. */
+  detail?: string;
+};
+
+/**
+ * A compression progress event from core.js: the list of videos about to be compressed, or one video's new state.
+ */
+export type VideoCompressionProgressEvent =
+  | { type: "plan"; files: string[] }
+  | {
+      type: "item";
+      index: number;
+      status: Exclude<VideoCompressionStatus, "pending">;
+      fraction: number;
+      detail?: string;
+    };
+
+/**
+ * Applies a compression progress event to the progress list. A plan starts a new list with every video pending;
+ * an item event updates one video, and is ignored when it does not match the list (for example when the page
+ * connected after the plan was sent).
+ * @param items - The current list.
+ * @param event - The progress event.
+ * @returns The updated list.
+ */
+export const applyVideoCompressionProgress = (
+  items: readonly VideoCompressionItem[],
+  event: VideoCompressionProgressEvent,
+): VideoCompressionItem[] => {
+  if (event.type === "plan") {
+    return event.files.map((name) => ({
+      name,
+      status: "pending",
+      fraction: 0,
+    }));
+  }
+  if (!Number.isInteger(event.index) || !items[event.index]) {
+    return [...items];
+  }
+  return items.map((item, index) =>
+    index === event.index
+      ? {
+          ...item,
+          status: event.status,
+          fraction: Math.min(1, Math.max(0, Number(event.fraction) || 0)),
+          detail: event.detail ?? item.detail,
+        }
+      : item,
+  );
+};
+
+/** The label shown for each compression status. */
+export const VIDEO_COMPRESSION_STATUS_LABELS: Record<
+  VideoCompressionStatus,
+  string
+> = {
+  pending: "Pending",
+  "in-progress": "In Progress",
+  complete: "Complete",
+  skipped: "Skipped",
+  failed: "Failed",
+};

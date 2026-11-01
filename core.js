@@ -456,7 +456,10 @@ const getImmichGoDiagnostics = () =>
  * Compresses a folder's standalone videos in place and reports progress (see compressFolderVideos).
  * @param {string} directoryPath - The folder to compress, already checked to be a directory.
  * @param {ReturnType<typeof normalizeVideoCompression>} compressionSettings - The compression settings.
- * @param {(progress: {phase: string, output: string}) => void} reportProgress - Receives "compressing" progress.
+ * @param {(progress: {phase: string, output?: string, compression?: Object}) => void} reportProgress - Receives
+ *   "compressing" progress: status text in `output`, and in `compression` either the list of videos
+ *   (`{type: "plan", files}`, paths relative to the folder) or one video's state (`{type: "item", index, status,
+ *   fraction, detail?}`, status "in-progress", "complete", "skipped" or "failed").
  * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, log?: {info: Function}}} options -
  *   Whether to include nested folders, the confinement check for them, and a logger.
  * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} Whether every video was compressed or
@@ -472,20 +475,55 @@ const runFolderVideoCompressionStep = async (
     phase: "compressing",
     output: "Looking for videos to compress...",
   });
-  let lastReported = "";
+  // The list is sent once; later events carry only the video that changed, at most once per whole percent.
+  const lastPercents = new Map();
   const compression = await compressFolderVideos(
     directoryPath,
     compressionSettings,
     {
       recursive,
       isAllowedPath,
-      onProgress: ({ index, total, filePath, fraction }) => {
-        const message = `Compressing ${path.basename(filePath)} (${index + 1} of ${total}): ${Math.round(fraction * 100)}%`;
-        if (message !== lastReported) {
-          lastReported = message;
-          reportProgress({ phase: "compressing", output: message });
+      onPlan: (filePaths) =>
+        reportProgress({
+          phase: "compressing",
+          output: filePaths.length
+            ? `Compressing ${filePaths.length} ${filePaths.length === 1 ? "video" : "videos"}...`
+            : "No videos to compress.",
+          compression: {
+            type: "plan",
+            files: filePaths.map((filePath) =>
+              path.relative(directoryPath, filePath),
+            ),
+          },
+        }),
+      onProgress: ({ index, fraction }) => {
+        const percent = Math.floor(Math.min(1, Math.max(0, fraction)) * 100);
+        if (lastPercents.get(index) === percent) {
+          return;
         }
+        lastPercents.set(index, percent);
+        reportProgress({
+          phase: "compressing",
+          compression: {
+            type: "item",
+            index,
+            status: "in-progress",
+            fraction: percent / 100,
+          },
+        });
       },
+      onItemDone: ({ index, status, detail }) =>
+        reportProgress({
+          phase: "compressing",
+          compression: {
+            type: "item",
+            index,
+            status,
+            fraction:
+              status === "complete" ? 1 : (lastPercents.get(index) ?? 0) / 100,
+            detail,
+          },
+        }),
     },
   );
   log?.info("Video compression finished.", {
@@ -4119,9 +4157,10 @@ const compressVideoInPlaceUnlocked = async (
  * one at a time, each under the image file lock; one failure does not stop the rest.
  * @param {string} directoryPath - The folder to compress.
  * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression).
- * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onPlan?: (filePaths: string[]) => void, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, onItemDone?: (outcome: {index: number, filePath: string, status: "complete"|"skipped"|"failed", detail: string}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
  *   Whether to include nested folders and the confinement check for them (see readDirectory), a cancellation
- *   signal, a progress listener, and replaceable compression and probe steps, for tests.
+ *   signal, listeners for the list of videos about to be compressed (in order), each video's progress, and each
+ *   video's outcome, and replaceable compression and probe steps, for tests.
  * @returns {Promise<{ok: boolean, compressed: Array<{from: string, to: string, originalBytes: number, compressedBytes: number}>, skipped: Array<{filePath: string, reason: string}>, errors: string[]}>}
  */
 const compressFolderVideos = async (
@@ -4131,7 +4170,9 @@ const compressFolderVideos = async (
     recursive = false,
     isAllowedPath,
     signal,
+    onPlan = () => {},
     onProgress = () => {},
+    onItemDone = () => {},
     compress,
     probe,
   } = {},
@@ -4144,6 +4185,7 @@ const compressFolderVideos = async (
   const videos = files.filter(
     (pair) => pair.mediaType === "video" && !pair.doNotUpload,
   );
+  onPlan(videos.map((video) => video.frontPath));
 
   const compressed = [];
   const skipped = [];
@@ -4172,16 +4214,33 @@ const compressFolderVideos = async (
       );
       if (result.status === "compressed") {
         compressed.push(result);
+        onItemDone({
+          index,
+          filePath: videoPath,
+          status: "complete",
+          detail: `${formatByteSize(result.originalBytes)} -> ${formatByteSize(result.compressedBytes)}`,
+        });
       } else {
         skipped.push(result);
+        onItemDone({
+          index,
+          filePath: videoPath,
+          status: "skipped",
+          detail: `Kept as is: ${result.reason}`,
+        });
       }
     } catch (error) {
       if (signal?.aborted) {
         throw error;
       }
-      errors.push(
-        `${video.imageLabel}: ${error instanceof Error ? error.message : "Unknown error"}`,
-      );
+      const message = error instanceof Error ? error.message : "Unknown error";
+      errors.push(`${video.imageLabel}: ${message}`);
+      onItemDone({
+        index,
+        filePath: videoPath,
+        status: "failed",
+        detail: message,
+      });
     }
   }
 

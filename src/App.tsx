@@ -62,10 +62,15 @@ import TagInput from "./TagInput";
 import { mergeTagSources } from "./tagSuggestions";
 import VideoPlayer from "./VideoPlayer";
 import {
+  applyVideoCompressionProgress,
   DEFAULT_VIDEO_COMPRESSION,
   VIDEO_COMPRESSION_LIMITS,
+  VIDEO_COMPRESSION_STATUS_LABELS,
+  type VideoCompressionItem,
+  type VideoCompressionProgressEvent,
   type VideoCompressionSettings,
 } from "./videoModel";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   fetchCurrentUser,
   isWebApp,
@@ -190,7 +195,10 @@ type VideoCompressionResult = {
 
 type ImmichUploadProgress = {
   phase: "compressing" | "uploading";
-  output: string;
+  /** Replaces the activity log when present; per-video compression updates leave it alone. */
+  output?: string;
+  /** The list of videos to compress, or one video's new state. */
+  compression?: VideoCompressionProgressEvent;
 };
 
 type ImageRotationResult = {
@@ -1012,6 +1020,11 @@ function App() {
   /** Which job holds isUploading: an Immich upload, or compressing videos without uploading. */
   const [uploadTask, setUploadTask] = useState<"upload" | "compress">("upload");
   const uploadTaskRef = useRef<"upload" | "compress">("upload");
+  /** Each video of the current (or last) compression run, with its status and progress. */
+  const [compressionItems, setCompressionItems] = useState<
+    VideoCompressionItem[]
+  >([]);
+  const [isCompressConfirmOpen, setIsCompressConfirmOpen] = useState(false);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -1290,7 +1303,15 @@ function App() {
     }
 
     return electronApi.onImmichUploadProgress((progress) => {
-      setImmichOutput(progress.output);
+      if (progress.output !== undefined) {
+        setImmichOutput(progress.output);
+      }
+      const compressionEvent = progress.compression;
+      if (compressionEvent) {
+        setCompressionItems((current) =>
+          applyVideoCompressionProgress(current, compressionEvent),
+        );
+      }
       setImmichStatus(
         progress.phase !== "compressing"
           ? "Immich is processing the selected directory..."
@@ -2695,6 +2716,7 @@ function App() {
 
       uploadTaskRef.current = "upload";
       setUploadTask("upload");
+      setCompressionItems([]);
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
@@ -2735,8 +2757,9 @@ function App() {
 
   /**
    * Compresses the folder's standalone videos in place with the current settings, without uploading anything, so
-   * the settings can be tried (and the results reviewed) before an upload. The originals are replaced, so it asks
-   * first. Pending saves finish first because compression may rename a video and its sidecar.
+   * the settings can be tried (and the results reviewed) before an upload. The originals are replaced, so the
+   * button asks first, in an in-page dialog. Pending saves finish first because compression may rename a video and
+   * its sidecar.
    */
   const handleCompressVideosNow = async () => {
     const electronApi = window.electronAPI;
@@ -2747,16 +2770,6 @@ function App() {
 
     if (!directoryPath) {
       setImmichStatus("Load a folder before compressing its videos.");
-      return;
-    }
-
-    if (
-      !window.confirm(
-        `Compress the videos in this folder${includeNested ? " and its nested folders" : ""} now, without uploading?
-
-Each standalone video is re-encoded to MP4 and the original file is replaced. Try this on a copy of a folder first if you are unsure of the settings.`,
-      )
-    ) {
       return;
     }
 
@@ -2779,6 +2792,7 @@ Each standalone video is re-encoded to MP4 and the original file is replaced. Tr
 
       uploadTaskRef.current = "compress";
       setUploadTask("compress");
+      setCompressionItems([]);
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
@@ -4279,7 +4293,7 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       <button
                         type="button"
                         className="secondary-button"
-                        onClick={handleCompressVideosNow}
+                        onClick={() => setIsCompressConfirmOpen(true)}
                         disabled={isImageControlLocked || !directoryPath}
                         aria-describedby="video-compression-test-help"
                       >
@@ -4344,6 +4358,42 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                     </span>
                   </div>
                 ) : null}
+                {compressionItems.length ? (
+                  <ul
+                    className="compression-list"
+                    aria-label="Video compression progress"
+                  >
+                    {compressionItems.map((item) => (
+                      <li
+                        key={item.name}
+                        className={`compression-item compression-item-${item.status}`}
+                      >
+                        <span className="compression-item-name">
+                          {item.name}
+                        </span>
+                        <span className="compression-item-status">
+                          {VIDEO_COMPRESSION_STATUS_LABELS[item.status]}
+                          {item.status === "in-progress"
+                            ? ` ${Math.round(item.fraction * 100)}%`
+                            : ""}
+                        </span>
+                        {item.status === "in-progress" ? (
+                          <progress
+                            className="compression-item-bar"
+                            max={1}
+                            value={item.fraction}
+                            aria-label={`${item.name} compression progress`}
+                          />
+                        ) : null}
+                        {item.detail ? (
+                          <span className="compression-item-detail">
+                            {item.detail}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
                 {immichOutput ? (
                   <pre
                     ref={immichOutputRef}
@@ -4393,6 +4443,29 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
           </details>
         </main>
       )}
+
+      <ConfirmDialog
+        isOpen={isCompressConfirmOpen}
+        title="Compress videos now?"
+        confirmLabel="Compress and replace originals"
+        isDestructive
+        onCancel={() => setIsCompressConfirmOpen(false)}
+        onConfirm={() => {
+          setIsCompressConfirmOpen(false);
+          void handleCompressVideosNow();
+        }}
+      >
+        <p>
+          Compress the videos in this folder
+          {includeNested ? " and its nested folders" : ""} now, without
+          uploading anything?
+        </p>
+        <p>
+          Each standalone video is re-encoded to MP4 and{" "}
+          <strong>the original file is replaced</strong>. This cannot be undone.
+          Try it on a copy of a folder first if you are unsure of the settings.
+        </p>
+      </ConfirmDialog>
 
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}
