@@ -910,6 +910,10 @@ const clampCollapsedImageHeight = (value: number) => {
     MAX_COLLAPSED_IMAGE_HEIGHT,
   );
 };
+/** The upload status shown before any upload or compression runs in the current folder. */
+const DEFAULT_IMMICH_STATUS =
+  "Immich settings are saved when an upload starts.";
+
 const defaultImmichSettings: ImmichSettings = {
   serverUrl: "",
   userApiKey: "",
@@ -1018,9 +1022,7 @@ function App() {
   const [immichSettings, setImmichSettings] = useState<ImmichSettings>(
     defaultImmichSettings,
   );
-  const [immichStatus, setImmichStatus] = useState(
-    "Immich settings are saved when an upload starts.",
-  );
+  const [immichStatus, setImmichStatus] = useState(DEFAULT_IMMICH_STATUS);
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   /** Which job holds isUploading: an Immich upload, or compressing videos without uploading. */
@@ -2503,6 +2505,12 @@ function App() {
       setIncludeSubfoldersInProcessed(false);
       setFolderProcessedError("");
       setHasUploadedFolder(false);
+      // The video compression and immich-go results belong to the previous folder.
+      setImmichStatus(DEFAULT_IMMICH_STATUS);
+      setImmichOutput("");
+      setCompressionItems([]);
+      setUploadElapsedSeconds(0);
+      isImmichOutputFollowingRef.current = true;
       setIsHydrated(false);
       setPairs(result.files);
       resetSavedPairs();
