@@ -15,7 +15,10 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
   audio at 128–192 kbps (default 160) with the source's channels. A `.mov`/`.mkv`/… becomes `.mp4` and its sidecar
   is renamed to match; the file date and recording date are kept. An original is replaced only after the new file
   is complete and smaller. Live photo videos, videos flagged "Do not upload", and videos Image Parser already
-  compressed are skipped. If any video cannot be compressed, the upload does not start.
+  compressed are skipped. If any video cannot be compressed, the upload does not start. To try the settings without
+  uploading, use **Compress videos now**: it runs the same compression on the loaded folder (and its nested folders, if
+  they were loaded with it), also replacing the originals, and stops before immich-go. It needs no Immich
+  server or API key. Try it on a copy of a folder first.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
 - **Videos and Live Photos**: `.mp4`, `.m4v`, `.mov`, `.webm` and `.mkv` files appear in the grid with a play badge
   and their length, and play in Review with seek-bar previews. An image and a video with the same name in the same

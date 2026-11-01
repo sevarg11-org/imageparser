@@ -162,6 +162,28 @@ test("confines video paths to the shared root", async () => {
   await absolute.arrayBuffer();
 });
 
+const postCompressVideos = (directoryPath) =>
+  fetch(new URL("api/compress-videos", baseUrl), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ directoryPath, settings: {}, recursive: false }),
+  });
+
+test("compresses videos without uploading, confined to the shared root", async () => {
+  const outside = await postCompressVideos("..");
+  assert.equal(outside.status, 403);
+  await outside.arrayBuffer();
+
+  // clip.mp4 is not a real video, so it is reported and kept as it was.
+  const response = await postCompressVideos(".");
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.ok, false);
+  assert.equal(result.compressedVideos, 0);
+  assert.match(result.output, /clip\.mp4: ffprobe could not read/);
+  assert.deepEqual(await fs.readFile(path.join(root, "clip.mp4")), videoBytes);
+});
+
 test("does not follow a symbolic link out of the shared root", async (t) => {
   try {
     await fs.symlink(

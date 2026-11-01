@@ -98,6 +98,8 @@ const createWebApi = (): ImageParserApi => ({
   saveImmichSettings: (settings) => postJson("api/immich-settings", settings),
   uploadToImmich: (settings, directoryPath, recursive) =>
     postJson("api/upload-to-immich", { settings, directoryPath, recursive }),
+  compressVideos: (settings, directoryPath, recursive) =>
+    postJson("api/compress-videos", { settings, directoryPath, recursive }),
   onImmichUploadProgress: (listener) => {
     const eventSource = new EventSource("api/immich-progress");
     eventSource.onmessage = (event) => {

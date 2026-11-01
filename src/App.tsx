@@ -180,6 +180,14 @@ type ImmichUploadResult = {
   compressedVideos?: number;
 };
 
+/** The result of compressing a folder's videos without uploading them. */
+type VideoCompressionResult = {
+  ok: boolean;
+  output: string;
+  /** How many videos were compressed in place (renamed to .mp4). */
+  compressedVideos: number;
+};
+
 type ImmichUploadProgress = {
   phase: "compressing" | "uploading";
   output: string;
@@ -320,6 +328,11 @@ declare global {
         directoryPath: string,
         recursive: boolean,
       ) => Promise<ImmichUploadResult>;
+      compressVideos: (
+        settings: VideoCompressionSettings,
+        directoryPath: string,
+        recursive: boolean,
+      ) => Promise<VideoCompressionResult>;
       onImmichUploadProgress: (
         listener: (progress: ImmichUploadProgress) => void,
       ) => () => void;
@@ -996,6 +1009,9 @@ function App() {
   );
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
+  /** Which job holds isUploading: an Immich upload, or compressing videos without uploading. */
+  const [uploadTask, setUploadTask] = useState<"upload" | "compress">("upload");
+  const uploadTaskRef = useRef<"upload" | "compress">("upload");
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -1276,9 +1292,11 @@ function App() {
     return electronApi.onImmichUploadProgress((progress) => {
       setImmichOutput(progress.output);
       setImmichStatus(
-        progress.phase === "compressing"
-          ? "Compressing videos before the upload..."
-          : "Immich is processing the selected directory...",
+        progress.phase !== "compressing"
+          ? "Immich is processing the selected directory..."
+          : uploadTaskRef.current === "compress"
+            ? "Compressing videos (no upload)..."
+            : "Compressing videos before the upload...",
       );
     });
   }, []);
@@ -2675,6 +2693,8 @@ function App() {
         return;
       }
 
+      uploadTaskRef.current = "upload";
+      setUploadTask("upload");
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
@@ -2707,6 +2727,81 @@ function App() {
     } catch (error) {
       setImmichStatus(
         error instanceof Error ? error.message : "Unable to upload to Immich.",
+      );
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  /**
+   * Compresses the folder's standalone videos in place with the current settings, without uploading anything, so
+   * the settings can be tried (and the results reviewed) before an upload. The originals are replaced, so it asks
+   * first. Pending saves finish first because compression may rename a video and its sidecar.
+   */
+  const handleCompressVideosNow = async () => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      setImmichStatus("This application must run inside Electron.");
+      return;
+    }
+
+    if (!directoryPath) {
+      setImmichStatus("Load a folder before compressing its videos.");
+      return;
+    }
+
+    if (
+      !window.confirm(
+        `Compress the videos in this folder${includeNested ? " and its nested folders" : ""} now, without uploading?
+
+Each standalone video is re-encoded to MP4 and the original file is replaced. Try this on a copy of a folder first if you are unsure of the settings.`,
+      )
+    ) {
+      return;
+    }
+
+    try {
+      setImmichStatus("Saving changes before compressing videos...");
+      if (!(await persistReviewedPair())) {
+        setImmichStatus(
+          "Compression stopped because an image rotation could not be persisted.",
+        );
+        return;
+      }
+
+      const unsavedImages = await waitForPendingSaves();
+      if (unsavedImages.length) {
+        setImmichStatus(
+          `Compression stopped because changes to ${unsavedImages.join(", ")} could not be saved. Open those items to retry.`,
+        );
+        return;
+      }
+
+      uploadTaskRef.current = "compress";
+      setUploadTask("compress");
+      setIsUploading(true);
+      setUploadElapsedSeconds(0);
+      setImmichOutput("");
+      isImmichOutputFollowingRef.current = true;
+      setImmichStatus("Compressing videos (no upload)...");
+      const result = await electronApi.compressVideos(
+        immichSettings.videoCompression,
+        directoryPath,
+        includeNested,
+      );
+      setImmichOutput(result.output);
+      setImmichStatus(
+        result.ok
+          ? `Video compression finished: ${result.compressedVideos} ${result.compressedVideos === 1 ? "video" : "videos"} replaced. Nothing was uploaded.`
+          : "Some videos could not be compressed. Nothing was uploaded; see the details below.",
+      );
+      // Compressed videos replaced their originals (often under a new .mp4 name), so the list is stale.
+      if (result.compressedVideos) {
+        await reloadDirectory(sortBy);
+      }
+    } catch (error) {
+      setImmichStatus(
+        error instanceof Error ? error.message : "Unable to compress videos.",
       );
     } finally {
       setIsUploading(false);
@@ -4168,6 +4263,24 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                         <option value={192}>192 kbps</option>
                       </select>
                     </label>
+                    <div className="video-compression-test">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={handleCompressVideosNow}
+                        disabled={isImageControlLocked || !directoryPath}
+                        aria-describedby="video-compression-test-help"
+                      >
+                        {isUploading && uploadTask === "compress"
+                          ? "Compressing..."
+                          : "Compress videos now"}
+                      </button>
+                      <span id="video-compression-test-help">
+                        Runs the same compression with these settings
+                        {includeNested ? " (including nested folders)" : ""},
+                        replacing the originals, but does not upload anything.
+                      </span>
+                    </div>
                   </div>
                 ) : null}
               </fieldset>
@@ -4193,7 +4306,9 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   onClick={handleImmichUpload}
                   disabled={isImageControlLocked || !canUploadToImmich}
                 >
-                  {isUploading ? "Uploading..." : "Upload to Immich"}
+                  {isUploading && uploadTask === "upload"
+                    ? "Uploading..."
+                    : "Upload to Immich"}
                 </button>
               </div>
 
@@ -4203,11 +4318,17 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   <div className="immich-progress">
                     <progress
                       className="immich-progress-bar"
-                      aria-label="Immich upload is processing"
+                      aria-label={
+                        uploadTask === "compress"
+                          ? "Video compression is running"
+                          : "Immich upload is processing"
+                      }
                     />
                     <span>
                       Processing for {formatElapsedTime(uploadElapsedSeconds)}.
-                      Activity below updates while immich-go is running.
+                      {uploadTask === "compress"
+                        ? " Activity below updates while videos are compressed."
+                        : " Activity below updates while immich-go is running."}
                     </span>
                   </div>
                 ) : null}

@@ -972,6 +972,17 @@
   gap: 10px;
 }
 
+.video-compression-test {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
 .checkbox-field {
   display: flex;
   align-items: center;

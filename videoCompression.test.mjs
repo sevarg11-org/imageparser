@@ -7,6 +7,7 @@ import {
   compressFolderVideos,
   loadImmichSettings,
   runImmichUpload,
+  runVideoCompression,
   saveImmichSettings,
   shutdownCore,
 } from "./core.js";
@@ -294,6 +295,67 @@ test("the upload does not start when a video cannot be compressed", async () => 
     assert.match(result.output, /The upload did not start/);
     assert.ok(!phases.includes("uploading"));
     assert.deepEqual(await list(), ["broken.mov"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("videos can be compressed without Immich settings or an upload", async () => {
+  // compression "enabled: false" is ignored: the caller asked to compress now.
+  const { dir, list, cleanup } = await makeTestDirectory({
+    "broken.mov": 0,
+    "photo.jpg": 5,
+  });
+  const phases = [];
+  try {
+    const result = await runVideoCompression(
+      { enabled: false, codec: "h264", crf: 21 },
+      dir,
+      (progress) => phases.push(progress.phase),
+    );
+    assert.equal(result.ok, false);
+    assert.equal(result.compressedVideos, 0);
+    assert.match(result.output, /broken\.mov: ffprobe could not read/);
+    assert.match(result.output, /failed: 1/);
+    assert.doesNotMatch(result.output, /upload/i);
+    assert.ok(phases.length > 0);
+    assert.ok(phases.every((phase) => phase === "compressing"));
+    assert.deepEqual(await list(), ["broken.mov", "photo.jpg"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("compressing a folder without videos succeeds and changes nothing", async () => {
+  const { dir, list, cleanup } = await makeTestDirectory({ "photo.jpg": 5 });
+  try {
+    const result = await runVideoCompression({}, dir);
+    assert.deepEqual(result, {
+      ok: true,
+      compressedVideos: 0,
+      output:
+        "Videos compressed: 0, kept as is: 0, failed: 0. Space saved: 0 bytes.",
+    });
+    assert.deepEqual(await list(), ["photo.jpg"]);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("compressing videos rejects bad settings and paths, and releases its lock", async () => {
+  const { dir, cleanup } = await makeTestDirectory({ "photo.jpg": 5 });
+  try {
+    await assert.rejects(
+      runVideoCompression({ codec: "h265", crf: 40 }, dir),
+      /CRF/,
+    );
+    await assert.rejects(runVideoCompression({}, ""), /Load a folder/);
+    await assert.rejects(
+      runVideoCompression({}, path.join(dir, "photo.jpg")),
+      /not a directory/,
+    );
+    // Each failure released the lock, so the next run starts.
+    assert.equal((await runVideoCompression({}, dir)).ok, true);
   } finally {
     await cleanup();
   }

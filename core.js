@@ -453,6 +453,103 @@ const getImmichGoDiagnostics = () =>
   });
 
 /**
+ * Compresses a folder's standalone videos in place and reports progress (see compressFolderVideos).
+ * @param {string} directoryPath - The folder to compress, already checked to be a directory.
+ * @param {ReturnType<typeof normalizeVideoCompression>} compressionSettings - The compression settings.
+ * @param {(progress: {phase: string, output: string}) => void} reportProgress - Receives "compressing" progress.
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, log?: {info: Function}}} options -
+ *   Whether to include nested folders, the confinement check for them, and a logger.
+ * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} Whether every video was compressed or
+ *   skipped without an error, the summary for the log, and how many videos were replaced.
+ */
+const runFolderVideoCompressionStep = async (
+  directoryPath,
+  compressionSettings,
+  reportProgress,
+  { recursive = false, isAllowedPath, log } = {},
+) => {
+  reportProgress({
+    phase: "compressing",
+    output: "Looking for videos to compress...",
+  });
+  let lastReported = "";
+  const compression = await compressFolderVideos(
+    directoryPath,
+    compressionSettings,
+    {
+      recursive,
+      isAllowedPath,
+      onProgress: ({ index, total, filePath, fraction }) => {
+        const message = `Compressing ${path.basename(filePath)} (${index + 1} of ${total}): ${Math.round(fraction * 100)}%`;
+        if (message !== lastReported) {
+          lastReported = message;
+          reportProgress({ phase: "compressing", output: message });
+        }
+      },
+    },
+  );
+  log?.info("Video compression finished.", {
+    compressed: compression.compressed.length,
+    skipped: compression.skipped.length,
+    errors: compression.errors,
+  });
+  return {
+    ok: compression.ok,
+    output: describeCompressionResult(compression),
+    compressedVideos: compression.compressed.length,
+  };
+};
+
+/**
+ * Compresses a folder's standalone videos in place without uploading anything, so the compression settings can be
+ * tried before an upload. It runs exactly the compression an upload runs first (the originals are replaced), needs
+ * no Immich settings, and shares the upload lock, so it never runs alongside an upload for the same key.
+ * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression); "enabled" is ignored.
+ * @param {string} directoryPath - The folder to compress.
+ * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Receives "compressing" progress.
+ * @param {{recursive?: boolean, log?: {info: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean}} [options] -
+ *   Whether to include nested folders, a logger, the key shared with uploads, and the confinement check for nested
+ *   folders (see readDirectory).
+ * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} The compression summary.
+ * @throws {Error} If an upload or compression is already running, or the folder or settings are invalid.
+ */
+const runVideoCompression = async (
+  compressionSettings,
+  directoryPath,
+  reportProgress = () => {},
+  { recursive = false, log, lockKey = "default", isAllowedPath } = {},
+) => {
+  if (runningImmichUploads.has(lockKey)) {
+    throw new Error(
+      "An Immich upload or video compression is already running.",
+    );
+  }
+  runningImmichUploads.add(lockKey);
+  try {
+    const normalizedDirectoryPath = String(directoryPath ?? "").trim();
+    if (!normalizedDirectoryPath) {
+      throw new Error("Load a folder before compressing its videos.");
+    }
+    const directoryStats = await fs.stat(normalizedDirectoryPath);
+    if (!directoryStats.isDirectory()) {
+      throw new Error("The selected path is not a directory.");
+    }
+    const settings = normalizeVideoCompression({
+      ...compressionSettings,
+      enabled: true,
+    });
+    return await runFolderVideoCompressionStep(
+      normalizedDirectoryPath,
+      settings,
+      reportProgress,
+      { recursive, isAllowedPath, log },
+    );
+  } finally {
+    runningImmichUploads.delete(lockKey);
+  }
+};
+
+/**
  * Runs immich-go to upload images from a folder to the Immich server.
  * Executes asynchronously and prevents concurrent uploads.
  * @param {{serverUrl: string, userApiKey: string, adminApiKey?: string, albumName: string, tags: string, pauseImmichJobs: boolean, concurrentTasks: number}} settings - The validated Immich settings.
@@ -504,33 +601,14 @@ const runImmichUpload = async (
     let compressionOutput = "";
     let compressedVideos = 0;
     if (normalizedSettings.videoCompression.enabled) {
-      reportProgress({
-        phase: "compressing",
-        output: "Looking for videos to compress...",
-      });
-      let lastReported = "";
-      const compression = await compressFolderVideos(
+      const compression = await runFolderVideoCompressionStep(
         normalizedDirectoryPath,
         normalizedSettings.videoCompression,
-        {
-          recursive,
-          isAllowedPath,
-          onProgress: ({ index, total, filePath, fraction }) => {
-            const message = `Compressing ${path.basename(filePath)} (${index + 1} of ${total}): ${Math.round(fraction * 100)}%`;
-            if (message !== lastReported) {
-              lastReported = message;
-              reportProgress({ phase: "compressing", output: message });
-            }
-          },
-        },
+        reportProgress,
+        { recursive, isAllowedPath, log },
       );
-      compressionOutput = describeCompressionResult(compression);
-      compressedVideos = compression.compressed.length;
-      log?.info("Video compression finished.", {
-        compressed: compression.compressed.length,
-        skipped: compression.skipped.length,
-        errors: compression.errors,
-      });
+      compressionOutput = compression.output;
+      compressedVideos = compression.compressedVideos;
       if (!compression.ok) {
         return {
           ok: false,
@@ -4154,6 +4232,7 @@ export {
   getVideoInfo,
   getVideoSeekSprite,
   compressFolderVideos,
+  runVideoCompression,
   applyImageRotationsQueued as applyImageRotations,
   buildImmichUploadArguments,
   clearThumbnailMemoryCache,

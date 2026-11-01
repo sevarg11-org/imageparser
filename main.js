@@ -19,6 +19,7 @@ import {
   readDirectory,
   readSidecarMetadata,
   runImmichUpload,
+  runVideoCompression,
   saveImmichSettings,
   saveMetadata,
   setDoNotUpload,
@@ -667,6 +668,30 @@ ipcMain.handle(
     };
 
     return runImmichUpload(settings, directoryPath, reportProgress, {
+      recursive: recursive === true,
+    });
+  },
+);
+
+/**
+ * IPC handler for compressing a folder's videos in place without uploading them, to try the compression settings.
+ * Progress goes to the same channel as uploads.
+ * @param {*} _event - The IPC event object.
+ * @param {*} settings - The video compression settings.
+ * @param {string} directoryPath - The folder to compress.
+ * @param {boolean} [recursive] - Whether to include nested folders.
+ * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} The compression summary.
+ */
+ipcMain.handle(
+  "compress-videos",
+  async (_event, settings, directoryPath, recursive = false) => {
+    const reportProgress = (progress) => {
+      if (!_event.sender.isDestroyed()) {
+        _event.sender.send("immich-upload-progress", progress);
+      }
+    };
+
+    return runVideoCompression(settings, directoryPath, reportProgress, {
       recursive: recursive === true,
     });
   },
