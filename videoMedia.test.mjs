@@ -13,6 +13,8 @@ import {
   formatVideoDuration,
   getPlayerSourceType,
   applyVideoCompressionProgress,
+  formatByteSize,
+  getSavedPercent,
   getSeekSpriteFrameCount as getClientFrameCount,
   hasMissingPicture,
   SEEK_SPRITE_LAYOUT,
@@ -235,4 +237,12 @@ test("the compression list starts pending and follows each video's progress", ()
     })[1].fraction,
     1,
   );
+});
+
+test("compression summary sizes are formatted like the server log", () => {
+  assert.equal(formatByteSize(512), "512 bytes");
+  assert.equal(formatByteSize(471_236_198), "449.4 MB");
+  assert.equal(formatByteSize(1.5 * 1024 ** 3), "1.5 GB");
+  assert.equal(getSavedPercent(471_236_198, 404_234_198), 86);
+  assert.equal(getSavedPercent(0, 0), 0);
 });

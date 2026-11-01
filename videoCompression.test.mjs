@@ -372,6 +372,50 @@ test("compression progress lists the videos, then each one's progress and outcom
   }
 });
 
+test("compressing returns each video's outcome and the space saved", async () => {
+  const { dir, cleanup } = await makeTestDirectory({
+    "a.mov": 100,
+    "b.mp4": 60,
+    "tiny.mp4": 5,
+  });
+  await fs.mkdir(path.join(dir, "nested"));
+  await fs.writeFile(path.join(dir, "nested", "c.mp4"), Buffer.alloc(50, 7));
+  try {
+    const result = await runVideoCompression({}, dir, () => {}, {
+      recursive: true,
+      ...makeFakes({ outputBytes: 10 }),
+    });
+    assert.equal(result.compressedVideos, 3);
+    assert.deepEqual(
+      {
+        originalBytes: result.summary.originalBytes,
+        compressedBytes: result.summary.compressedBytes,
+        savedBytes: result.summary.savedBytes,
+      },
+      // a.mov, b.mp4 and nested/c.mp4 were replaced; tiny.mp4 was kept, so it is not in the totals.
+      { originalBytes: 210, compressedBytes: 30, savedBytes: 180 },
+    );
+    const byName = Object.fromEntries(
+      result.summary.videos.map((video) => [video.name, video]),
+    );
+    assert.deepEqual(byName["a.mov"], {
+      name: "a.mov",
+      newName: "a.mp4",
+      status: "complete",
+      originalBytes: 100,
+      compressedBytes: 10,
+      detail: "100 bytes -> 10 bytes",
+    });
+    assert.equal(byName["b.mp4"].newName, null);
+    assert.equal(byName[path.join("nested", "c.mp4")].status, "complete");
+    assert.equal(byName["tiny.mp4"].status, "skipped");
+    assert.equal(byName["tiny.mp4"].originalBytes, null);
+    assert.match(byName["tiny.mp4"].detail, /did not make it smaller/);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("compressing a folder without videos succeeds and changes nothing", async () => {
   const { dir, list, cleanup } = await makeTestDirectory({ "photo.jpg": 5 });
   try {
@@ -381,6 +425,12 @@ test("compressing a folder without videos succeeds and changes nothing", async (
       compressedVideos: 0,
       output:
         "Videos compressed: 0, kept as is: 0, failed: 0. Space saved: 0 bytes.",
+      summary: {
+        videos: [],
+        originalBytes: 0,
+        compressedBytes: 0,
+        savedBytes: 0,
+      },
     });
     assert.deepEqual(await list(), ["photo.jpg"]);
   } finally {

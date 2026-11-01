@@ -1,0 +1,116 @@
+.compression-summary-dialog {
+  width: min(640px, calc(100vw - 2rem));
+}
+
+.compression-summary-dialog .confirm-dialog-content {
+  max-height: calc(100dvh - 2rem);
+}
+
+.compression-summary-dialog .confirm-dialog-body {
+  overflow-y: auto;
+}
+
+.compression-summary-totals {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.compression-summary-totals > div {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.compression-summary-totals dt {
+  color: #94a3b8;
+  font-size: 0.8rem;
+}
+
+.compression-summary-totals dd {
+  margin: 0;
+  color: var(--text-h);
+  font-size: 1.15rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.compression-summary-saved {
+  border-color: rgba(74, 222, 128, 0.45) !important;
+}
+
+.compression-summary-saved dd {
+  color: #4ade80;
+}
+
+.compression-summary-saved dd span {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.compression-summary-table-wrap {
+  overflow-x: auto;
+}
+
+.compression-summary-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.compression-summary-table th,
+.compression-summary-table td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  vertical-align: top;
+}
+
+.compression-summary-table thead th {
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.compression-summary-table th:first-child {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.compression-summary-table tbody th {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.compression-summary-note {
+  display: block;
+  color: #94a3b8;
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+
+.compression-summary-complete td:last-child {
+  color: #4ade80;
+  font-weight: 700;
+}
+
+.compression-summary-kept {
+  color: #94a3b8;
+  text-align: left !important;
+}
+
+.compression-summary-failed .compression-summary-kept,
+.compression-summary-failed .compression-summary-note {
+  color: #f87171;
+}
+
+/* On a phone, the totals stack. */
+@media (max-width: 480px) {
+  .compression-summary-totals {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

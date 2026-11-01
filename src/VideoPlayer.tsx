@@ -55,10 +55,9 @@ type VideoPlayerProps = {
 };
 
 /**
- * Plays a video as it is stored (no transcoding), with seek-bar thumbnails when the sprite is available.
- * A codec the browser cannot play is reported in place of the player.
+ * Plays one video source. VideoPlayer remounts it for each source; see there.
  */
-const VideoPlayer = ({
+const VideoPlayerForSource = ({
   filePath,
   src,
   posterUrl,
@@ -135,5 +134,17 @@ const VideoPlayer = ({
     </MediaPlayer>
   );
 };
+
+/**
+ * Plays a video as it is stored (no transcoding), with seek-bar thumbnails when the sprite is available.
+ * A codec the browser cannot play is reported in place of the player.
+ *
+ * Each video gets a fresh player: Vidstack can keep the previous video's state and never load the next source
+ * (for example after compression replaced the file it was playing, which left Review with an empty player), and a
+ * fresh player also clears a "can't play" message left by the previous video.
+ */
+const VideoPlayer = (props: VideoPlayerProps) => (
+  <VideoPlayerForSource key={props.src} {...props} />
+);
 
 export default VideoPlayer;

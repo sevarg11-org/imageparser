@@ -69,7 +69,9 @@ import {
   type VideoCompressionItem,
   type VideoCompressionProgressEvent,
   type VideoCompressionSettings,
+  type VideoCompressionSummary,
 } from "./videoModel";
+import { CompressionSummaryDialog } from "./CompressionSummaryDialog";
 import { useConfirm } from "./useConfirm";
 import {
   fetchCurrentUser,
@@ -183,6 +185,8 @@ type ImmichUploadResult = {
   output: string;
   /** How many videos were compressed in place (renamed to .mp4) before the upload. */
   compressedVideos?: number;
+  /** What the compression before the upload did, when it ran. */
+  compressionSummary?: VideoCompressionSummary;
 };
 
 /** The result of compressing a folder's videos without uploading them. */
@@ -191,6 +195,8 @@ type VideoCompressionResult = {
   output: string;
   /** How many videos were compressed in place (renamed to .mp4). */
   compressedVideos: number;
+  /** Each video's result and the sizes before and after. */
+  summary: VideoCompressionSummary;
 };
 
 type ImmichUploadProgress = {
@@ -1026,6 +1032,11 @@ function App() {
   >([]);
   /** In-page confirmations (instead of window.confirm, which phones and embedded views handle poorly). */
   const { confirm, confirmDialog } = useConfirm();
+  /** The finished compression run shown in the summary overlay, or null when it is closed. */
+  const [compressionSummary, setCompressionSummary] = useState<{
+    summary: VideoCompressionSummary;
+    isCompressOnly: boolean;
+  } | null>(null);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -2756,6 +2767,13 @@ function App() {
       if (result.compressedVideos) {
         await reloadDirectory(sortBy);
       }
+      // The overlay opens after the reload, so the new files can be browsed as soon as it is closed.
+      if (result.compressionSummary?.videos.length) {
+        setCompressionSummary({
+          summary: result.compressionSummary,
+          isCompressOnly: false,
+        });
+      }
     } catch (error) {
       setImmichStatus(
         error instanceof Error ? error.message : "Unable to upload to Immich.",
@@ -2848,6 +2866,8 @@ function App() {
       if (result.compressedVideos) {
         await reloadDirectory(sortBy);
       }
+      // The overlay opens after the reload, so the new files can be browsed as soon as it is closed.
+      setCompressionSummary({ summary: result.summary, isCompressOnly: true });
     } catch (error) {
       setImmichStatus(
         error instanceof Error ? error.message : "Unable to compress videos.",
@@ -4496,6 +4516,11 @@ function App() {
       )}
 
       {confirmDialog}
+      <CompressionSummaryDialog
+        summary={compressionSummary?.summary ?? null}
+        isCompressOnly={compressionSummary?.isCompressOnly ?? false}
+        onClose={() => setCompressionSummary(null)}
+      />
 
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}

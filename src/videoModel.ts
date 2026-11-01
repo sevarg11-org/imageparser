@@ -222,3 +222,50 @@ export const VIDEO_COMPRESSION_STATUS_LABELS: Record<
   skipped: "Skipped",
   failed: "Failed",
 };
+
+/** One video's result in a compression summary. */
+export type VideoCompressionOutcome = {
+  /** The video's path relative to the loaded folder, before compression. */
+  name: string;
+  /** The new path when the video became an .mp4 under a new name. */
+  newName: string | null;
+  status: "complete" | "skipped" | "failed";
+  /** The sizes before and after, for replaced videos only. */
+  originalBytes: number | null;
+  compressedBytes: number | null;
+  /** The size change, or why the video was kept or failed. */
+  detail: string;
+};
+
+/** What a compression run did, as core.js returns it. Totals cover the replaced videos only. */
+export type VideoCompressionSummary = {
+  videos: VideoCompressionOutcome[];
+  originalBytes: number;
+  compressedBytes: number;
+  savedBytes: number;
+};
+
+/**
+ * Formats a byte count the way core.js does in its log, for example "1.4 GB".
+ * @param bytes - The size in bytes.
+ * @returns The formatted size.
+ */
+export const formatByteSize = (bytes: number) => {
+  const units = ["bytes", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes);
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} bytes` : `${value.toFixed(1)} ${units[unit]}`;
+};
+
+/**
+ * The share of the original size that compression saved, as a whole percent.
+ * @param originalBytes - The size before.
+ * @param savedBytes - The bytes saved.
+ * @returns The percent saved, or 0 when nothing was compressed.
+ */
+export const getSavedPercent = (originalBytes: number, savedBytes: number) =>
+  originalBytes > 0 ? Math.round((savedBytes / originalBytes) * 100) : 0;

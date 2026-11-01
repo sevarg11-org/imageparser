@@ -462,14 +462,15 @@ const getImmichGoDiagnostics = () =>
  *   fraction, detail?}`, status "in-progress", "complete", "skipped" or "failed").
  * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, log?: {info: Function}}} options -
  *   Whether to include nested folders, the confinement check for them, and a logger.
- * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} Whether every video was compressed or
- *   skipped without an error, the summary for the log, and how many videos were replaced.
+ * @returns {Promise<{ok: boolean, output: string, compressedVideos: number, summary: {videos: Array<{name: string, newName: string|null, status: "complete"|"skipped"|"failed", originalBytes: number|null, compressedBytes: number|null, detail: string}>, originalBytes: number, compressedBytes: number, savedBytes: number}}>}
+ *   Whether every video was compressed or skipped without an error, the summary for the log, how many videos were
+ *   replaced, and each video's outcome with the total sizes before and after (of the replaced videos only).
  */
 const runFolderVideoCompressionStep = async (
   directoryPath,
   compressionSettings,
   reportProgress,
-  { recursive = false, isAllowedPath, log } = {},
+  { recursive = false, isAllowedPath, log, compress, probe } = {},
 ) => {
   reportProgress({
     phase: "compressing",
@@ -477,12 +478,17 @@ const runFolderVideoCompressionStep = async (
   });
   // The list is sent once; later events carry only the video that changed, at most once per whole percent.
   const lastPercents = new Map();
+  const toRelative = (filePath) => path.relative(directoryPath, filePath);
+  /** @type {Array<{name: string, newName: string|null, status: "complete"|"skipped"|"failed", originalBytes: number|null, compressedBytes: number|null, detail: string}>} */
+  const outcomes = [];
   const compression = await compressFolderVideos(
     directoryPath,
     compressionSettings,
     {
       recursive,
       isAllowedPath,
+      compress,
+      probe,
       onPlan: (filePaths) =>
         reportProgress({
           phase: "compressing",
@@ -512,7 +518,26 @@ const runFolderVideoCompressionStep = async (
           },
         });
       },
-      onItemDone: ({ index, status, detail }) =>
+      onItemDone: ({
+        index,
+        filePath,
+        status,
+        detail,
+        originalBytes,
+        compressedBytes,
+        newFilePath,
+      }) => {
+        outcomes[index] = {
+          name: toRelative(filePath),
+          newName:
+            newFilePath && newFilePath !== filePath
+              ? toRelative(newFilePath)
+              : null,
+          status,
+          originalBytes: originalBytes ?? null,
+          compressedBytes: compressedBytes ?? null,
+          detail,
+        };
         reportProgress({
           phase: "compressing",
           compression: {
@@ -523,7 +548,8 @@ const runFolderVideoCompressionStep = async (
               status === "complete" ? 1 : (lastPercents.get(index) ?? 0) / 100,
             detail,
           },
-        }),
+        });
+      },
     },
   );
   log?.info("Video compression finished.", {
@@ -531,10 +557,24 @@ const runFolderVideoCompressionStep = async (
     skipped: compression.skipped.length,
     errors: compression.errors,
   });
+  const originalBytes = compression.compressed.reduce(
+    (total, item) => total + item.originalBytes,
+    0,
+  );
+  const compressedBytes = compression.compressed.reduce(
+    (total, item) => total + item.compressedBytes,
+    0,
+  );
   return {
     ok: compression.ok,
     output: describeCompressionResult(compression),
     compressedVideos: compression.compressed.length,
+    summary: {
+      videos: outcomes.filter(Boolean),
+      originalBytes,
+      compressedBytes,
+      savedBytes: originalBytes - compressedBytes,
+    },
   };
 };
 
@@ -545,17 +585,25 @@ const runFolderVideoCompressionStep = async (
  * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression); "enabled" is ignored.
  * @param {string} directoryPath - The folder to compress.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Receives "compressing" progress.
- * @param {{recursive?: boolean, log?: {info: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean}} [options] -
- *   Whether to include nested folders, a logger, the key shared with uploads, and the confinement check for nested
- *   folders (see readDirectory).
- * @returns {Promise<{ok: boolean, output: string, compressedVideos: number}>} The compression summary.
+ * @param {{recursive?: boolean, log?: {info: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean, compress?: Function, probe?: Function}} [options] -
+ *   Whether to include nested folders, a logger, the key shared with uploads, the confinement check for nested
+ *   folders (see readDirectory), and replaceable compression and probe steps, for tests.
+ * @returns {Promise<{ok: boolean, output: string, compressedVideos: number, summary: Object}>} The log text, how many
+ *   videos were replaced, and the per-video summary with total sizes (see runFolderVideoCompressionStep).
  * @throws {Error} If an upload or compression is already running, or the folder or settings are invalid.
  */
 const runVideoCompression = async (
   compressionSettings,
   directoryPath,
   reportProgress = () => {},
-  { recursive = false, log, lockKey = "default", isAllowedPath } = {},
+  {
+    recursive = false,
+    log,
+    lockKey = "default",
+    isAllowedPath,
+    compress,
+    probe,
+  } = {},
 ) => {
   if (runningImmichUploads.has(lockKey)) {
     throw new Error(
@@ -580,7 +628,7 @@ const runVideoCompression = async (
       normalizedDirectoryPath,
       settings,
       reportProgress,
-      { recursive, isAllowedPath, log },
+      { recursive, isAllowedPath, log, compress, probe },
     );
   } finally {
     runningImmichUploads.delete(lockKey);
@@ -594,7 +642,7 @@ const runVideoCompression = async (
  * @param {string} directoryPath - The path to the directory containing images to upload.
  * @param {(progress: {phase: string, output: string}) => void} [reportProgress] - Optional callback for progress updates.
  * @param {{debug?: boolean, recursive?: boolean, log?: {debug: Function, info: Function, warn: Function, error: Function}, lockKey?: string, isAllowedPath?: (realPath: string) => boolean}} [options] - Optional verbose immich-go logging, whether to upload nested folders too, a logger for diagnostics, the key that serializes uploads (default: one upload at a time), and the confinement check for nested folders that video compression rewrites (see readDirectory).
- * @returns {{ok: boolean, exitCode: number, output: string, compressedVideos: number}} The result of the upload operation with
+ * @returns {{ok: boolean, exitCode: number, output: string, compressedVideos: number, compressionSummary?: Object}} The result of the upload operation with
  *   redacted output, and how many videos were compressed (replacing the originals) before it.
  * @throws {Error} If an upload is already running or the directory path is invalid.
  */
@@ -638,6 +686,7 @@ const runImmichUpload = async (
     // Videos are compressed first, replacing the originals, so the upload sends the smaller files.
     let compressionOutput = "";
     let compressedVideos = 0;
+    let compressionSummary;
     if (normalizedSettings.videoCompression.enabled) {
       const compression = await runFolderVideoCompressionStep(
         normalizedDirectoryPath,
@@ -647,11 +696,13 @@ const runImmichUpload = async (
       );
       compressionOutput = compression.output;
       compressedVideos = compression.compressedVideos;
+      compressionSummary = compression.summary;
       if (!compression.ok) {
         return {
           ok: false,
           exitCode: -1,
           compressedVideos,
+          compressionSummary,
           output: `${compressionOutput}\nThe upload did not start because some videos could not be compressed. Fix them, flag them "Do not upload", or turn off video compression.`,
         };
       }
@@ -720,6 +771,7 @@ const runImmichUpload = async (
           ok,
           exitCode: exitCode ?? -1,
           compressedVideos,
+          compressionSummary,
           output: redact(
             [compressionOutput, combinedOutput, ...hints]
               .filter(Boolean)
@@ -4157,7 +4209,7 @@ const compressVideoInPlaceUnlocked = async (
  * one at a time, each under the image file lock; one failure does not stop the rest.
  * @param {string} directoryPath - The folder to compress.
  * @param {*} compressionSettings - The compression settings (see normalizeVideoCompression).
- * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onPlan?: (filePaths: string[]) => void, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, onItemDone?: (outcome: {index: number, filePath: string, status: "complete"|"skipped"|"failed", detail: string}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
+ * @param {{recursive?: boolean, isAllowedPath?: (realPath: string) => boolean, signal?: AbortSignal, onPlan?: (filePaths: string[]) => void, onProgress?: (progress: {index: number, total: number, filePath: string, fraction: number}) => void, onItemDone?: (outcome: {index: number, filePath: string, status: "complete"|"skipped"|"failed", detail: string, originalBytes?: number, compressedBytes?: number, newFilePath?: string}) => void, compress?: typeof compressVideo, probe?: typeof probeVideo}} [options] -
  *   Whether to include nested folders and the confinement check for them (see readDirectory), a cancellation
  *   signal, listeners for the list of videos about to be compressed (in order), each video's progress, and each
  *   video's outcome, and replaceable compression and probe steps, for tests.
@@ -4219,6 +4271,9 @@ const compressFolderVideos = async (
           filePath: videoPath,
           status: "complete",
           detail: `${formatByteSize(result.originalBytes)} -> ${formatByteSize(result.compressedBytes)}`,
+          originalBytes: result.originalBytes,
+          compressedBytes: result.compressedBytes,
+          newFilePath: result.to,
         });
       } else {
         skipped.push(result);
