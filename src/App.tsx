@@ -4205,18 +4205,23 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                             crf: VIDEO_COMPRESSION_LIMITS[codec].defaultCrf,
                           });
                         }}
+                        aria-describedby="video-compression-codec-help"
                       >
-                        <option value="h265">
-                          H.265 (HEVC): smaller, slower to encode
-                        </option>
-                        <option value="h264">
-                          H.264 (AVC): plays everywhere
-                        </option>
+                        <option value="h265">H.265 (HEVC)</option>
+                        <option value="h264">H.264 (AVC)</option>
                       </select>
+                      <span
+                        id="video-compression-codec-help"
+                        className="field-help"
+                      >
+                        {immichSettings.videoCompression.codec === "h265"
+                          ? "Smaller files, slower to encode."
+                          : "Bigger files, plays everywhere."}
+                      </span>
                     </label>
                     <label>
                       Quality (CRF {compressionCrfLimits.minCrf}–
-                      {compressionCrfLimits.maxCrf}; lower is better and bigger)
+                      {compressionCrfLimits.maxCrf})
                       <input
                         type="number"
                         min={compressionCrfLimits.minCrf}
@@ -4229,7 +4234,14 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                           })
                         }
                         required
+                        aria-describedby="video-compression-crf-help"
                       />
+                      <span
+                        id="video-compression-crf-help"
+                        className="field-help"
+                      >
+                        Lower is better quality and a bigger file.
+                      </span>
                     </label>
                     <label>
                       Encoder preset

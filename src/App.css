@@ -594,7 +594,8 @@
 
 .metadata-panel input,
 .metadata-panel textarea,
-.immich-panel input {
+.immich-panel input,
+.immich-panel select {
   width: 100%;
   box-sizing: border-box;
   border: 1px solid #334155;
@@ -969,7 +970,25 @@
 .video-compression-options {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 10px;
+  gap: 14px;
+  /* Controls share a top edge even when a label's help text adds a line. */
+  align-items: start;
+}
+
+/* Label above its control, like the other upload fields. */
+.video-compression-options label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  color: #dfeaf7;
+  font-weight: 600;
+  text-align: left;
+}
+
+.video-compression-options .field-help {
+  font-size: 0.85rem;
+  font-weight: 400;
 }
 
 .video-compression-test {
