@@ -105,7 +105,7 @@ type ImagePair = {
   sidecarDate: string;
 };
 
-type ViewMode = "grid" | "review";
+type ViewMode = "grid" | "review" | "upload";
 
 type SetDoNotUploadResult = Pick<
   ImagePair,
@@ -2674,13 +2674,30 @@ function App() {
       return;
     }
 
-    if (!(await persistCurrentPair())) {
+    if (!(await persistReviewedPair())) {
       return;
     }
 
     setGridFocusPairId(selectedPair?.id ?? null);
     setViewMode("grid");
-  }, [persistCurrentPair, selectedPair, viewMode]);
+  }, [persistReviewedPair, selectedPair, viewMode]);
+
+  /**
+   * Opens the Immich upload view, saving the reviewed image first so the upload includes its
+   * edits; stays in Review when the save fails, and the status bar explains why.
+   */
+  const openUploadView = useCallback(async () => {
+    if (viewMode === "upload") {
+      return;
+    }
+
+    if (!(await persistReviewedPair())) {
+      return;
+    }
+
+    setGridFocusPairId(selectedPair?.id ?? null);
+    setViewMode("upload");
+  }, [persistReviewedPair, selectedPair, viewMode]);
 
   /**
    * Updates an Immich setting field with a new value and persists it to storage.
@@ -3550,55 +3567,66 @@ function App() {
               >
                 Review
               </button>
+              <button
+                type="button"
+                aria-pressed={viewMode === "upload"}
+                onClick={() => void openUploadView()}
+                disabled={isTransitionLocked}
+              >
+                Upload
+              </button>
             </div>
-            <div className="view-bar-controls">
-              <label className="sort-control">
-                <span>Sort by</span>
-                <select
-                  value={sortBy}
-                  onChange={(event) => {
-                    const nextSortBy = event.target.value as SortOption;
-                    void reloadDirectory(nextSortBy);
-                  }}
-                  disabled={isImageControlLocked}
-                >
-                  <option value="createdAt-asc">
-                    File created (oldest first)
-                  </option>
-                  <option value="createdAt-desc">
-                    File created (newest first)
-                  </option>
-                  <option value="dateTaken-asc">
-                    Date taken (oldest first)
-                  </option>
-                  <option value="dateTaken-desc">
-                    Date taken (newest first)
-                  </option>
-                  <option value="fileName-asc">File name (A-Z)</option>
-                  <option value="fileName-desc">File name (Z-A)</option>
-                </select>
-              </label>
-              <label className="sort-control filter-control">
-                <span>Show</span>
-                <select
-                  value={imageFilter}
-                  onChange={(event) => {
-                    if (isImageFilter(event.target.value)) {
-                      void changeImageFilter(event.target.value);
-                    }
-                  }}
-                  disabled={
-                    isTransitionLocked || (!isHydrated && selectedPair !== null)
-                  }
-                >
-                  {imageFilterOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label} ({filterCounts[option.value]})
+            {viewMode === "upload" ? null : (
+              <div className="view-bar-controls">
+                <label className="sort-control">
+                  <span>Sort by</span>
+                  <select
+                    value={sortBy}
+                    onChange={(event) => {
+                      const nextSortBy = event.target.value as SortOption;
+                      void reloadDirectory(nextSortBy);
+                    }}
+                    disabled={isImageControlLocked}
+                  >
+                    <option value="createdAt-asc">
+                      File created (oldest first)
                     </option>
-                  ))}
-                </select>
-              </label>
-            </div>
+                    <option value="createdAt-desc">
+                      File created (newest first)
+                    </option>
+                    <option value="dateTaken-asc">
+                      Date taken (oldest first)
+                    </option>
+                    <option value="dateTaken-desc">
+                      Date taken (newest first)
+                    </option>
+                    <option value="fileName-asc">File name (A-Z)</option>
+                    <option value="fileName-desc">File name (Z-A)</option>
+                  </select>
+                </label>
+                <label className="sort-control filter-control">
+                  <span>Show</span>
+                  <select
+                    value={imageFilter}
+                    onChange={(event) => {
+                      if (isImageFilter(event.target.value)) {
+                        void changeImageFilter(event.target.value);
+                      }
+                    }}
+                    disabled={
+                      isTransitionLocked ||
+                      (!isHydrated && selectedPair !== null)
+                    }
+                  >
+                    {imageFilterOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label} ({filterCounts[option.value]})
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
           </div>
 
           {viewMode === "grid" ? (
@@ -3615,7 +3643,7 @@ function App() {
                 onToggleSelect={toggleGridSelection}
               />
             </section>
-          ) : (
+          ) : viewMode === "review" ? (
             <>
               <aside className="metadata-panel">
                 <div className="metadata-grid">
@@ -4077,449 +4105,458 @@ function App() {
                 </div>
               </section>
             </>
-          )}
-
-          <details className="immich-panel">
-            <summary className="immich-panel-summary">
-              <span>
+          ) : (
+            <section
+              className="immich-panel"
+              aria-labelledby="immich-panel-title"
+            >
+              <div className="immich-panel-header">
                 <span className="eyebrow">Final step</span>
-                <span className="immich-panel-title">Upload to Immich</span>
-              </span>
-              <span className="immich-summary-action">
-                Configure and upload
-              </span>
-            </summary>
+                <h2 id="immich-panel-title" className="immich-panel-title">
+                  Upload to Immich
+                </h2>
+              </div>
 
-            <div className="immich-content">
-              <span className="immich-directory">
-                Uploads: {directoryPath}
-                {includeNested ? ` ${folderNestedDescription}` : ""}
-              </span>
-              {flaggedPairCount > 0 ? (
-                <span className="immich-skipped">
-                  {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
-                  flagged Do not upload will be skipped.
+              <div className="immich-content">
+                <span className="immich-directory">
+                  Uploads: {directoryPath}
+                  {includeNested ? ` ${folderNestedDescription}` : ""}
                 </span>
-              ) : null}
+                {flaggedPairCount > 0 ? (
+                  <span className="immich-skipped">
+                    {flaggedPairCount} image{flaggedPairCount === 1 ? "" : "s"}{" "}
+                    flagged Do not upload will be skipped.
+                  </span>
+                ) : null}
 
-              <div className="immich-grid">
-                {managedImmichFields?.serverUrl ? (
-                  // Shown as text, not a read-only input, so it does not look editable.
-                  <div
-                    className="immich-managed-field"
-                    role="group"
-                    aria-labelledby="immich-server-url-label"
-                  >
-                    <span id="immich-server-url-label">Server URL</span>
-                    <span className="immich-managed-value">
-                      {immichSettings.serverUrl}
-                    </span>
-                    <span className="field-help">
-                      Set by your administrator.
-                    </span>
-                  </div>
-                ) : (
-                  <label>
-                    Server URL
-                    <input
-                      type="url"
-                      value={immichSettings.serverUrl}
-                      onChange={(event) =>
-                        updateImmichSetting("serverUrl", event.target.value)
-                      }
-                      placeholder="https://photos.example.com"
-                      required
-                      disabled={isUploading}
-                    />
-                  </label>
-                )}
-
-                {managedImmichFields?.userApiKey ? null : (
-                  <label>
-                    User API key
-                    <input
-                      type="password"
-                      value={immichSettings.userApiKey}
-                      onChange={(event) =>
-                        updateImmichSetting("userApiKey", event.target.value)
-                      }
-                      autoComplete="new-password"
-                      required
-                      disabled={isUploading}
-                    />
-                  </label>
-                )}
-
-                {managedImmichFields?.adminApiKey ? null : (
-                  <label>
-                    Admin API key
-                    <input
-                      type="password"
-                      value={immichSettings.adminApiKey}
-                      onChange={(event) =>
-                        updateImmichSetting("adminApiKey", event.target.value)
-                      }
-                      autoComplete="new-password"
-                      required={immichSettings.pauseImmichJobs}
-                      disabled={isUploading}
-                      aria-describedby="admin-api-key-help"
-                    />
-                    <span id="admin-api-key-help" className="field-help">
-                      Required when pausing Immich jobs.
-                    </span>
-                  </label>
-                )}
-
-                {isWebApp() ? (
-                  <AlbumCombobox
-                    value={immichSettings.albumName}
-                    onChange={(albumName) =>
-                      updateImmichSetting("albumName", albumName)
-                    }
-                    disabled={isUploading}
-                    settings={{
-                      serverUrl: immichSettings.serverUrl,
-                      userApiKey: immichSettings.userApiKey,
-                    }}
-                  />
-                ) : (
-                  <label>
-                    Target album
-                    <input
-                      type="text"
-                      value={immichSettings.albumName}
-                      onChange={(event) =>
-                        updateImmichSetting("albumName", event.target.value)
-                      }
-                      required
-                      disabled={isUploading}
-                    />
-                  </label>
-                )}
-
-                <div className="immich-tags">
-                  <label htmlFor="immich-upload-tag">Tags</label>
-                  <TagInput
-                    id="immich-upload-tag"
-                    suggestions={tagSuggestions}
-                    selectedTags={uploadTags}
-                    onAdd={(tag) =>
-                      updateImmichSetting(
-                        "tags",
-                        [...uploadTags, tag].join(", "),
-                      )
-                    }
-                    placeholder="family, archive, scanned"
-                    disabled={isUploading}
-                    lookupError={immichTagError}
-                  />
-                  {uploadTags.length ? (
-                    <div className="selected-tags" aria-label="Upload tags">
-                      {uploadTags.map((tag) => (
-                        <button
-                          key={tag.toLocaleLowerCase()}
-                          type="button"
-                          onClick={() =>
-                            updateImmichSetting(
-                              "tags",
-                              uploadTags
-                                .filter((current) => current !== tag)
-                                .join(", "),
-                            )
-                          }
-                          disabled={isUploading}
-                          aria-label={`Remove ${tag}`}
-                        >
-                          {tag} <span aria-hidden="true">&times;</span>
-                        </button>
-                      ))}
+                <div className="immich-grid">
+                  {managedImmichFields?.serverUrl ? (
+                    // Shown as text, not a read-only input, so it does not look editable.
+                    <div
+                      className="immich-managed-field"
+                      role="group"
+                      aria-labelledby="immich-server-url-label"
+                    >
+                      <span id="immich-server-url-label">Server URL</span>
+                      <span className="immich-managed-value">
+                        {immichSettings.serverUrl}
+                      </span>
+                      <span className="field-help">
+                        Set by your administrator.
+                      </span>
                     </div>
+                  ) : (
+                    <label>
+                      Server URL
+                      <input
+                        type="url"
+                        value={immichSettings.serverUrl}
+                        onChange={(event) =>
+                          updateImmichSetting("serverUrl", event.target.value)
+                        }
+                        placeholder="https://photos.example.com"
+                        required
+                        disabled={isUploading}
+                      />
+                    </label>
+                  )}
+
+                  {managedImmichFields?.userApiKey ? null : (
+                    <label>
+                      User API key
+                      <input
+                        type="password"
+                        value={immichSettings.userApiKey}
+                        onChange={(event) =>
+                          updateImmichSetting("userApiKey", event.target.value)
+                        }
+                        autoComplete="new-password"
+                        required
+                        disabled={isUploading}
+                      />
+                    </label>
+                  )}
+
+                  {managedImmichFields?.adminApiKey ? null : (
+                    <label>
+                      Admin API key
+                      <input
+                        type="password"
+                        value={immichSettings.adminApiKey}
+                        onChange={(event) =>
+                          updateImmichSetting("adminApiKey", event.target.value)
+                        }
+                        autoComplete="new-password"
+                        required={immichSettings.pauseImmichJobs}
+                        disabled={isUploading}
+                        aria-describedby="admin-api-key-help"
+                      />
+                      <span id="admin-api-key-help" className="field-help">
+                        Required when pausing Immich jobs.
+                      </span>
+                    </label>
+                  )}
+
+                  {isWebApp() ? (
+                    <AlbumCombobox
+                      value={immichSettings.albumName}
+                      onChange={(albumName) =>
+                        updateImmichSetting("albumName", albumName)
+                      }
+                      disabled={isUploading}
+                      settings={{
+                        serverUrl: immichSettings.serverUrl,
+                        userApiKey: immichSettings.userApiKey,
+                      }}
+                    />
+                  ) : (
+                    <label>
+                      Target album
+                      <input
+                        type="text"
+                        value={immichSettings.albumName}
+                        onChange={(event) =>
+                          updateImmichSetting("albumName", event.target.value)
+                        }
+                        required
+                        disabled={isUploading}
+                      />
+                    </label>
+                  )}
+
+                  <div className="immich-tags">
+                    <label htmlFor="immich-upload-tag">Tags</label>
+                    <TagInput
+                      id="immich-upload-tag"
+                      suggestions={tagSuggestions}
+                      selectedTags={uploadTags}
+                      onAdd={(tag) =>
+                        updateImmichSetting(
+                          "tags",
+                          [...uploadTags, tag].join(", "),
+                        )
+                      }
+                      placeholder="family, archive, scanned"
+                      disabled={isUploading}
+                      lookupError={immichTagError}
+                    />
+                    {uploadTags.length ? (
+                      <div className="selected-tags" aria-label="Upload tags">
+                        {uploadTags.map((tag) => (
+                          <button
+                            key={tag.toLocaleLowerCase()}
+                            type="button"
+                            onClick={() =>
+                              updateImmichSetting(
+                                "tags",
+                                uploadTags
+                                  .filter((current) => current !== tag)
+                                  .join(", "),
+                              )
+                            }
+                            disabled={isUploading}
+                            aria-label={`Remove ${tag}`}
+                          >
+                            {tag} <span aria-hidden="true">&times;</span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <label>
+                    Concurrent tasks
+                    <input
+                      type="number"
+                      min="1"
+                      max="20"
+                      step="1"
+                      value={immichSettings.concurrentTasks}
+                      onChange={(event) =>
+                        updateImmichSetting(
+                          "concurrentTasks",
+                          Number(event.target.value),
+                        )
+                      }
+                      required
+                      disabled={isUploading}
+                    />
+                  </label>
+                </div>
+
+                <fieldset
+                  className="video-compression"
+                  disabled={isUploading}
+                  aria-describedby="video-compression-help"
+                >
+                  <legend>Video compression</legend>
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={immichSettings.videoCompression.enabled}
+                      onChange={(event) =>
+                        updateVideoCompression({
+                          enabled: event.target.checked,
+                        })
+                      }
+                    />
+                    Compress videos before uploading
+                  </label>
+                  <p
+                    id="video-compression-help"
+                    className="video-compression-help"
+                  >
+                    Each standalone video is re-encoded to MP4 at its own
+                    resolution and frame rate, and{" "}
+                    <strong>the original file is replaced</strong>. Live photo
+                    videos, videos flagged &quot;Do not upload&quot;, and videos
+                    already compressed are left as they are. If any video cannot
+                    be compressed, the upload does not start.
+                  </p>
+                  {immichSettings.videoCompression.enabled ? (
+                    <div className="video-compression-options">
+                      <label>
+                        Video codec
+                        <select
+                          value={immichSettings.videoCompression.codec}
+                          onChange={(event) => {
+                            const codec =
+                              event.target.value === "h264" ? "h264" : "h265";
+                            updateVideoCompression({
+                              codec,
+                              crf: VIDEO_COMPRESSION_LIMITS[codec].defaultCrf,
+                            });
+                          }}
+                          aria-describedby="video-compression-codec-help"
+                        >
+                          <option value="h264">H.264 (AVC)</option>
+                          <option value="h265">H.265 (HEVC)</option>
+                        </select>
+                        <span
+                          id="video-compression-codec-help"
+                          className="field-help"
+                        >
+                          {immichSettings.videoCompression.codec === "h265"
+                            ? "Smaller files, but many browsers show no picture for them, and Immich usually stores an extra H.264 copy to play."
+                            : "Plays in every browser, and Immich plays it as uploaded."}
+                        </span>
+                      </label>
+                      <label>
+                        Quality (CRF {compressionCrfLimits.minCrf}–
+                        {compressionCrfLimits.maxCrf})
+                        <input
+                          type="number"
+                          min={compressionCrfLimits.minCrf}
+                          max={compressionCrfLimits.maxCrf}
+                          step="1"
+                          value={immichSettings.videoCompression.crf}
+                          onChange={(event) =>
+                            updateVideoCompression({
+                              crf: Number(event.target.value),
+                            })
+                          }
+                          required
+                          aria-describedby="video-compression-crf-help"
+                        />
+                        <span
+                          id="video-compression-crf-help"
+                          className="field-help"
+                        >
+                          Lower is better quality and a bigger file.
+                        </span>
+                      </label>
+                      <label>
+                        Encoder preset
+                        <select
+                          value={immichSettings.videoCompression.preset}
+                          onChange={(event) =>
+                            updateVideoCompression({
+                              preset:
+                                event.target.value === "slow"
+                                  ? "slow"
+                                  : "medium",
+                            })
+                          }
+                        >
+                          <option value="medium">Medium</option>
+                          <option value="slow">
+                            Slow: smaller files, takes longer
+                          </option>
+                        </select>
+                      </label>
+                      <label>
+                        Audio (AAC-LC)
+                        <select
+                          value={
+                            immichSettings.videoCompression.audioBitrateKbps
+                          }
+                          onChange={(event) =>
+                            updateVideoCompression({
+                              audioBitrateKbps: Number(event.target.value),
+                            })
+                          }
+                        >
+                          <option value={128}>128 kbps</option>
+                          <option value={160}>160 kbps</option>
+                          <option value={192}>192 kbps</option>
+                        </select>
+                      </label>
+                      <div className="video-compression-test">
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => void handleCompressVideosNow()}
+                          disabled={isImageControlLocked || !directoryPath}
+                          aria-describedby="video-compression-test-help"
+                        >
+                          {isUploading && uploadTask === "compress"
+                            ? "Compressing..."
+                            : "Compress videos now"}
+                        </button>
+                        <span id="video-compression-test-help">
+                          Runs the same compression with these settings
+                          {includeNested ? " (including nested folders)" : ""},
+                          replacing the originals, but does not upload anything.
+                        </span>
+                      </div>
+                    </div>
+                  ) : null}
+                </fieldset>
+
+                <div className="immich-actions">
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={immichSettings.pauseImmichJobs}
+                      onChange={(event) =>
+                        updateImmichSetting(
+                          "pauseImmichJobs",
+                          event.target.checked,
+                        )
+                      }
+                      disabled={isUploading}
+                    />
+                    Pause Immich background jobs during upload
+                  </label>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={handleImmichUpload}
+                    disabled={isImageControlLocked || !canUploadToImmich}
+                  >
+                    {isUploading && uploadTask === "upload"
+                      ? "Uploading..."
+                      : "Upload to Immich"}
+                  </button>
+                </div>
+
+                <div className="immich-result" role="status" aria-live="polite">
+                  <strong>{immichStatus}</strong>
+                  {isUploading ? (
+                    <div className="immich-progress">
+                      <progress
+                        className="immich-progress-bar"
+                        aria-label={
+                          uploadTask === "compress"
+                            ? "Video compression is running"
+                            : "Immich upload is processing"
+                        }
+                      />
+                      <span>
+                        Processing for {formatElapsedTime(uploadElapsedSeconds)}
+                        .
+                        {uploadTask === "compress"
+                          ? " Activity below updates while videos are compressed."
+                          : " Activity below updates while immich-go is running."}
+                      </span>
+                    </div>
+                  ) : null}
+                  {compressionItems.length ? (
+                    <ul
+                      className="compression-list"
+                      aria-label="Video compression progress"
+                    >
+                      {compressionItems.map((item) => (
+                        <li
+                          key={item.name}
+                          className={`compression-item compression-item-${item.status}`}
+                        >
+                          <span className="compression-item-name">
+                            {item.name}
+                          </span>
+                          <span className="compression-item-status">
+                            {VIDEO_COMPRESSION_STATUS_LABELS[item.status]}
+                            {item.status === "in-progress"
+                              ? ` ${Math.round(item.fraction * 100)}%`
+                              : ""}
+                          </span>
+                          {item.status === "in-progress" ? (
+                            <progress
+                              className="compression-item-bar"
+                              max={1}
+                              value={item.fraction}
+                              aria-label={`${item.name} compression progress`}
+                            />
+                          ) : null}
+                          {item.detail ? (
+                            <span className="compression-item-detail">
+                              {item.detail}
+                            </span>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {immichOutput ? (
+                    <pre
+                      ref={immichOutputRef}
+                      onScroll={(event) => {
+                        const outputElement = event.currentTarget;
+                        const distanceFromBottom =
+                          outputElement.scrollHeight -
+                          outputElement.scrollTop -
+                          outputElement.clientHeight;
+                        isImmichOutputFollowingRef.current =
+                          distanceFromBottom < 24;
+                      }}
+                    >
+                      {immichOutput}
+                    </pre>
                   ) : null}
                 </div>
 
-                <label>
-                  Concurrent tasks
-                  <input
-                    type="number"
-                    min="1"
-                    max="20"
-                    step="1"
-                    value={immichSettings.concurrentTasks}
-                    onChange={(event) =>
-                      updateImmichSetting(
-                        "concurrentTasks",
-                        Number(event.target.value),
-                      )
-                    }
-                    required
-                    disabled={isUploading}
-                  />
-                </label>
-              </div>
-
-              <fieldset
-                className="video-compression"
-                disabled={isUploading}
-                aria-describedby="video-compression-help"
-              >
-                <legend>Video compression</legend>
-                <label className="checkbox-field">
-                  <input
-                    type="checkbox"
-                    checked={immichSettings.videoCompression.enabled}
-                    onChange={(event) =>
-                      updateVideoCompression({ enabled: event.target.checked })
-                    }
-                  />
-                  Compress videos before uploading
-                </label>
-                <p
-                  id="video-compression-help"
-                  className="video-compression-help"
-                >
-                  Each standalone video is re-encoded to MP4 at its own
-                  resolution and frame rate, and{" "}
-                  <strong>the original file is replaced</strong>. Live photo
-                  videos, videos flagged &quot;Do not upload&quot;, and videos
-                  already compressed are left as they are. If any video cannot
-                  be compressed, the upload does not start.
-                </p>
-                {immichSettings.videoCompression.enabled ? (
-                  <div className="video-compression-options">
-                    <label>
-                      Video codec
-                      <select
-                        value={immichSettings.videoCompression.codec}
-                        onChange={(event) => {
-                          const codec =
-                            event.target.value === "h264" ? "h264" : "h265";
-                          updateVideoCompression({
-                            codec,
-                            crf: VIDEO_COMPRESSION_LIMITS[codec].defaultCrf,
-                          });
-                        }}
-                        aria-describedby="video-compression-codec-help"
-                      >
-                        <option value="h264">H.264 (AVC)</option>
-                        <option value="h265">H.265 (HEVC)</option>
-                      </select>
-                      <span
-                        id="video-compression-codec-help"
-                        className="field-help"
-                      >
-                        {immichSettings.videoCompression.codec === "h265"
-                          ? "Smaller files, but many browsers show no picture for them, and Immich usually stores an extra H.264 copy to play."
-                          : "Plays in every browser, and Immich plays it as uploaded."}
-                      </span>
-                    </label>
-                    <label>
-                      Quality (CRF {compressionCrfLimits.minCrf}–
-                      {compressionCrfLimits.maxCrf})
-                      <input
-                        type="number"
-                        min={compressionCrfLimits.minCrf}
-                        max={compressionCrfLimits.maxCrf}
-                        step="1"
-                        value={immichSettings.videoCompression.crf}
-                        onChange={(event) =>
-                          updateVideoCompression({
-                            crf: Number(event.target.value),
-                          })
-                        }
-                        required
-                        aria-describedby="video-compression-crf-help"
-                      />
-                      <span
-                        id="video-compression-crf-help"
-                        className="field-help"
-                      >
-                        Lower is better quality and a bigger file.
-                      </span>
-                    </label>
-                    <label>
-                      Encoder preset
-                      <select
-                        value={immichSettings.videoCompression.preset}
-                        onChange={(event) =>
-                          updateVideoCompression({
-                            preset:
-                              event.target.value === "slow" ? "slow" : "medium",
-                          })
-                        }
-                      >
-                        <option value="medium">Medium</option>
-                        <option value="slow">
-                          Slow: smaller files, takes longer
-                        </option>
-                      </select>
-                    </label>
-                    <label>
-                      Audio (AAC-LC)
-                      <select
-                        value={immichSettings.videoCompression.audioBitrateKbps}
-                        onChange={(event) =>
-                          updateVideoCompression({
-                            audioBitrateKbps: Number(event.target.value),
-                          })
-                        }
-                      >
-                        <option value={128}>128 kbps</option>
-                        <option value={160}>160 kbps</option>
-                        <option value={192}>192 kbps</option>
-                      </select>
-                    </label>
-                    <div className="video-compression-test">
-                      <button
-                        type="button"
-                        className="secondary-button"
-                        onClick={() => void handleCompressVideosNow()}
-                        disabled={isImageControlLocked || !directoryPath}
-                        aria-describedby="video-compression-test-help"
-                      >
-                        {isUploading && uploadTask === "compress"
-                          ? "Compressing..."
-                          : "Compress videos now"}
-                      </button>
-                      <span id="video-compression-test-help">
-                        Runs the same compression with these settings
-                        {includeNested ? " (including nested folders)" : ""},
-                        replacing the originals, but does not upload anything.
-                      </span>
-                    </div>
-                  </div>
-                ) : null}
-              </fieldset>
-
-              <div className="immich-actions">
-                <label className="checkbox-field">
-                  <input
-                    type="checkbox"
-                    checked={immichSettings.pauseImmichJobs}
-                    onChange={(event) =>
-                      updateImmichSetting(
-                        "pauseImmichJobs",
-                        event.target.checked,
-                      )
-                    }
-                    disabled={isUploading}
-                  />
-                  Pause Immich background jobs during upload
-                </label>
-                <button
-                  type="button"
-                  className="primary-button"
-                  onClick={handleImmichUpload}
-                  disabled={isImageControlLocked || !canUploadToImmich}
-                >
-                  {isUploading && uploadTask === "upload"
-                    ? "Uploading..."
-                    : "Upload to Immich"}
-                </button>
-              </div>
-
-              <div className="immich-result" role="status" aria-live="polite">
-                <strong>{immichStatus}</strong>
-                {isUploading ? (
-                  <div className="immich-progress">
-                    <progress
-                      className="immich-progress-bar"
-                      aria-label={
-                        uploadTask === "compress"
-                          ? "Video compression is running"
-                          : "Immich upload is processing"
-                      }
-                    />
-                    <span>
-                      Processing for {formatElapsedTime(uploadElapsedSeconds)}.
-                      {uploadTask === "compress"
-                        ? " Activity below updates while videos are compressed."
-                        : " Activity below updates while immich-go is running."}
-                    </span>
-                  </div>
-                ) : null}
-                {compressionItems.length ? (
-                  <ul
-                    className="compression-list"
-                    aria-label="Video compression progress"
+                {hasUploadedFolder && !folderState.processed ? (
+                  <div
+                    className="immich-mark-processed"
+                    role="group"
+                    aria-label="Mark folder as processed"
                   >
-                    {compressionItems.map((item) => (
-                      <li
-                        key={item.name}
-                        className={`compression-item compression-item-${item.status}`}
-                      >
-                        <span className="compression-item-name">
-                          {item.name}
-                        </span>
-                        <span className="compression-item-status">
-                          {VIDEO_COMPRESSION_STATUS_LABELS[item.status]}
-                          {item.status === "in-progress"
-                            ? ` ${Math.round(item.fraction * 100)}%`
-                            : ""}
-                        </span>
-                        {item.status === "in-progress" ? (
-                          <progress
-                            className="compression-item-bar"
-                            max={1}
-                            value={item.fraction}
-                            aria-label={`${item.name} compression progress`}
-                          />
-                        ) : null}
-                        {item.detail ? (
-                          <span className="compression-item-detail">
-                            {item.detail}
-                          </span>
-                        ) : null}
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-                {immichOutput ? (
-                  <pre
-                    ref={immichOutputRef}
-                    onScroll={(event) => {
-                      const outputElement = event.currentTarget;
-                      const distanceFromBottom =
-                        outputElement.scrollHeight -
-                        outputElement.scrollTop -
-                        outputElement.clientHeight;
-                      isImmichOutputFollowingRef.current =
-                        distanceFromBottom < 24;
-                    }}
-                  >
-                    {immichOutput}
-                  </pre>
-                ) : null}
-              </div>
-
-              {hasUploadedFolder && !folderState.processed ? (
-                <div
-                  className="immich-mark-processed"
-                  role="group"
-                  aria-label="Mark folder as processed"
-                >
-                  <span>Mark folder as processed?</span>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => void handleSetFolderProcessed(true, false)}
-                    disabled={isTransitionLocked}
-                  >
-                    This folder
-                  </button>
-                  {hasSubfolders ? (
+                    <span>Mark folder as processed?</span>
                     <button
                       type="button"
                       className="secondary-button"
-                      onClick={() => void handleSetFolderProcessed(true, true)}
+                      onClick={() => void handleSetFolderProcessed(true, false)}
                       disabled={isTransitionLocked}
                     >
-                      This folder and all subfolders
+                      This folder
                     </button>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
-          </details>
+                    {hasSubfolders ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() =>
+                          void handleSetFolderProcessed(true, true)
+                        }
+                        disabled={isTransitionLocked}
+                      >
+                        This folder and all subfolders
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            </section>
+          )}
         </main>
       )}
 
