@@ -10,6 +10,15 @@
   max-height: 72vh;
 }
 
+/*
+ * Vidstack's React <Poster> renders the <img> itself with the vds-poster class, so the theme's
+ * `.vds-poster img { object-fit: contain }` never matches and the poster stretches to fill the
+ * player until playback replaces it with the (contained) video.
+ */
+.video-player .vds-poster {
+  object-fit: contain;
+}
+
 .video-player-unsupported {
   display: grid;
   gap: 8px;
