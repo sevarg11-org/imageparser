@@ -85,13 +85,13 @@ export const VIDEO_COMPRESSION_LIMITS = {
 } as const;
 
 /**
- * Off by default; H.264 at CRF 21, the medium preset, and 160 kbps AAC when turned on. H.264 plays in every
- * browser and in Immich as uploaded; see videoMedia.js.
+ * Off by default; H.265 at CRF 24, the medium preset, and 160 kbps AAC when turned on. H.265 gives smaller files
+ * and plays in Immich and in most browsers with hardware acceleration; see videoMedia.js.
  */
 export const DEFAULT_VIDEO_COMPRESSION: VideoCompressionSettings = {
   enabled: false,
-  codec: "h264",
-  crf: VIDEO_COMPRESSION_LIMITS.h264.defaultCrf,
+  codec: "h265",
+  crf: VIDEO_COMPRESSION_LIMITS.h265.defaultCrf,
   preset: "medium",
   audioBitrateKbps: 160,
 };

@@ -80,19 +80,19 @@ const makeFakes = ({
   };
 };
 
-test("compression settings default to H.264 CRF 21, medium, 160 kbps, and stay in the recommended ranges", () => {
+test("compression settings default to H.265 CRF 24, medium, 160 kbps, and stay in the recommended ranges", () => {
   assert.deepEqual(normalizeVideoCompression(undefined), {
     ...defaultVideoCompression,
   });
   assert.deepEqual(normalizeVideoCompression({ enabled: true }), {
     enabled: true,
-    codec: "h264",
-    crf: 21,
+    codec: "h265",
+    crf: 24,
     preset: "medium",
     audioBitrateKbps: 160,
   });
-  assert.equal(normalizeVideoCompression({ codec: "h265" }).crf, 24);
-  assert.equal(normalizeVideoCompression({ codec: "bogus" }).codec, "h264");
+  assert.equal(normalizeVideoCompression({ codec: "h264" }).crf, 21);
+  assert.equal(normalizeVideoCompression({ codec: "bogus" }).codec, "h265");
   assert.equal(
     normalizeVideoCompression({ codec: "h264", crf: 23, preset: "slow" })
       .preset,
@@ -126,10 +126,10 @@ test("the ffmpeg arguments follow the recommended settings", () => {
   assert.equal(valueAfter("-i"), `file:${input}`);
   assert.equal(args.at(-1), `file:${output}`);
   assert.equal(valueAfter("-f"), "mp4");
-  assert.equal(valueAfter("-c:v"), "libx264");
-  assert.equal(valueAfter("-profile:v"), "high");
+  assert.equal(valueAfter("-c:v"), "libx265");
+  assert.equal(valueAfter("-tag:v"), "hvc1");
   assert.equal(valueAfter("-pix_fmt"), "yuv420p");
-  assert.equal(valueAfter("-crf"), "21");
+  assert.equal(valueAfter("-crf"), "24");
   assert.equal(valueAfter("-preset"), "medium");
   assert.equal(valueAfter("-fps_mode"), "cfr");
   assert.ok(!args.includes("-r"), "the source frame rate is kept");
@@ -140,16 +140,16 @@ test("the ffmpeg arguments follow the recommended settings", () => {
   assert.ok(args.includes("creation_time=1994-12-25T18:30:00.000Z"));
   assert.ok(args.includes("imageparser_compressed=1"));
 
-  const h265 = buildCompressionArguments(
+  const h264 = buildCompressionArguments(
     input,
     output,
-    normalizeVideoCompression({ codec: "h265", crf: 23, preset: "slow" }),
+    normalizeVideoCompression({ codec: "h264", crf: 20, preset: "slow" }),
   );
-  assert.equal(h265[h265.indexOf("-c:v") + 1], "libx265");
-  assert.equal(h265[h265.indexOf("-tag:v") + 1], "hvc1");
-  assert.equal(h265[h265.indexOf("-crf") + 1], "23");
-  assert.equal(h265[h265.indexOf("-preset") + 1], "slow");
-  assert.ok(!h265.some((arg) => arg.startsWith("creation_time=")));
+  assert.equal(h264[h264.indexOf("-c:v") + 1], "libx264");
+  assert.equal(h264[h264.indexOf("-profile:v") + 1], "high");
+  assert.equal(h264[h264.indexOf("-crf") + 1], "20");
+  assert.equal(h264[h264.indexOf("-preset") + 1], "slow");
+  assert.ok(!h264.some((arg) => arg.startsWith("creation_time=")));
 });
 
 test("a .mov is replaced by a smaller .mp4 and its sidecar follows", async () => {

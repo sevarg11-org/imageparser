@@ -4292,16 +4292,16 @@ function App() {
                         }}
                         aria-describedby="video-compression-codec-help"
                       >
-                        <option value="h264">H.264 (AVC)</option>
                         <option value="h265">H.265 (HEVC)</option>
+                        <option value="h264">H.264 (AVC)</option>
                       </select>
                       <span
                         id="video-compression-codec-help"
                         className="field-help"
                       >
                         {immichSettings.videoCompression.codec === "h265"
-                          ? "Smaller files, but many browsers show no picture for them, and Immich usually stores an extra H.264 copy to play."
-                          : "Plays in every browser, and Immich plays it as uploaded."}
+                          ? "Smaller files. Plays in Immich and in most browsers when hardware acceleration is enabled."
+                          : "Bigger files, but plays in every browser, even without H.265 support."}
                       </span>
                     </label>
                     <label>
