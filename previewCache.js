@@ -68,6 +68,25 @@ export const buildThumbnailCacheKey = (filePath, stats, rotation, size) =>
     .digest("hex");
 
 /**
+ * Builds the cache key for a video's seek-bar preview sprite.
+ * Sprites share the preview cache, so the key is tagged to never match a preview or thumbnail key.
+ * @param {string} filePath - The resolved path of the source video.
+ * @param {{size: number, mtimeMs: number, ctimeMs: number}} stats - The source video's stats.
+ * @returns {string} A hex SHA-256 key that is safe to use as a file name.
+ */
+export const buildVideoSpriteCacheKey = (filePath, stats) =>
+  createHash("sha256")
+    .update(
+      JSON.stringify([
+        previewFormatVersion,
+        "video-sprite",
+        path.resolve(filePath),
+        buildImageVersion(stats),
+      ]),
+    )
+    .digest("hex");
+
+/**
  * Creates a size-capped preview cache stored as files in one directory.
  * Entries are evicted least recently used first; a cache hit refreshes the entry's modification time.
  * Cache failures never break previews: reads that fail are misses and writes that fail are skipped.

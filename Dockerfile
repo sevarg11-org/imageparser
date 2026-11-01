@@ -38,8 +38,10 @@ FROM node:22-slim
 # perl is required by exiftool-vendored; gosu drops root after mounted-volume setup.
 # ca-certificates lets immich-go (a Go binary that uses the system trust store) verify HTTPS Immich servers;
 # tzdata gives it correct local time zones for photo dates.
+# ffmpeg reads video lengths and renders video posters and seek-bar previews; videos are streamed as they are,
+# never transcoded. (The ffmpeg-static npm packages are dev-only and pruned from this image.)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates gosu perl tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg gosu perl tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data /config \
     && chown node:node /data /config
@@ -50,7 +52,7 @@ RUN immich-go version
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
-COPY package.json server.js serverLogger.js core.js imageFileQueue.js previewCache.js auth.js pathAccess.js managedImmichSettings.js immichLookup.js geocoder.js docker-entrypoint.sh ./
+COPY package.json server.js serverLogger.js core.js imageFileQueue.js previewCache.js auth.js pathAccess.js managedImmichSettings.js immichLookup.js geocoder.js videoMedia.js docker-entrypoint.sh ./
 RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
     && chmod 755 /app/docker-entrypoint.sh
 

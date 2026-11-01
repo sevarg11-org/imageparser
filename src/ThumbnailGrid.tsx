@@ -1,12 +1,21 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import "./ThumbnailGrid.css";
 import {
+  canRotateGridCell,
   createThumbnailLoadQueue,
   describeGridCell,
   formatGridDate,
   type ThumbnailGridCell,
   type ThumbnailLoadQueue,
 } from "./thumbnailGridModel";
+import { formatVideoDuration } from "./videoModel";
 
 type VisibilityListener = (isVisible: boolean) => void;
 
@@ -42,6 +51,8 @@ type LazyThumbnailProps = {
   rotation: number;
   observeVisibility: ObserveVisibility;
   loadQueue: ThumbnailLoadQueue;
+  /** Marks drawn over the thumbnail, such as a video's play badge. */
+  overlay?: ReactNode;
 };
 
 /**
@@ -53,6 +64,7 @@ const LazyThumbnail = ({
   rotation,
   observeVisibility,
   loadQueue,
+  overlay,
 }: LazyThumbnailProps) => {
   const frameRef = useRef<HTMLSpanElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
@@ -119,6 +131,7 @@ const LazyThumbnail = ({
       {status === "error" ? (
         <span className="thumbnail-placeholder-text">No preview</span>
       ) : null}
+      {overlay}
     </span>
   );
 };
@@ -151,10 +164,50 @@ const ThumbnailCell = memo(function ThumbnailCell({
     (button: HTMLButtonElement | null) => registerButton(id, button),
     [id, registerButton],
   );
+  const isVideo = cell.mediaType === "video";
+  const duration = isVideo ? formatVideoDuration(cell.durationSeconds) : "";
+  // The button's accessible name already says "video" or "live photo"; these marks are visual.
+  const marks = (
+    <>
+      {isVideo ? (
+        <span className="thumbnail-video-marks">
+          <span className="thumbnail-play">▶</span>
+          {duration ? (
+            <span className="thumbnail-duration">{duration}</span>
+          ) : null}
+        </span>
+      ) : null}
+      {cell.isLivePhoto ? (
+        <span className="thumbnail-live" title="Live photo: has a video">
+          <svg viewBox="0 0 24 24" width="16" height="16" focusable="false">
+            <circle cx="12" cy="12" r="3" fill="currentColor" />
+            <circle
+              cx="12"
+              cy="12"
+              r="6.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+            />
+            <circle
+              cx="12"
+              cy="12"
+              r="10"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeDasharray="1.6 2.4"
+            />
+          </svg>
+          <span>Live</span>
+        </span>
+      ) : null}
+    </>
+  );
 
   return (
     <li
-      className={`thumbnail-cell${isSelected ? " thumbnail-cell--selected" : ""}`}
+      className={`thumbnail-cell${isSelected ? " thumbnail-cell--selected" : ""}${cell.isLivePhoto ? " thumbnail-cell--live" : ""}`}
     >
       <button
         ref={setButton}
@@ -170,6 +223,7 @@ const ThumbnailCell = memo(function ThumbnailCell({
           rotation={cell.rotation}
           observeVisibility={observeVisibility}
           loadQueue={loadQueue}
+          overlay={marks}
         />
         <span className="thumbnail-caption" aria-hidden="true">
           <span
@@ -206,26 +260,30 @@ const ThumbnailCell = memo(function ThumbnailCell({
         checked={isSelected}
         onChange={() => onToggleSelect(id)}
       />
-      <button
-        type="button"
-        className="thumbnail-rotate thumbnail-rotate--left"
-        aria-label={`Rotate ${cell.imageLabel} left`}
-        title="Rotate left"
-        disabled={!canRotate}
-        onClick={() => onRotate(id, -90)}
-      >
-        <span aria-hidden="true">↺</span>
-      </button>
-      <button
-        type="button"
-        className="thumbnail-rotate thumbnail-rotate--right"
-        aria-label={`Rotate ${cell.imageLabel} right`}
-        title="Rotate right"
-        disabled={!canRotate}
-        onClick={() => onRotate(id, 90)}
-      >
-        <span aria-hidden="true">↻</span>
-      </button>
+      {canRotateGridCell(cell) ? (
+        <>
+          <button
+            type="button"
+            className="thumbnail-rotate thumbnail-rotate--left"
+            aria-label={`Rotate ${cell.imageLabel} left`}
+            title="Rotate left"
+            disabled={!canRotate}
+            onClick={() => onRotate(id, -90)}
+          >
+            <span aria-hidden="true">↺</span>
+          </button>
+          <button
+            type="button"
+            className="thumbnail-rotate thumbnail-rotate--right"
+            aria-label={`Rotate ${cell.imageLabel} right`}
+            title="Rotate right"
+            disabled={!canRotate}
+            onClick={() => onRotate(id, 90)}
+          >
+            <span aria-hidden="true">↻</span>
+          </button>
+        </>
+      ) : null}
     </li>
   );
 });

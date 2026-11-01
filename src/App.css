@@ -450,7 +450,19 @@
   border-color: rgba(125, 211, 252, 0.45);
 }
 
-.image-card img {
+/* A live photo's Still/Video switch, styled like the Grid/Review view switch. */
+.live-photo-toggle {
+  display: flex;
+  gap: 2px;
+}
+
+.image-actions .live-photo-toggle button[aria-pressed="true"] {
+  border-color: transparent;
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  color: white;
+}
+
+.image-card .magnifier-frame img {
   display: block;
   width: 100%;
   height: auto;
@@ -464,7 +476,7 @@
     max-height 0.3s ease-out;
 }
 
-.image-stack--expanded .image-card img {
+.image-stack--expanded .image-card .magnifier-frame img {
   width: 100%;
   max-height: none;
   transition:
@@ -472,7 +484,7 @@
     max-height 0.3s ease-out;
 }
 
-.image-stack:not(.image-stack--expanded) .image-card img {
+.image-stack:not(.image-stack--expanded) .image-card .magnifier-frame img {
   width: auto;
   max-width: 100%;
   height: var(--collapsed-image-height, 600px);
@@ -582,7 +594,8 @@
 
 .metadata-panel input,
 .metadata-panel textarea,
-.immich-panel input {
+.immich-panel input,
+.immich-panel select {
   width: 100%;
   box-sizing: border-box;
   border: 1px solid #334155;
@@ -928,6 +941,67 @@
   text-align: left;
 }
 
+.video-compression {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(125, 211, 252, 0.22);
+  border-radius: 12px;
+}
+
+.video-compression legend {
+  padding: 0 6px;
+  color: #dfeaf7;
+  font-weight: 700;
+}
+
+.video-compression-help {
+  margin: 0;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.video-compression-help strong {
+  color: #fcd34d;
+}
+
+.video-compression-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+  /* Controls share a top edge even when a label's help text adds a line. */
+  align-items: start;
+}
+
+/* Label above its control, like the other upload fields. */
+.video-compression-options label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  color: #dfeaf7;
+  font-weight: 600;
+  text-align: left;
+}
+
+.video-compression-options .field-help {
+  font-size: 0.85rem;
+  font-weight: 400;
+}
+
+.video-compression-test {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 10px;
+  color: #94a3b8;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
 .checkbox-field {
   display: flex;
   align-items: center;
@@ -1041,4 +1115,102 @@
 
 .tag-entry input {
   min-width: 0;
+}
+
+/* Per-video compression progress: Pending (blue), In Progress (yellow, with a bar), Complete (green). */
+.compression-list {
+  --compression-pending: #60a5fa;
+  --compression-in-progress: #facc15;
+  --compression-complete: #4ade80;
+  --compression-skipped: #94a3b8;
+  --compression-failed: #f87171;
+  display: grid;
+  gap: 6px;
+  max-height: 320px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  text-align: left;
+}
+
+.compression-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-left: 4px solid var(--compression-color);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.compression-item-pending {
+  --compression-color: var(--compression-pending);
+}
+
+.compression-item-in-progress {
+  --compression-color: var(--compression-in-progress);
+}
+
+.compression-item-complete {
+  --compression-color: var(--compression-complete);
+}
+
+.compression-item-skipped {
+  --compression-color: var(--compression-skipped);
+}
+
+.compression-item-failed {
+  --compression-color: var(--compression-failed);
+}
+
+.compression-item-name {
+  overflow-wrap: anywhere;
+  color: #e2e8f0;
+}
+
+.compression-item-status {
+  color: var(--compression-color);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.compression-item-bar,
+.compression-item-detail {
+  grid-column: 1 / -1;
+}
+
+.compression-item-bar {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border: none;
+  border-radius: 999px;
+  background: rgba(250, 204, 21, 0.15);
+  appearance: none;
+}
+
+.compression-item-bar::-webkit-progress-bar {
+  border-radius: 999px;
+  background: rgba(250, 204, 21, 0.15);
+}
+
+.compression-item-bar::-webkit-progress-value {
+  border-radius: 999px;
+  background: var(--compression-in-progress);
+  transition: width 0.3s ease;
+}
+
+.compression-item-bar::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--compression-in-progress);
+}
+
+.compression-item-detail {
+  color: #94a3b8;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
 }

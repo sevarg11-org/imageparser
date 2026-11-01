@@ -60,6 +60,19 @@ import {
 } from "./thumbnailGridModel";
 import TagInput from "./TagInput";
 import { mergeTagSources } from "./tagSuggestions";
+import VideoPlayer from "./VideoPlayer";
+import {
+  applyVideoCompressionProgress,
+  DEFAULT_VIDEO_COMPRESSION,
+  VIDEO_COMPRESSION_LIMITS,
+  VIDEO_COMPRESSION_STATUS_LABELS,
+  type VideoCompressionItem,
+  type VideoCompressionProgressEvent,
+  type VideoCompressionSettings,
+  type VideoCompressionSummary,
+} from "./videoModel";
+import { CompressionSummaryDialog } from "./CompressionSummaryDialog";
+import { useConfirm } from "./useConfirm";
 import {
   fetchCurrentUser,
   isWebApp,
@@ -73,10 +86,17 @@ type ImagePair = {
   imageLabel: string;
   /** The pair's folder relative to the loaded folder, with forward slashes; "" for the loaded folder itself. */
   relativeDirectory: string;
+  /** "video" for a standalone video; its frontPath is the video file and it never has a back. */
+  mediaType: "image" | "video";
   frontPath: string;
   backPath: string | null;
+  /** A live photo's video: same folder and stem as the A image, which has no side suffix. */
+  liveVideoPath: string | null;
   frontVersion: string;
   backVersion: string | null;
+  liveVideoVersion: string | null;
+  /** A standalone video's length, or null when it is unknown or the item is an image. */
+  durationSeconds: number | null;
   createdAt: number;
   doNotUpload: boolean;
   excludeMismatch: boolean;
@@ -95,6 +115,8 @@ type SetDoNotUploadResult = Pick<
   | "backPath"
   | "frontVersion"
   | "backVersion"
+  | "liveVideoPath"
+  | "liveVideoVersion"
   | "doNotUpload"
   | "excludeMismatch"
 > & {
@@ -143,6 +165,8 @@ type ImmichSettings = {
   tags: string;
   pauseImmichJobs: boolean;
   concurrentTasks: number;
+  /** Compresses standalone videos in place (replacing the originals) before the upload. */
+  videoCompression: VideoCompressionSettings;
   /** Set by the web server only; managed keys are never sent to the browser. */
   managed?: ImmichManagedFields;
 };
@@ -159,11 +183,28 @@ type ImmichUploadResult = {
   ok: boolean;
   exitCode: number;
   output: string;
+  /** How many videos were compressed in place (renamed to .mp4) before the upload. */
+  compressedVideos?: number;
+  /** What the compression before the upload did, when it ran. */
+  compressionSummary?: VideoCompressionSummary;
+};
+
+/** The result of compressing a folder's videos without uploading them. */
+type VideoCompressionResult = {
+  ok: boolean;
+  output: string;
+  /** How many videos were compressed in place (renamed to .mp4). */
+  compressedVideos: number;
+  /** Each video's result and the sizes before and after. */
+  summary: VideoCompressionSummary;
 };
 
 type ImmichUploadProgress = {
-  phase: "uploading";
-  output: string;
+  phase: "compressing" | "uploading";
+  /** Replaces the activity log when present; per-video compression updates leave it alone. */
+  output?: string;
+  /** The list of videos to compress, or one video's new state. */
+  compression?: VideoCompressionProgressEvent;
 };
 
 type ImageRotationResult = {
@@ -241,6 +282,10 @@ declare global {
         size: number,
         version: string,
       ) => string;
+      /** Streams a video with Range support; never transcoded. */
+      getVideoUrl: (filePath: string, version: string) => string;
+      /** A video's seek-bar sprite, laid out as videoModel.ts SEEK_SPRITE_LAYOUT. */
+      getVideoSpriteUrl: (filePath: string, version: string) => string;
       applyImageRotations: (request: {
         frontPath: string;
         backPath: string | null;
@@ -297,6 +342,11 @@ declare global {
         directoryPath: string,
         recursive: boolean,
       ) => Promise<ImmichUploadResult>;
+      compressVideos: (
+        settings: VideoCompressionSettings,
+        directoryPath: string,
+        recursive: boolean,
+      ) => Promise<VideoCompressionResult>;
       onImmichUploadProgress: (
         listener: (progress: ImmichUploadProgress) => void,
       ) => () => void;
@@ -556,6 +606,53 @@ const MAGNIFIER_LENS_SIZE = 160;
 const MAGNIFIER_ZOOM = 2.5;
 const MAGNIFIER_EDGE_BUFFER = 32;
 
+/** The poster size for a standalone video in Review; the largest thumbnail the server renders. */
+const VIDEO_POSTER_SIZE = 640;
+
+/**
+ * Plays the selected standalone video, or a live photo's video when its Video view is chosen. Live photo
+ * videos are a few seconds long, so they autoplay and skip the poster and seek-bar previews.
+ */
+const SelectedVideo = ({
+  pair,
+  isLiveVideo,
+  imageVersions,
+}: {
+  pair: ImagePair;
+  isLiveVideo: boolean;
+  /** File versions changed since the folder was read, by path. */
+  imageVersions: Record<string, string>;
+}) => {
+  const electronApi = window.electronAPI;
+  const videoPath = isLiveVideo ? pair.liveVideoPath : pair.frontPath;
+  if (!electronApi || !videoPath) {
+    return null;
+  }
+  const version =
+    imageVersions[videoPath] ??
+    (isLiveVideo ? pair.liveVideoVersion : pair.frontVersion) ??
+    "";
+  return (
+    <VideoPlayer
+      filePath={videoPath}
+      src={electronApi.getVideoUrl(videoPath, version)}
+      posterUrl={
+        isLiveVideo
+          ? undefined
+          : electronApi.getThumbnailUrl(videoPath, VIDEO_POSTER_SIZE, version)
+      }
+      spriteUrl={
+        isLiveVideo
+          ? undefined
+          : electronApi.getVideoSpriteUrl(videoPath, version)
+      }
+      durationSeconds={isLiveVideo ? null : pair.durationSeconds}
+      autoPlay={isLiveVideo}
+      title={`${pair.imageLabel}${isLiveVideo ? " (live photo video)" : ""}`}
+    />
+  );
+};
+
 const MagnifiedImage = ({
   filePath,
   version,
@@ -813,6 +910,10 @@ const clampCollapsedImageHeight = (value: number) => {
     MAX_COLLAPSED_IMAGE_HEIGHT,
   );
 };
+/** The upload status shown before any upload or compression runs in the current folder. */
+const DEFAULT_IMMICH_STATUS =
+  "Immich settings are saved when an upload starts.";
+
 const defaultImmichSettings: ImmichSettings = {
   serverUrl: "",
   userApiKey: "",
@@ -821,6 +922,7 @@ const defaultImmichSettings: ImmichSettings = {
   tags: "",
   pauseImmichJobs: true,
   concurrentTasks: 2,
+  videoCompression: DEFAULT_VIDEO_COMPRESSION,
 };
 
 /**
@@ -920,11 +1022,23 @@ function App() {
   const [immichSettings, setImmichSettings] = useState<ImmichSettings>(
     defaultImmichSettings,
   );
-  const [immichStatus, setImmichStatus] = useState(
-    "Immich settings are saved when an upload starts.",
-  );
+  const [immichStatus, setImmichStatus] = useState(DEFAULT_IMMICH_STATUS);
   const [immichOutput, setImmichOutput] = useState("");
   const [isUploading, setIsUploading] = useState(false);
+  /** Which job holds isUploading: an Immich upload, or compressing videos without uploading. */
+  const [uploadTask, setUploadTask] = useState<"upload" | "compress">("upload");
+  const uploadTaskRef = useRef<"upload" | "compress">("upload");
+  /** Each video of the current (or last) compression run, with its status and progress. */
+  const [compressionItems, setCompressionItems] = useState<
+    VideoCompressionItem[]
+  >([]);
+  /** In-page confirmations (instead of window.confirm, which phones and embedded views handle poorly). */
+  const { confirm, confirmDialog } = useConfirm();
+  /** The finished compression run shown in the summary overlay, or null when it is closed. */
+  const [compressionSummary, setCompressionSummary] = useState<{
+    summary: VideoCompressionSummary;
+    isCompressOnly: boolean;
+  } | null>(null);
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -1039,6 +1153,15 @@ function App() {
     () => displayPairs[selectedIndex] ?? null,
     [displayPairs, selectedIndex],
   );
+  // The live photo whose video is shown instead of its still; moving to another item shows its still again.
+  const [liveVideoPairId, setLiveVideoPairId] = useState<string | null>(null);
+  const isSelectedVideo = selectedPair?.mediaType === "video";
+  const isShowingLiveVideo =
+    selectedPair !== null &&
+    selectedPair.liveVideoPath !== null &&
+    liveVideoPairId === selectedPair.id;
+  // Videos are never rotated, and a live photo's still is rotated only while it is shown.
+  const canRotateSelectedFront = !isSelectedVideo && !isShowingLiveVideo;
 
   const gridCells = useMemo<ThumbnailGridCell[]>(() => {
     const electronApi = window.electronAPI;
@@ -1059,6 +1182,9 @@ function App() {
         imageVersions[pair.frontPath] ?? pair.frontVersion,
       ),
       rotation: gridRotations.get(pair.id) ?? 0,
+      mediaType: pair.mediaType,
+      isLivePhoto: pair.liveVideoPath !== null,
+      durationSeconds: pair.durationSeconds,
     }));
   }, [displayPairs, gridRotations, imageVersions, savedDates, savedPairIds]);
 
@@ -1131,7 +1257,13 @@ function App() {
       try {
         const savedSettings = await electronApi.loadImmichSettings();
         if (isMounted) {
-          setImmichSettings(savedSettings);
+          setImmichSettings({
+            ...savedSettings,
+            videoCompression: {
+              ...DEFAULT_VIDEO_COMPRESSION,
+              ...savedSettings.videoCompression,
+            },
+          });
         }
       } catch (error) {
         if (isMounted) {
@@ -1185,8 +1317,22 @@ function App() {
     }
 
     return electronApi.onImmichUploadProgress((progress) => {
-      setImmichOutput(progress.output);
-      setImmichStatus("Immich is processing the selected directory...");
+      if (progress.output !== undefined) {
+        setImmichOutput(progress.output);
+      }
+      const compressionEvent = progress.compression;
+      if (compressionEvent) {
+        setCompressionItems((current) =>
+          applyVideoCompressionProgress(current, compressionEvent),
+        );
+      }
+      setImmichStatus(
+        progress.phase !== "compressing"
+          ? "Immich is processing the selected directory..."
+          : uploadTaskRef.current === "compress"
+            ? "Compressing videos (no upload)..."
+            : "Compressing videos before the upload...",
+      );
     });
   }, []);
 
@@ -1820,7 +1966,12 @@ function App() {
    */
   const rotateImage = useCallback(
     (field: RotationField, delta: number) => {
-      if (isPersistingRotation || isUploading || !isHydrated) {
+      if (
+        isPersistingRotation ||
+        isUploading ||
+        !isHydrated ||
+        (field === "front" && !canRotateSelectedFront)
+      ) {
         return;
       }
 
@@ -1830,7 +1981,13 @@ function App() {
         [field]: normalizeRotation(current[field] + delta),
       }));
     },
-    [isHydrated, isPersistingRotation, isUploading, markUserChanged],
+    [
+      canRotateSelectedFront,
+      isHydrated,
+      isPersistingRotation,
+      isUploading,
+      markUserChanged,
+    ],
   );
 
   /**
@@ -1896,6 +2053,8 @@ function App() {
                 backPath: result.backPath,
                 frontVersion: result.frontVersion,
                 backVersion: result.backVersion,
+                liveVideoPath: result.liveVideoPath,
+                liveVideoVersion: result.liveVideoVersion,
                 doNotUpload: result.doNotUpload,
                 excludeMismatch: result.excludeMismatch,
               }
@@ -2306,9 +2465,18 @@ function App() {
       const unsavedImages = await waitForPendingSaves();
       if (
         unsavedImages.length &&
-        !window.confirm(
-          `Changes to ${unsavedImages.join(", ")} could not be saved and will be lost. Open the other folder anyway?`,
-        )
+        !(await confirm({
+          title: "Open the other folder?",
+          body: (
+            <p>
+              Changes to {unsavedImages.join(", ")} could not be saved and{" "}
+              <strong>will be lost</strong> if you open the other folder.
+            </p>
+          ),
+          confirmLabel: "Open and discard changes",
+          cancelLabel: "Stay in this folder",
+          isDestructive: true,
+        }))
       ) {
         setStatus(
           `Stayed in this folder.${describeUnsavedImages(unsavedImages)}`,
@@ -2337,6 +2505,12 @@ function App() {
       setIncludeSubfoldersInProcessed(false);
       setFolderProcessedError("");
       setHasUploadedFolder(false);
+      // The video compression and immich-go results belong to the previous folder.
+      setImmichStatus(DEFAULT_IMMICH_STATUS);
+      setImmichOutput("");
+      setCompressionItems([]);
+      setUploadElapsedSeconds(0);
+      isImmichOutputFollowingRef.current = true;
       setIsHydrated(false);
       setPairs(result.files);
       resetSavedPairs();
@@ -2522,6 +2696,21 @@ function App() {
   };
 
   /**
+   * Updates part of the video compression settings.
+   * @param changes - The compression fields to change.
+   */
+  const updateVideoCompression = (
+    changes: Partial<VideoCompressionSettings>,
+  ) => {
+    setImmichSettings((current) => ({
+      ...current,
+      videoCompression: { ...current.videoCompression, ...changes },
+    }));
+  };
+  const compressionCrfLimits =
+    VIDEO_COMPRESSION_LIMITS[immichSettings.videoCompression.codec];
+
+  /**
    * Handles the upload of images to Immich after applying pending image rotations.
    * Saves settings, processes any outstanding rotation tasks, then uploads the directory.
    */
@@ -2554,6 +2743,9 @@ function App() {
         return;
       }
 
+      uploadTaskRef.current = "upload";
+      setUploadTask("upload");
+      setCompressionItems([]);
       setIsUploading(true);
       setUploadElapsedSeconds(0);
       setImmichOutput("");
@@ -2579,9 +2771,114 @@ function App() {
           ? "Immich upload completed successfully."
           : `Immich upload failed with exit code ${result.exitCode}.`,
       );
+      // Compressed videos replaced their originals (often under a new .mp4 name), so the list is stale.
+      if (result.compressedVideos) {
+        await reloadDirectory(sortBy);
+      }
+      // The overlay opens after the reload, so the new files can be browsed as soon as it is closed.
+      if (result.compressionSummary?.videos.length) {
+        setCompressionSummary({
+          summary: result.compressionSummary,
+          isCompressOnly: false,
+        });
+      }
     } catch (error) {
       setImmichStatus(
         error instanceof Error ? error.message : "Unable to upload to Immich.",
+      );
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  /**
+   * Compresses the folder's standalone videos in place with the current settings, without uploading anything, so
+   * the settings can be tried (and the results reviewed) before an upload. The originals are replaced, so the
+   * button asks first, in an in-page dialog. Pending saves finish first because compression may rename a video and
+   * its sidecar.
+   */
+  const handleCompressVideosNow = async () => {
+    const electronApi = window.electronAPI;
+    if (!electronApi) {
+      setImmichStatus("This application must run inside Electron.");
+      return;
+    }
+
+    if (!directoryPath) {
+      setImmichStatus("Load a folder before compressing its videos.");
+      return;
+    }
+
+    if (
+      !(await confirm({
+        title: "Compress videos now?",
+        body: (
+          <>
+            <p>
+              Compress the videos in this folder
+              {includeNested ? " and its nested folders" : ""} now, without
+              uploading anything?
+            </p>
+            <p>
+              Each standalone video is re-encoded to MP4 and{" "}
+              <strong>the original file is replaced</strong>. This cannot be
+              undone. Try it on a copy of a folder first if you are unsure of
+              the settings.
+            </p>
+          </>
+        ),
+        confirmLabel: "Compress and replace originals",
+        isDestructive: true,
+      }))
+    ) {
+      return;
+    }
+
+    try {
+      setImmichStatus("Saving changes before compressing videos...");
+      if (!(await persistReviewedPair())) {
+        setImmichStatus(
+          "Compression stopped because an image rotation could not be persisted.",
+        );
+        return;
+      }
+
+      const unsavedImages = await waitForPendingSaves();
+      if (unsavedImages.length) {
+        setImmichStatus(
+          `Compression stopped because changes to ${unsavedImages.join(", ")} could not be saved. Open those items to retry.`,
+        );
+        return;
+      }
+
+      uploadTaskRef.current = "compress";
+      setUploadTask("compress");
+      setCompressionItems([]);
+      setIsUploading(true);
+      setUploadElapsedSeconds(0);
+      setImmichOutput("");
+      isImmichOutputFollowingRef.current = true;
+      setImmichStatus("Compressing videos (no upload)...");
+      const result = await electronApi.compressVideos(
+        immichSettings.videoCompression,
+        directoryPath,
+        includeNested,
+      );
+      setImmichOutput(result.output);
+      setImmichStatus(
+        result.ok
+          ? `Video compression finished: ${result.compressedVideos} ${result.compressedVideos === 1 ? "video" : "videos"} replaced. Nothing was uploaded.`
+          : "Some videos could not be compressed. Nothing was uploaded; see the details below.",
+      );
+      // Compressed videos replaced their originals (often under a new .mp4 name), so the list is stale.
+      if (result.compressedVideos) {
+        await reloadDirectory(sortBy);
+      }
+      // The overlay opens after the reload, so the new files can be browsed as soon as it is closed.
+      setCompressionSummary({ summary: result.summary, isCompressOnly: true });
+    } catch (error) {
+      setImmichStatus(
+        error instanceof Error ? error.message : "Unable to compress videos.",
       );
     } finally {
       setIsUploading(false);
@@ -2690,11 +2987,27 @@ function App() {
       return;
     }
     if (
-      !window.confirm(
-        `Reset processing for all images${includeNested ? " in this folder and its nested folders" : " in this folder"}?
-
-This permanently deletes their .xmp sidecar files, including the saved dates, descriptions and tags. The images themselves are not deleted. This cannot be undone.`,
-      )
+      !(await confirm({
+        title: "Reset processing?",
+        body: (
+          <>
+            <p>
+              Reset processing for all images
+              {includeNested
+                ? " in this folder and its nested folders"
+                : " in this folder"}
+              ?
+            </p>
+            <p>
+              This <strong>permanently deletes their .xmp sidecar files</strong>
+              , including the saved dates, descriptions and tags. The images
+              themselves are not deleted. This cannot be undone.
+            </p>
+          </>
+        ),
+        confirmLabel: "Reset processing",
+        isDestructive: true,
+      }))
     ) {
       return;
     }
@@ -3615,7 +3928,11 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       <div className="image-card">
                         <div className="image-card-header">
                           <div className="image-label">
-                            Front image
+                            {isSelectedVideo
+                              ? "Video"
+                              : selectedPair?.liveVideoPath
+                                ? "Live photo"
+                                : "Front image"}
                             {selectedPair?.doNotUpload ? (
                               <span className="do-not-upload-badge">
                                 Do not upload
@@ -3623,20 +3940,48 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                             ) : null}
                           </div>
                           <div className="image-actions">
-                            <button
-                              type="button"
-                              onClick={() => rotateImage("front", -90)}
-                              disabled={isImageControlLocked}
-                            >
-                              Rotate left
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => rotateImage("front", 90)}
-                              disabled={isImageControlLocked}
-                            >
-                              Rotate right
-                            </button>
+                            {selectedPair?.liveVideoPath ? (
+                              <div
+                                className="live-photo-toggle"
+                                role="group"
+                                aria-label="Show the live photo's"
+                              >
+                                <button
+                                  type="button"
+                                  aria-pressed={!isShowingLiveVideo}
+                                  onClick={() => setLiveVideoPairId(null)}
+                                >
+                                  Still
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-pressed={isShowingLiveVideo}
+                                  onClick={() =>
+                                    setLiveVideoPairId(selectedPair.id)
+                                  }
+                                >
+                                  Video
+                                </button>
+                              </div>
+                            ) : null}
+                            {canRotateSelectedFront ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => rotateImage("front", -90)}
+                                  disabled={isImageControlLocked}
+                                >
+                                  Rotate left
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => rotateImage("front", 90)}
+                                  disabled={isImageControlLocked}
+                                >
+                                  Rotate right
+                                </button>
+                              </>
+                            ) : null}
                             <button
                               type="button"
                               onClick={toggleExpanded}
@@ -3646,24 +3991,36 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                             </button>
                           </div>
                         </div>
-                        <MagnifiedImage
-                          filePath={
-                            selectedPair && readyPairId === selectedPair.id
-                              ? selectedPair.frontPath
-                              : ""
-                          }
-                          version={getDisplayedVersion(
-                            selectedPair?.frontPath ?? null,
-                            selectedPair?.frontVersion ?? null,
-                          )}
-                          altText={`${selectedPair?.imageLabel ?? ""}`}
-                          rotation={normalizeRotation(
-                            rotations.front +
-                              (gridRotations.get(selectedPair?.id ?? "") ?? 0),
-                          )}
-                          isExpanded={isExpanded}
-                          collapsedHeight={collapsedImageHeight}
-                        />
+                        {selectedPair &&
+                        (isSelectedVideo || isShowingLiveVideo) &&
+                        window.electronAPI ? (
+                          <SelectedVideo
+                            key={`${selectedPair.id}-${isShowingLiveVideo ? "live" : "video"}`}
+                            pair={selectedPair}
+                            isLiveVideo={isShowingLiveVideo}
+                            imageVersions={imageVersions}
+                          />
+                        ) : (
+                          <MagnifiedImage
+                            filePath={
+                              selectedPair && readyPairId === selectedPair.id
+                                ? selectedPair.frontPath
+                                : ""
+                            }
+                            version={getDisplayedVersion(
+                              selectedPair?.frontPath ?? null,
+                              selectedPair?.frontVersion ?? null,
+                            )}
+                            altText={`${selectedPair?.imageLabel ?? ""}`}
+                            rotation={normalizeRotation(
+                              rotations.front +
+                                (gridRotations.get(selectedPair?.id ?? "") ??
+                                  0),
+                            )}
+                            isExpanded={isExpanded}
+                            collapsedHeight={collapsedImageHeight}
+                          />
+                        )}
                       </div>
 
                       {selectedPair && selectedPair.backPath ? (
@@ -3900,6 +4257,139 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                 </label>
               </div>
 
+              <fieldset
+                className="video-compression"
+                disabled={isUploading}
+                aria-describedby="video-compression-help"
+              >
+                <legend>Video compression</legend>
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={immichSettings.videoCompression.enabled}
+                    onChange={(event) =>
+                      updateVideoCompression({ enabled: event.target.checked })
+                    }
+                  />
+                  Compress videos before uploading
+                </label>
+                <p
+                  id="video-compression-help"
+                  className="video-compression-help"
+                >
+                  Each standalone video is re-encoded to MP4 at its own
+                  resolution and frame rate, and{" "}
+                  <strong>the original file is replaced</strong>. Live photo
+                  videos, videos flagged &quot;Do not upload&quot;, and videos
+                  already compressed are left as they are. If any video cannot
+                  be compressed, the upload does not start.
+                </p>
+                {immichSettings.videoCompression.enabled ? (
+                  <div className="video-compression-options">
+                    <label>
+                      Video codec
+                      <select
+                        value={immichSettings.videoCompression.codec}
+                        onChange={(event) => {
+                          const codec =
+                            event.target.value === "h264" ? "h264" : "h265";
+                          updateVideoCompression({
+                            codec,
+                            crf: VIDEO_COMPRESSION_LIMITS[codec].defaultCrf,
+                          });
+                        }}
+                        aria-describedby="video-compression-codec-help"
+                      >
+                        <option value="h264">H.264 (AVC)</option>
+                        <option value="h265">H.265 (HEVC)</option>
+                      </select>
+                      <span
+                        id="video-compression-codec-help"
+                        className="field-help"
+                      >
+                        {immichSettings.videoCompression.codec === "h265"
+                          ? "Smaller files, but many browsers show no picture for them, and Immich usually stores an extra H.264 copy to play."
+                          : "Plays in every browser, and Immich plays it as uploaded."}
+                      </span>
+                    </label>
+                    <label>
+                      Quality (CRF {compressionCrfLimits.minCrf}–
+                      {compressionCrfLimits.maxCrf})
+                      <input
+                        type="number"
+                        min={compressionCrfLimits.minCrf}
+                        max={compressionCrfLimits.maxCrf}
+                        step="1"
+                        value={immichSettings.videoCompression.crf}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            crf: Number(event.target.value),
+                          })
+                        }
+                        required
+                        aria-describedby="video-compression-crf-help"
+                      />
+                      <span
+                        id="video-compression-crf-help"
+                        className="field-help"
+                      >
+                        Lower is better quality and a bigger file.
+                      </span>
+                    </label>
+                    <label>
+                      Encoder preset
+                      <select
+                        value={immichSettings.videoCompression.preset}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            preset:
+                              event.target.value === "slow" ? "slow" : "medium",
+                          })
+                        }
+                      >
+                        <option value="medium">Medium</option>
+                        <option value="slow">
+                          Slow: smaller files, takes longer
+                        </option>
+                      </select>
+                    </label>
+                    <label>
+                      Audio (AAC-LC)
+                      <select
+                        value={immichSettings.videoCompression.audioBitrateKbps}
+                        onChange={(event) =>
+                          updateVideoCompression({
+                            audioBitrateKbps: Number(event.target.value),
+                          })
+                        }
+                      >
+                        <option value={128}>128 kbps</option>
+                        <option value={160}>160 kbps</option>
+                        <option value={192}>192 kbps</option>
+                      </select>
+                    </label>
+                    <div className="video-compression-test">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => void handleCompressVideosNow()}
+                        disabled={isImageControlLocked || !directoryPath}
+                        aria-describedby="video-compression-test-help"
+                      >
+                        {isUploading && uploadTask === "compress"
+                          ? "Compressing..."
+                          : "Compress videos now"}
+                      </button>
+                      <span id="video-compression-test-help">
+                        Runs the same compression with these settings
+                        {includeNested ? " (including nested folders)" : ""},
+                        replacing the originals, but does not upload anything.
+                      </span>
+                    </div>
+                  </div>
+                ) : null}
+              </fieldset>
+
               <div className="immich-actions">
                 <label className="checkbox-field">
                   <input
@@ -3921,7 +4411,9 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   onClick={handleImmichUpload}
                   disabled={isImageControlLocked || !canUploadToImmich}
                 >
-                  {isUploading ? "Uploading..." : "Upload to Immich"}
+                  {isUploading && uploadTask === "upload"
+                    ? "Uploading..."
+                    : "Upload to Immich"}
                 </button>
               </div>
 
@@ -3931,13 +4423,55 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                   <div className="immich-progress">
                     <progress
                       className="immich-progress-bar"
-                      aria-label="Immich upload is processing"
+                      aria-label={
+                        uploadTask === "compress"
+                          ? "Video compression is running"
+                          : "Immich upload is processing"
+                      }
                     />
                     <span>
                       Processing for {formatElapsedTime(uploadElapsedSeconds)}.
-                      Activity below updates while immich-go is running.
+                      {uploadTask === "compress"
+                        ? " Activity below updates while videos are compressed."
+                        : " Activity below updates while immich-go is running."}
                     </span>
                   </div>
+                ) : null}
+                {compressionItems.length ? (
+                  <ul
+                    className="compression-list"
+                    aria-label="Video compression progress"
+                  >
+                    {compressionItems.map((item) => (
+                      <li
+                        key={item.name}
+                        className={`compression-item compression-item-${item.status}`}
+                      >
+                        <span className="compression-item-name">
+                          {item.name}
+                        </span>
+                        <span className="compression-item-status">
+                          {VIDEO_COMPRESSION_STATUS_LABELS[item.status]}
+                          {item.status === "in-progress"
+                            ? ` ${Math.round(item.fraction * 100)}%`
+                            : ""}
+                        </span>
+                        {item.status === "in-progress" ? (
+                          <progress
+                            className="compression-item-bar"
+                            max={1}
+                            value={item.fraction}
+                            aria-label={`${item.name} compression progress`}
+                          />
+                        ) : null}
+                        {item.detail ? (
+                          <span className="compression-item-detail">
+                            {item.detail}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
                 ) : null}
                 {immichOutput ? (
                   <pre
@@ -3988,6 +4522,13 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
           </details>
         </main>
       )}
+
+      {confirmDialog}
+      <CompressionSummaryDialog
+        summary={compressionSummary?.summary ?? null}
+        isCompressOnly={compressionSummary?.isCompressOnly ?? false}
+        onClose={() => setCompressionSummary(null)}
+      />
 
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}
