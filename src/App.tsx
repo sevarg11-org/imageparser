@@ -70,7 +70,7 @@ import {
   type VideoCompressionProgressEvent,
   type VideoCompressionSettings,
 } from "./videoModel";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { useConfirm } from "./useConfirm";
 import {
   fetchCurrentUser,
   isWebApp,
@@ -1024,7 +1024,8 @@ function App() {
   const [compressionItems, setCompressionItems] = useState<
     VideoCompressionItem[]
   >([]);
-  const [isCompressConfirmOpen, setIsCompressConfirmOpen] = useState(false);
+  /** In-page confirmations (instead of window.confirm, which phones and embedded views handle poorly). */
+  const { confirm, confirmDialog } = useConfirm();
   const [isSettingFolderDate, setIsSettingFolderDate] = useState(false);
   const [selectedGridIds, setSelectedGridIds] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -2451,9 +2452,18 @@ function App() {
       const unsavedImages = await waitForPendingSaves();
       if (
         unsavedImages.length &&
-        !window.confirm(
-          `Changes to ${unsavedImages.join(", ")} could not be saved and will be lost. Open the other folder anyway?`,
-        )
+        !(await confirm({
+          title: "Open the other folder?",
+          body: (
+            <p>
+              Changes to {unsavedImages.join(", ")} could not be saved and{" "}
+              <strong>will be lost</strong> if you open the other folder.
+            </p>
+          ),
+          confirmLabel: "Open and discard changes",
+          cancelLabel: "Stay in this folder",
+          isDestructive: true,
+        }))
       ) {
         setStatus(
           `Stayed in this folder.${describeUnsavedImages(unsavedImages)}`,
@@ -2773,6 +2783,31 @@ function App() {
       return;
     }
 
+    if (
+      !(await confirm({
+        title: "Compress videos now?",
+        body: (
+          <>
+            <p>
+              Compress the videos in this folder
+              {includeNested ? " and its nested folders" : ""} now, without
+              uploading anything?
+            </p>
+            <p>
+              Each standalone video is re-encoded to MP4 and{" "}
+              <strong>the original file is replaced</strong>. This cannot be
+              undone. Try it on a copy of a folder first if you are unsure of
+              the settings.
+            </p>
+          </>
+        ),
+        confirmLabel: "Compress and replace originals",
+        isDestructive: true,
+      }))
+    ) {
+      return;
+    }
+
     try {
       setImmichStatus("Saving changes before compressing videos...");
       if (!(await persistReviewedPair())) {
@@ -2924,11 +2959,27 @@ function App() {
       return;
     }
     if (
-      !window.confirm(
-        `Reset processing for all images${includeNested ? " in this folder and its nested folders" : " in this folder"}?
-
-This permanently deletes their .xmp sidecar files, including the saved dates, descriptions and tags. The images themselves are not deleted. This cannot be undone.`,
-      )
+      !(await confirm({
+        title: "Reset processing?",
+        body: (
+          <>
+            <p>
+              Reset processing for all images
+              {includeNested
+                ? " in this folder and its nested folders"
+                : " in this folder"}
+              ?
+            </p>
+            <p>
+              This <strong>permanently deletes their .xmp sidecar files</strong>
+              , including the saved dates, descriptions and tags. The images
+              themselves are not deleted. This cannot be undone.
+            </p>
+          </>
+        ),
+        confirmLabel: "Reset processing",
+        isDestructive: true,
+      }))
     ) {
       return;
     }
@@ -4293,7 +4344,7 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                       <button
                         type="button"
                         className="secondary-button"
-                        onClick={() => setIsCompressConfirmOpen(true)}
+                        onClick={() => void handleCompressVideosNow()}
                         disabled={isImageControlLocked || !directoryPath}
                         aria-describedby="video-compression-test-help"
                       >
@@ -4444,28 +4495,7 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
         </main>
       )}
 
-      <ConfirmDialog
-        isOpen={isCompressConfirmOpen}
-        title="Compress videos now?"
-        confirmLabel="Compress and replace originals"
-        isDestructive
-        onCancel={() => setIsCompressConfirmOpen(false)}
-        onConfirm={() => {
-          setIsCompressConfirmOpen(false);
-          void handleCompressVideosNow();
-        }}
-      >
-        <p>
-          Compress the videos in this folder
-          {includeNested ? " and its nested folders" : ""} now, without
-          uploading anything?
-        </p>
-        <p>
-          Each standalone video is re-encoded to MP4 and{" "}
-          <strong>the original file is replaced</strong>. This cannot be undone.
-          Try it on a copy of a folder first if you are unsure of the settings.
-        </p>
-      </ConfirmDialog>
+      {confirmDialog}
 
       <SetFolderDateModal
         isOpen={isSetFolderDateModalOpen}
