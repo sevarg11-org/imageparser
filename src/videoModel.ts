@@ -84,11 +84,14 @@ export const VIDEO_COMPRESSION_LIMITS = {
   maxAudioBitrateKbps: 192,
 } as const;
 
-/** Off by default; H.265 at CRF 24, the medium preset, and 160 kbps AAC when turned on. */
+/**
+ * Off by default; H.264 at CRF 21, the medium preset, and 160 kbps AAC when turned on. H.264 plays in every
+ * browser and in Immich as uploaded; see videoMedia.js.
+ */
 export const DEFAULT_VIDEO_COMPRESSION: VideoCompressionSettings = {
   enabled: false,
-  codec: "h265",
-  crf: VIDEO_COMPRESSION_LIMITS.h265.defaultCrf,
+  codec: "h264",
+  crf: VIDEO_COMPRESSION_LIMITS.h264.defaultCrf,
   preset: "medium",
   audioBitrateKbps: 160,
 };
@@ -118,4 +121,30 @@ export const formatVideoDuration = (durationSeconds: number | null) => {
   return hours
     ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`
     : `${minutes}:${seconds}`;
+};
+
+/**
+ * Whether a video element that has loaded is showing no picture: browsers that cannot decode the video codec (for
+ * example H.265 without hardware support) still play the sound and raise no error, leaving a black frame.
+ * @param video - The video's size and decoded frame count, as a video element reports them.
+ * @param hasPlayed - Whether playback has run long enough that frames must have been decoded.
+ * @returns True when the video has no picture size, or has played without decoding a single frame.
+ */
+export const hasMissingPicture = (
+  video: {
+    readyState: number;
+    videoWidth: number;
+    videoHeight: number;
+    getVideoPlaybackQuality?: () => { totalVideoFrames: number };
+  },
+  hasPlayed: boolean,
+) => {
+  // HTMLMediaElement.HAVE_METADATA: before it, the size is not known yet.
+  if (video.readyState < 1) {
+    return false;
+  }
+  if (video.videoWidth === 0 || video.videoHeight === 0) {
+    return true;
+  }
+  return hasPlayed && video.getVideoPlaybackQuality?.().totalVideoFrames === 0;
 };

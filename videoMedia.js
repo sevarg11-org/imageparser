@@ -258,12 +258,14 @@ export const videoCompressionLimits = Object.freeze({
 });
 
 /**
- * The default compression settings: off, H.265 at CRF 24, medium preset, 160 kbps AAC.
+ * The default compression settings: off, H.264 at CRF 21, medium preset, 160 kbps AAC. H.264 is the default
+ * because every browser plays it, and Immich (by default) plays it as uploaded; H.265 files are smaller, but many
+ * browsers show no picture for them, and Immich stores an extra H.264 copy of each one for playback.
  */
 export const defaultVideoCompression = Object.freeze({
   enabled: false,
-  codec: "h265",
-  crf: videoCompressionLimits.h265.defaultCrf,
+  codec: "h264",
+  crf: videoCompressionLimits.h264.defaultCrf,
   preset: "medium",
   audioBitrateKbps: 160,
 });
@@ -276,7 +278,7 @@ export const defaultVideoCompression = Object.freeze({
  * @throws {Error} If a value is outside the recommended range.
  */
 export const normalizeVideoCompression = (value) => {
-  const codec = value?.codec === "h264" ? "h264" : "h265";
+  const codec = value?.codec === "h265" ? "h265" : "h264";
   const limits = videoCompressionLimits[codec];
   const crf =
     value?.crf === undefined || value?.crf === null || value?.crf === ""

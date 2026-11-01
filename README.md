@@ -10,7 +10,7 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
   tasks. immich-go's folder upload includes videos, and the `_exclude` "Do not upload" names apply to them too.
 - **Video Compression (optional)**: Turn on "Compress videos before uploading" in the Immich settings to re-encode
   each standalone video before the upload, **replacing the original file**. The output follows the recommended
-  settings for digitized tape: MP4, H.265 (CRF 23–26, default 24) or H.264 (CRF 20–23, default 21), the medium or
+  settings for digitized tape: MP4, H.264 (CRF 20–23, default 21) or H.265 (CRF 23–26, default 24), the medium or
   slow preset, the native resolution (never upscaled), the source frame rate as a constant frame rate, and AAC-LC
   audio at 128–192 kbps (default 160) with the source's channels. A `.mov`/`.mkv`/… becomes `.mp4` and its sidecar
   is renamed to match; the file date and recording date are kept. An original is replaced only after the new file
@@ -18,7 +18,9 @@ Image Parser is a desktop and web application for reviewing paired images (A/B s
   compressed are skipped. If any video cannot be compressed, the upload does not start. To try the settings without
   uploading, use **Compress videos now**: it runs the same compression on the loaded folder (and its nested folders, if
   they were loaded with it), also replacing the originals, and stops before immich-go. It needs no Immich
-  server or API key. Try it on a copy of a folder first.
+  server or API key. Try it on a copy of a folder first. H.264 is the default because every browser plays it and
+  Immich, with its default transcoding settings, plays it as uploaded. H.265 files are smaller, but browsers
+  without H.265 support (such as Brave on some computers) play only their sound, and Immich stores an extra H.264 copy of each for playback.
 - **Image Rotation**: Apply rotation corrections to both file metadata and pixel data where supported.
 - **Videos and Live Photos**: `.mp4`, `.m4v`, `.mov`, `.webm` and `.mkv` files appear in the grid with a play badge
   and their length, and play in Review with seek-bar previews. An image and a video with the same name in the same

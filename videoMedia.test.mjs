@@ -13,6 +13,7 @@ import {
   formatVideoDuration,
   getPlayerSourceType,
   getSeekSpriteFrameCount as getClientFrameCount,
+  hasMissingPicture,
   SEEK_SPRITE_LAYOUT,
 } from "./src/videoModel.ts";
 import {
@@ -156,4 +157,29 @@ test("grid cells describe videos and live photos, and only images rotate", () =>
   );
   assert.equal(canRotateGridCell({ mediaType: "video" }), false);
   assert.equal(canRotateGridCell({ mediaType: "image" }), true);
+});
+
+test("a video that plays only its sound is reported as having no picture", () => {
+  const video = (readyState, width, height, frames) => ({
+    readyState,
+    videoWidth: width,
+    videoHeight: height,
+    getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }),
+  });
+  // Before the metadata loads, nothing is known yet.
+  assert.equal(hasMissingPicture(video(0, 0, 0, 0), true), false);
+  // An undecodable video track leaves the size at zero (Chromium plays the sound alone).
+  assert.equal(hasMissingPicture(video(1, 0, 0, 0), false), true);
+  // A size but no decoded frames counts only once playback has run.
+  assert.equal(hasMissingPicture(video(4, 1280, 720, 0), false), false);
+  assert.equal(hasMissingPicture(video(4, 1280, 720, 0), true), true);
+  assert.equal(hasMissingPicture(video(4, 1280, 720, 45), true), false);
+  // Browsers without playback quality stats rely on the size alone.
+  assert.equal(
+    hasMissingPicture(
+      { readyState: 4, videoWidth: 640, videoHeight: 480 },
+      true,
+    ),
+    false,
+  );
 });

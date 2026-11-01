@@ -4207,16 +4207,16 @@ This permanently deletes their .xmp sidecar files, including the saved dates, de
                         }}
                         aria-describedby="video-compression-codec-help"
                       >
-                        <option value="h265">H.265 (HEVC)</option>
                         <option value="h264">H.264 (AVC)</option>
+                        <option value="h265">H.265 (HEVC)</option>
                       </select>
                       <span
                         id="video-compression-codec-help"
                         className="field-help"
                       >
                         {immichSettings.videoCompression.codec === "h265"
-                          ? "Smaller files, slower to encode."
-                          : "Bigger files, plays everywhere."}
+                          ? "Smaller files, but many browsers show no picture for them, and Immich usually stores an extra H.264 copy to play."
+                          : "Plays in every browser, and Immich plays it as uploaded."}
                       </span>
                     </label>
                     <label>
